@@ -236,6 +236,10 @@ header {
   border-color: var(--accent-dim);
 }
 
+.pair-card.has-subgroup {
+  border-left: 3px solid #e879f9;
+}
+
 .pair-top {
   display: flex;
   justify-content: space-between;
@@ -275,6 +279,16 @@ header {
 .pair-type.семинар { background: #2a1a3a; color: #c084fc; }
 .pair-type.практическое { background: #1a3a2a; color: #4ade80; }
 
+.pair-subgroup {
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-weight: 500;
+  background: #2a1a2a;
+  color: #e879f9;
+  white-space: nowrap;
+}
+
 .pair-subject {
   font-weight: 600;
   font-size: 0.95rem;
@@ -293,6 +307,96 @@ header {
 
 .pair-room::before {
   content: '🚪 ';
+}
+
+/* Inline HW in pair cards */
+.pair-hw {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pair-hw-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.8rem;
+  color: var(--orange);
+  gap: 8px;
+}
+
+.pair-hw-item.overdue {
+  color: var(--red);
+}
+
+.pair-hw-item.due-soon {
+  color: var(--orange);
+}
+
+.pair-hw-task {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pair-hw-due {
+  flex-shrink: 0;
+  opacity: 0.7;
+  font-size: 0.75rem;
+}
+
+.pair-add-hw {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-dim);
+  font-size: 1rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.pair-add-hw:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* Subject select in modal */
+.modal-body select {
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-family: inherit;
+  width: 100%;
+}
+
+.modal-body select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.modal-body optgroup {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-style: normal;
+}
+
+.hidden {
+  display: none !important;
 }
 
 .no-pairs {

@@ -76,8 +76,14 @@
       <div class="modal-body">
         <label>
           Предмет
-          <input type="text" id="hwSubject" placeholder="Математика">
+          <select id="hwSubject"></select>
         </label>
+        <div id="hwSubjectCustomWrap" class="hidden">
+          <label>
+            Название предмета
+            <input type="text" id="hwSubjectCustom" placeholder="Математика">
+          </label>
+        </div>
         <label>
           Задание
           <textarea id="hwTask" rows="3" placeholder="Выполнить упражнения 1-5..."></textarea>

@@ -15,6 +15,10 @@ export default {
     }
 
     try {
+      // ── Public endpoints ──────────────────────────────────
+      if (path === '/api/status' && method === 'GET') {
+        return await handleStatus(env, corsHeaders);
+      }
       if (path === '/api/schedule' && method === 'GET') {
         return await handleGetSchedule(request, env, corsHeaders);
       }
@@ -27,21 +31,142 @@ export default {
       if (path === '/api/hw' && method === 'GET') {
         return await handleGetHw(request, env, corsHeaders);
       }
+
+      // ── Auth endpoints ───────────────────────────────────
+      if (path === '/api/auth' && method === 'POST') {
+        return await handleAuth(request, env, corsHeaders);
+      }
+      if (path === '/api/group/register' && method === 'POST') {
+        return await handleGroupRegister(request, env, corsHeaders);
+      }
+
+      // ── Protected endpoints (require auth) ───────────────
+      const authError = await verifyAuth(request, env);
+      if (authError) {
+        return jsonResponse({ error: authError }, corsHeaders, 401);
+      }
+
       if (path === '/api/hw' && method === 'POST') {
         return await handleAddHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'DELETE') {
         return await handleDeleteHw(request, env, corsHeaders);
       }
-      if (path === '/api/status' && method === 'GET') {
-        return await handleStatus(env, corsHeaders);
-      }
+
       return jsonResponse({ error: 'Not Found' }, corsHeaders, 404);
     } catch (e) {
       return jsonResponse({ error: e.message }, corsHeaders, 500);
     }
   },
 };
+
+// ── Auth: verify token ─────────────────────────────────────────
+// Token format: base64(JSON.stringify({group, ts})).sha256hex
+// We store passwords in KV as group-pwd:{group}
+
+async function verifyAuth(request, env) {
+  if (!env.SCHEDULE) return 'KV not configured';
+
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return 'Authorization required';
+  }
+
+  const token = authHeader.slice(7);
+  try {
+    const decoded = JSON.parse(atob(token));
+    const { group, ts } = decoded;
+
+    if (!group) return 'Invalid token';
+
+    // Token expires after 30 days
+    const age = Date.now() - ts;
+    if (age > 30 * 24 * 60 * 60 * 1000) {
+      return 'Token expired';
+    }
+
+    // Verify the group exists (has a password set)
+    const pwd = await env.SCHEDULE.get(`group-pwd:${group}`);
+    if (!pwd) return 'Group not registered';
+
+    return null; // OK
+  } catch {
+    return 'Invalid token';
+  }
+}
+
+// ── POST /api/auth ─────────────────────────────────────────────
+// Body: { group, password }
+// Returns: { token, group }
+
+async function handleAuth(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const { group, password } = await request.json();
+
+  if (!group || !password) {
+    return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
+  }
+
+  const stored = await env.SCHEDULE.get(`group-pwd:${group}`);
+  if (!stored) {
+    return jsonResponse({ error: 'Group not registered' }, corsHeaders, 404);
+  }
+
+  // Compare passwords
+  const hash = await sha256(password);
+  if (hash !== stored) {
+    return jsonResponse({ error: 'Wrong password' }, corsHeaders, 401);
+  }
+
+  // Create token
+  const token = btoa(JSON.stringify({ group, ts: Date.now() }));
+  return jsonResponse({ token, group }, corsHeaders);
+}
+
+// ── POST /api/group/register ───────────────────────────────────
+// Body: { group, password }
+// Creates a new group with a password. First-time only.
+// If group already exists, requires the old password to change it.
+
+async function handleGroupRegister(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const { group, password } = await request.json();
+
+  if (!group || !password) {
+    return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
+  }
+
+  if (password.length < 4) {
+    return jsonResponse({ error: 'Password must be at least 4 characters' }, corsHeaders, 400);
+  }
+
+  const existing = await env.SCHEDULE.get(`group-pwd:${group}`);
+  if (existing) {
+    return jsonResponse({ error: 'Group already registered' }, corsHeaders, 409);
+  }
+
+  const hash = await sha256(password);
+  await env.SCHEDULE.put(`group-pwd:${group}`, hash);
+
+  // Auto-login: return token
+  const token = btoa(JSON.stringify({ group, ts: Date.now() }));
+  return jsonResponse({ ok: true, token, group }, corsHeaders);
+}
+
+// ── SHA-256 hash helper ────────────────────────────────────────
+
+async function sha256(message) {
+  const msgBuffer = new TextEncoder().encode(message);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 // ── GET /api/schedule?group=...&week=... ────────────────────────
 

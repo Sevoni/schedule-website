@@ -237,7 +237,18 @@ function parsePairType(subject) {
   return map[m[1]] || m[1];
 }
 
-function parsePairCell(text) {
+function parsePairCell(html) {
+  const subgroupMatch = html.match(/<b>\s*(подгруппа\s*\d)\s*<\/b>/i);
+  const subgroup = subgroupMatch ? subgroupMatch[1].trim() : '';
+
+  const text = html
+    .replace(/<b>[^<]*<\/b>/g, '')
+    .replace(/<br\s*\/?>/g, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\n\s*\n/g, '\n')
+    .trim();
+
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const subject = lines[0] || '';
   let teacher = '';
@@ -254,7 +265,7 @@ function parsePairCell(text) {
     }
   }
 
-  return { subject, teacher, room, type: parsePairType(subject) };
+  return { subject, teacher, room, type: parsePairType(subject), subgroup };
 }
 
 function parseScheduleHTML(html) {
@@ -310,26 +321,22 @@ function parseScheduleHTML(html) {
       const time = pm[2];
       const rest = pm[3];
 
-      let subject = '', teacher = '', room = '', type = '';
-
       const colspanMatch = rest.match(/<td\s+colspan="2">([\s\S]*?)<\/td>/);
       if (colspanMatch) {
-        const parsed = parsePairCell(cleanHtml(colspanMatch[1]));
-        ({ subject, teacher, room, type } = parsed);
+        const parsed = parsePairCell(colspanMatch[1]);
+        pairs.push({ num, time, ...parsed });
       } else {
-        const cols = [];
-        const colRegex = /<td[^>]*>([\s\S]*?)<\/td>/g;
-        let cm;
-        while ((cm = colRegex.exec(rest)) !== null) {
-          cols.push(cleanHtml(cm[1]));
-        }
-        if (cols.length >= 2) {
-          const parsed = parsePairCell(cols[0] || cols[1]);
-          ({ subject, teacher, room, type } = parsed);
+        const tdRegex = /<td([^>]*)>([\s\S]*?)<\/td>/g;
+        let tm;
+        while ((tm = tdRegex.exec(rest)) !== null) {
+          const attrs = tm[1];
+          const content = tm[2];
+          if (content.trim()) {
+            const parsed = parsePairCell(content);
+            pairs.push({ num, time, ...parsed });
+          }
         }
       }
-
-      pairs.push({ num, time, subject, teacher, room, type });
     }
 
     result.days[dayName] = { date: dayDate, pairs };
@@ -482,18 +489,42 @@ function renderDaySchedule(day) {
           : 'практика')
         : '';
 
+      const hwItems = getHwForSubject(p.subject);
+      let hwHtml = '';
+      if (hwItems.length) {
+        hwHtml = '<div class="pair-hw">' + hwItems.map(hw => {
+          let dc = '';
+          if (hw.dueDate) {
+            const d = new Date(hw.dueDate);
+            d.setHours(0, 0, 0, 0);
+            const now = new Date(); now.setHours(0, 0, 0, 0);
+            const df = Math.ceil((d - now) / 86400000);
+            if (df < 0) dc = ' overdue';
+            else if (df <= 2) dc = ' due-soon';
+          }
+          return `<div class="pair-hw-item${dc}"><span class="pair-hw-task">${escHtml(hw.task || 'задание')}</span>${hw.dueDate ? `<span class="pair-hw-due">${escHtml(hw.dueDate)}</span>` : ''}</div>`;
+        }).join('') + '</div>';
+      }
+
+      const baseSubj = p.subject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+
       pairsHtml += `
-        <div class="pair-card">
+        <div class="pair-card${p.subgroup ? ' has-subgroup' : ''}">
           <div class="pair-top">
             <div style="display:flex;align-items:center;gap:8px;">
               <span class="pair-num">${p.num}</span>
               <span class="pair-time">${p.time}</span>
             </div>
-            ${p.type ? `<span class="pair-type ${typeClass}">${p.type}</span>` : ''}
+            <div style="display:flex;align-items:center;gap:6px;">
+              ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
+              ${p.type ? `<span class="pair-type ${typeClass}">${p.type}</span>` : ''}
+              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" title="Добавить ДЗ">+</button>
+            </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
           ${p.teacher ? `<div class="pair-teacher">${escHtml(p.teacher)}</div>` : ''}
           ${p.room ? `<div class="pair-room">${escHtml(p.room)}</div>` : ''}
+          ${hwHtml}
         </div>`;
     }
   }
@@ -506,6 +537,13 @@ function renderDaySchedule(day) {
       </div>
       ${pairsHtml}
     </div>`;
+
+  content.querySelectorAll('.pair-add-hw').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      openHwModal(btn.dataset.subj);
+    };
+  });
 }
 
 // ── Sync UI ───────────────────────────────────────────────────
@@ -524,6 +562,88 @@ function updateSyncUI(status, errorMsg) {
     el.innerHTML = '<span class="sync-icon">✕</span> Ошибка. <button onclick="syncAll()" class="sync-retry">Повторить</button>';
     el.className = 'sync-status error';
   }
+}
+
+// ── Subjects ─────────────────────────────────────────────────
+
+function getAllSubjects() {
+  if (!state.schedule) return { today: [], all: [] };
+
+  const allSet = new Set();
+  const todaySet = new Set();
+  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+
+  for (const [day, data] of Object.entries(state.schedule.days)) {
+    for (const p of data.pairs) {
+      if (!p.subject) continue;
+      const name = p.subject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+      allSet.add(name);
+      if (day === todayName) todaySet.add(name);
+    }
+  }
+
+  const today = [...todaySet];
+  const rest = [...allSet].filter(s => !todaySet.has(s));
+  return { today, all: [...today, ...rest] };
+}
+
+function getHwForSubject(subj) {
+  if (!subj) return [];
+  const base = subj.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim().toLowerCase();
+  return state.homework.filter(h => {
+    const hBase = (h.subject || '').replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim().toLowerCase();
+    return hBase === base;
+  });
+}
+
+function openHwModal(preSubject) {
+  const modal = document.getElementById('homeworkModal');
+  const sel = document.getElementById('hwSubject');
+  const custom = document.getElementById('hwSubjectCustom');
+  const customWrap = document.getElementById('hwSubjectCustomWrap');
+
+  const { all } = getAllSubjects();
+
+  sel.innerHTML = '';
+  if (all.length) {
+    const { today } = getAllSubjects();
+    if (today.length) {
+      const og = document.createElement('optgroup');
+      og.label = 'Сегодня';
+      today.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; og.appendChild(o); });
+      sel.appendChild(og);
+    }
+    const rest = all.filter(s => !today.includes(s));
+    if (rest.length) {
+      const og = document.createElement('optgroup');
+      og.label = 'Все предметы';
+      rest.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; og.appendChild(o); });
+      sel.appendChild(og);
+    }
+  }
+
+  const co = document.createElement('option');
+  co.value = '__custom__';
+  co.textContent = 'Другой...';
+  sel.appendChild(co);
+
+  if (preSubject) {
+    const base = preSubject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+    const match = all.find(s => s.toLowerCase() === base.toLowerCase());
+    sel.value = match || '__custom__';
+    if (!match) { customWrap.classList.remove('hidden'); custom.value = preSubject; }
+    else { customWrap.classList.add('hidden'); custom.value = ''; }
+  } else {
+    sel.value = all.length ? all[0] : '__custom__';
+    customWrap.classList.add('hidden');
+    custom.value = '';
+  }
+
+  document.getElementById('hwTask').value = '';
+  document.getElementById('hwDueDate').value = '';
+  document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
+  modal.classList.remove('hidden');
+  document.getElementById('hwTask').focus();
 }
 
 // ── Homework (API) ────────────────────────────────────────────
@@ -602,6 +722,7 @@ function renderHomework() {
         await apiDelete('/api/hw', { id: btn.dataset.id, group: state.group });
         state.homework = state.homework.filter(h => h.id !== btn.dataset.id);
         renderHomework();
+        if (state.schedule) renderDayTabs();
       } catch (e) {
         console.warn('HW delete failed:', e.message);
       }
@@ -638,21 +759,27 @@ function setupSettingsModal() {
 
 function setupHomeworkModal() {
   const modal = document.getElementById('homeworkModal');
+  const sel = document.getElementById('hwSubject');
+  const customWrap = document.getElementById('hwSubjectCustomWrap');
 
-  document.getElementById('addHomeworkBtn').onclick = () => {
-    document.getElementById('hwSubject').value = '';
-    document.getElementById('hwTask').value = '';
-    document.getElementById('hwDueDate').value = '';
-    document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
-    modal.classList.remove('hidden');
-    document.getElementById('hwSubject').focus();
-  };
+  document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
 
   document.getElementById('closeHomework').onclick = () => modal.classList.add('hidden');
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 
+  sel.onchange = () => {
+    if (sel.value === '__custom__') {
+      customWrap.classList.remove('hidden');
+      document.getElementById('hwSubjectCustom').focus();
+    } else {
+      customWrap.classList.add('hidden');
+    }
+  };
+
   document.getElementById('saveHomework').onclick = async () => {
-    const subject = document.getElementById('hwSubject').value.trim();
+    const subject = sel.value === '__custom__'
+      ? document.getElementById('hwSubjectCustom').value.trim()
+      : sel.value;
     const task = document.getElementById('hwTask').value.trim();
     const dueDate = document.getElementById('hwDueDate').value;
     const author = document.getElementById('hwAuthor').value.trim();
@@ -672,6 +799,7 @@ function setupHomeworkModal() {
 
       state.homework.push(result.item);
       renderHomework();
+      if (state.schedule) renderDayTabs();
       modal.classList.add('hidden');
     } catch (e) {
       console.warn('HW save failed:', e.message);
