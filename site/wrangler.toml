@@ -1,0 +1,14 @@
+name = "schedule-worker"
+main = "worker/index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+CAMPUS_URL = "https://campus.syktsu.ru/schedule/group/"
+DEFAULT_GROUP = "131-ИБо"
+
+[[kv_namespaces]]
+binding = "SCHEDULE"
+id = "d4bf1890a6e94b5285f1c5195aed419a"
+
+[pages]
+build_output_dir = "frontend"

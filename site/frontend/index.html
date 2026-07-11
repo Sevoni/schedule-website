@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Расписание — 131-ИБо</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="header-top">
+        <h1>📅 Расписание</h1>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button id="syncBtn" class="icon-btn" title="Синхронизировать">🔄</button>
+          <button id="settingsBtn" class="icon-btn" title="Настройки">⚙️</button>
+        </div>
+      </div>
+      <div id="syncStatus" class="sync-status"></div>
+      <div class="group-info">
+        <span id="groupName">131-ИБо</span>
+        <span id="weekRange" class="week-range"></span>
+      </div>
+    </header>
+
+    <nav id="weekNav" class="week-nav">
+      <button id="prevWeek" class="nav-btn">◀</button>
+      <span id="weekLabel">Загрузка...</span>
+      <button id="nextWeek" class="nav-btn">▶</button>
+    </nav>
+
+    <nav id="dayTabs" class="day-tabs"></nav>
+
+    <main id="scheduleContent" class="schedule-content">
+      <div class="loading">Загрузка расписания...</div>
+    </main>
+
+    <section id="homeworkSection" class="homework-section">
+      <div class="homework-header">
+        <h2>📝 Домашние задания</h2>
+        <button id="addHomeworkBtn" class="add-btn">+ Добавить</button>
+      </div>
+      <div id="homeworkList" class="homework-list"></div>
+    </section>
+  </div>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Настройки</h2>
+        <button id="closeSettings" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>
+          Группа
+          <input type="text" id="groupInput" placeholder="131-ИБо">
+        </label>
+        <label>
+          API URL (Worker)
+          <input type="text" id="apiUrlInput" placeholder="https://your-worker.workers.dev">
+        </label>
+        <div class="settings-note">
+          API URL указывается автоматически. Нажмите 🔄 для синхронизации расписания.
+        </div>
+        <button id="saveSettings" class="save-btn">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="homeworkModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Новое задание</h2>
+        <button id="closeHomework" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>
+          Предмет
+          <input type="text" id="hwSubject" placeholder="Математика">
+        </label>
+        <label>
+          Задание
+          <textarea id="hwTask" rows="3" placeholder="Выполнить упражнения 1-5..."></textarea>
+        </label>
+        <label>
+          Сдать до
+          <input type="date" id="hwDueDate">
+        </label>
+        <label>
+          Автор
+          <input type="text" id="hwAuthor" placeholder="Ваше имя (необязательно)">
+        </label>
+        <button id="saveHomework" class="save-btn">Добавить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
