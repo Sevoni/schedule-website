@@ -31,6 +31,12 @@ export default {
       if (path === '/api/hw' && method === 'GET') {
         return await handleGetHw(request, env, corsHeaders);
       }
+      if (path === '/api/hw' && method === 'POST') {
+        return await handleAddHw(request, env, corsHeaders);
+      }
+      if (path === '/api/hw' && method === 'DELETE') {
+        return await handleDeleteHw(request, env, corsHeaders);
+      }
 
       // ── Auth endpoints ───────────────────────────────────
       if (path === '/api/auth' && method === 'POST') {
@@ -38,19 +44,6 @@ export default {
       }
       if (path === '/api/group/register' && method === 'POST') {
         return await handleGroupRegister(request, env, corsHeaders);
-      }
-
-      // ── Protected endpoints (require auth) ───────────────
-      const authError = await verifyAuth(request, env);
-      if (authError) {
-        return jsonResponse({ error: authError }, corsHeaders, 401);
-      }
-
-      if (path === '/api/hw' && method === 'POST') {
-        return await handleAddHw(request, env, corsHeaders);
-      }
-      if (path === '/api/hw' && method === 'DELETE') {
-        return await handleDeleteHw(request, env, corsHeaders);
       }
 
       return jsonResponse({ error: 'Not Found' }, corsHeaders, 404);
@@ -185,9 +178,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
 
-  const data = await env.SCHEDULE.get(`schedule:${group}:current`, { type: 'json' });
-  if (data) return jsonResponse(data, corsHeaders);
-  return jsonResponse({ error: 'No data. Run sync first.' }, corsHeaders, 404);
+  return jsonResponse({ error: 'Missing week parameter' }, corsHeaders, 400);
 }
 
 // ── GET /api/weeks?group=... ───────────────────────────────────
@@ -233,7 +224,6 @@ async function handleUpload(request, env, corsHeaders) {
 
     const key = weekCode ? `schedule:${group}:${weekCode}` : `schedule:${group}:current`;
     await env.SCHEDULE.put(key, JSON.stringify(data), { expirationTtl: 604800 });
-    await env.SCHEDULE.put(`schedule:${group}:current`, JSON.stringify(data), { expirationTtl: 604800 });
 
     await env.SCHEDULE.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
@@ -244,7 +234,45 @@ async function handleUpload(request, env, corsHeaders) {
     return jsonResponse({ ok: true, type: 'schedule', group, weekCode }, corsHeaders);
   }
 
+  if (type === 'schedule-batch') {
+    const { group, schedules } = body;
+    if (!group || !Array.isArray(schedules)) {
+      return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
+    }
+
+    const updated = [];
+    const validWeekCodes = [];
+
+    for (const { weekCode, data } of schedules) {
+      if (!weekCode || !data) continue;
+      validWeekCodes.push(weekCode);
+
+      const existing = await env.SCHEDULE.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+      const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
+      const newStr = JSON.stringify(stripComparable(data));
+
+      if (existingStr !== newStr) {
+        await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+        updated.push(weekCode);
+      }
+    }
+
+    await env.SCHEDULE.put('sync:meta', JSON.stringify({
+      lastSync: new Date().toISOString(),
+      lastGroup: group,
+      lastWeek: 'batch',
+    }), { expirationTtl: 604800 });
+
+    return jsonResponse({ ok: true, type: 'schedule-batch', updated: updated.length, total: schedules.length }, corsHeaders);
+  }
+
   return jsonResponse({ error: 'Invalid type' }, corsHeaders, 400);
+}
+
+function stripComparable(data) {
+  if (!data || typeof data !== 'object') return data;
+  const { parsedAt, ...rest } = data;
+  return rest;
 }
 
 // ── GET /api/hw?group=... ──────────────────────────────────────

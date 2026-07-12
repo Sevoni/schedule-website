@@ -26,8 +26,10 @@ No install step needed — only `wrangler` is a devDependency.
 
 ## Architecture
 
-- **Worker** (`site/worker/index.js`): single-file Cloudflare Worker, ~343 lines. Handles auth, schedule CRUD, homework CRUD, KV storage.
+- **Worker** (`site/worker/index.js`): single-file Cloudflare Worker, ~390 lines. Handles auth, schedule CRUD, homework CRUD, KV storage.
 - **KV namespace** `SCHEDULE`: stores schedule data, weeks, homework, group passwords. Keys: `schedule:{group}:{weekCode}`, `weeks:{group}`, `hw:{group}`, `group-pwd:{group}`.
+  - `schedule:{group}:current` is deleted during batch sync (legacy key, no longer written).
+  - `sync:meta` stores last sync metadata.
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
 - **Auth**: simple token scheme — `btoa(JSON.stringify({group, ts}))` as Bearer token, 30-day expiry. Passwords stored as SHA-256 hashes in KV.
 - **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
@@ -43,3 +45,30 @@ Both frontends parse `campus.syktsu.ru` HTML with regex (not DOM). The parser ex
 - No package manager lockfile — `node_modules` not tracked
 - `test.html` is a legacy standalone test page (can be ignored)
 - No TypeScript, no bundler, no transpiler — plain ES modules
+
+## Batch sync (`syncAll`)
+
+When the user clicks the refresh button, `syncAll()` in `app.js`:
+
+1. Fetches the weeks list from campus, preserving the user's current week selection.
+2. Determines which weeks to fetch via `getWeeksToSync()`:
+   - **Past week selected** → only that one week
+   - **Current week selected** → current + 4 ahead
+   - **Future week selected** → from current to (selected + 2)
+3. Fetches the selected range from campus in parallel via `Promise.all`.
+4. Sends everything to the Worker as a `schedule-batch` upload.
+5. The Worker compares each week's JSON against what's already in KV (ignoring `parsedAt`) and only writes if changed.
+6. Cleanup: `KV.list({ prefix: "schedule:{group}:" })` deletes `schedule:{group}:current` and any week keys not in the current weeks list.
+7. The frontend preserves the user's current week selection (does not jump to the current week).
+
+The old single-week `type: 'schedule'` upload is still used by `loadSchedule()` fallback (cache miss → parse campus → upload one week).
+
+## Background sync (`backgroundSync`)
+
+On first page load, `loadData()` shows cached data immediately, then calls `backgroundSync()`:
+
+1. Fetches weeks list from campus in the background.
+2. Fetches current week + 2 weeks ahead from campus in parallel.
+3. Sends to Worker as `schedule-batch` — only changed data is overwritten in KV.
+4. If campus is unavailable (CORS, network), silently keeps the cache as-is.
+5. Updates the UI if the user's current week data changed.

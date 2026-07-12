@@ -9,6 +9,3 @@ DEFAULT_GROUP = "131-ИБо"
 [[kv_namespaces]]
 binding = "SCHEDULE"
 id = "d4bf1890a6e94b5285f1c5195aed419a"
-
-[pages]
-build_output_dir = "frontend"

@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy && wrangler pages deploy frontend --project-name=schedule-worker",
     "tail": "wrangler tail"
   },
   "devDependencies": {

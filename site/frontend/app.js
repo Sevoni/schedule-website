@@ -40,8 +40,75 @@ async function loadData() {
     await loadWeeks();
     await loadSchedule();
     loadHomework();
+    backgroundSync();
   } catch (e) {
     showError('Не удалось загрузить данные: ' + e.message, () => syncAll());
+  }
+}
+
+async function backgroundSync() {
+  if (state.weeks.length === 0) return;
+
+  const today = new Date();
+  let realCurrentIdx = 0;
+  for (let i = 0; i < state.weeks.length; i++) {
+    const w = state.weeks[i];
+    if (w.dates.length >= 2) {
+      const start = parseDate(w.dates[0]);
+      const end = parseDate(w.dates[1]);
+      if (today >= start && today <= end) {
+        realCurrentIdx = i;
+        break;
+      }
+    }
+  }
+
+  const toIdx = Math.min(realCurrentIdx + 2, state.weeks.length - 1);
+  const weekRange = [];
+  for (let i = realCurrentIdx; i <= toIdx; i++) weekRange.push(state.weeks[i]);
+
+  console.log('[bgSync] weeks:', state.weeks.length, 'currentIdx:', realCurrentIdx, 'toIdx:', toIdx, 'range:', weekRange.map(w => w.value));
+
+  if (weekRange.length === 0) return;
+
+  try {
+    const results = await Promise.all(
+      weekRange.map(async (w) => {
+        try {
+          const data = await fetchScheduleFromCampus(state.group, w.value);
+          const hasPairs = data.days && Object.values(data.days).some(d => d.pairs && d.pairs.length > 0);
+          console.log('[bgSync] fetched', w.value, 'days:', Object.keys(data.days || {}).length, 'hasPairs:', hasPairs);
+          if (!hasPairs) return null;
+          return { weekCode: w.value, data };
+        } catch (e) {
+          console.warn('[bgSync] failed', w.value, e.message);
+          return null;
+        }
+      })
+    );
+
+    const valid = results.filter(Boolean);
+    console.log('[bgSync] valid:', valid.length, 'of', weekRange.length);
+    if (valid.length === 0) return;
+
+    const res = await apiPost('/api/upload', {
+      type: 'schedule-batch',
+      group: state.group,
+      schedules: valid,
+    });
+    console.log('[bgSync] uploaded, updated:', res.updated, 'of', res.total);
+
+    const currentWeek = state.weeks[state.currentWeekIdx];
+    if (currentWeek) {
+      const match = valid.find(s => s.weekCode === currentWeek.value);
+      if (match) {
+        state.schedule = match.data;
+        applyScheduleHeader();
+        renderDayTabs();
+      }
+    }
+  } catch (e) {
+    console.warn('[bgSync] error:', e.message);
   }
 }
 
@@ -113,27 +180,57 @@ async function syncAll() {
   state.syncing = true;
   updateSyncUI('syncing');
 
+  const savedWeekValue = state.weeks[state.currentWeekIdx]?.value;
+
   try {
-    await syncWeeksFromCampus();
+    await syncWeeksFromCampus(true);
 
-    const w = state.weeks[state.currentWeekIdx];
-    if (w) {
-      state.schedule = await fetchScheduleFromCampus(state.group, w.value);
-      applyScheduleHeader();
-
-      await apiPost('/api/upload', {
-        type: 'schedule',
-        group: state.group,
-        weekCode: w.value,
-        data: state.schedule,
-      });
+    if (savedWeekValue) {
+      const idx = state.weeks.findIndex(w => w.value === savedWeekValue);
+      if (idx >= 0) state.currentWeekIdx = idx;
     }
 
+    const weekIndices = getWeeksToSync();
+
+    const results = await Promise.all(
+      weekIndices.map(async (i) => {
+        try {
+          const w = state.weeks[i];
+          const data = await fetchScheduleFromCampus(state.group, w.value);
+          return { weekCode: w.value, data };
+        } catch (e) {
+          console.warn(`Failed to fetch week ${state.weeks[i]?.value}:`, e.message);
+          return null;
+        }
+      })
+    );
+
+    const validSchedules = results.filter(Boolean);
+
+    if (validSchedules.length === 0) {
+      throw new Error('Не удалось получить расписание ни для одной недели');
+    }
+
+    await apiPost('/api/upload', {
+      type: 'schedule-batch',
+      group: state.group,
+      schedules: validSchedules,
+    });
+
+    const currentWeek = state.weeks[state.currentWeekIdx];
+    if (currentWeek) {
+      const match = validSchedules.find(s => s.weekCode === currentWeek.value);
+      if (match) {
+        state.schedule = match.data;
+        applyScheduleHeader();
+      }
+    }
+
+    renderWeekNav();
     renderDayTabs();
     updateSyncUI('ok');
   } catch (e) {
     updateSyncUI('error', e.message);
-    // Если есть хотя бы кеш — покажем его
     if (!state.schedule) {
       showError('Не удалось синхронизировать: ' + e.message, () => syncAll());
     }
@@ -142,7 +239,7 @@ async function syncAll() {
   }
 }
 
-async function syncWeeksFromCampus() {
+async function syncWeeksFromCampus(preserveWeek = false) {
   const weeks = await fetchWeeksFromCampus(state.group);
   if (!weeks || weeks.length === 0) {
     throw new Error('Не удалось получить недели');
@@ -154,8 +251,15 @@ async function syncWeeksFromCampus() {
     weeks,
   });
 
+  const savedWeekValue = preserveWeek ? state.weeks[state.currentWeekIdx]?.value : null;
   state.weeks = weeks;
-  findCurrentWeek();
+
+  if (preserveWeek && savedWeekValue) {
+    const idx = state.weeks.findIndex(w => w.value === savedWeekValue);
+    state.currentWeekIdx = idx >= 0 ? idx : state.currentWeekIdx;
+  } else {
+    findCurrentWeek();
+  }
   renderWeekNav();
 }
 
@@ -400,6 +504,41 @@ function findCurrentWeek() {
   state.currentWeekIdx = found >= 0 ? found : 0;
 }
 
+function getWeeksToSync() {
+  const today = new Date();
+  const userIdx = state.currentWeekIdx;
+
+  let realCurrentIdx = -1;
+  for (let i = 0; i < state.weeks.length; i++) {
+    const w = state.weeks[i];
+    if (w.dates.length >= 2) {
+      const start = parseDate(w.dates[0]);
+      const end = parseDate(w.dates[1]);
+      if (today >= start && today <= end) {
+        realCurrentIdx = i;
+        break;
+      }
+    }
+  }
+  if (realCurrentIdx < 0) realCurrentIdx = 0;
+
+  let from, to;
+  if (userIdx < realCurrentIdx) {
+    from = userIdx;
+    to = userIdx;
+  } else if (userIdx === realCurrentIdx) {
+    from = realCurrentIdx;
+    to = Math.min(realCurrentIdx + 4, state.weeks.length - 1);
+  } else {
+    from = realCurrentIdx;
+    to = Math.min(userIdx + 2, state.weeks.length - 1);
+  }
+
+  const result = [];
+  for (let i = from; i <= to; i++) result.push(i);
+  return result;
+}
+
 function renderWeekNav() {
   const label = document.getElementById('weekLabel');
   const w = state.weeks[state.currentWeekIdx];
@@ -506,7 +645,7 @@ function renderDaySchedule(day) {
         }).join('') + '</div>';
       }
 
-      const baseSubj = p.subject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+      const baseSubj = p.subject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
 
       pairsHtml += `
         <div class="pair-card${p.subgroup ? ' has-subgroup' : ''}">
@@ -576,7 +715,7 @@ function getAllSubjects() {
   for (const [day, data] of Object.entries(state.schedule.days)) {
     for (const p of data.pairs) {
       if (!p.subject) continue;
-      const name = p.subject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+      const name = p.subject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
       allSet.add(name);
       if (day === todayName) todaySet.add(name);
     }
@@ -589,9 +728,9 @@ function getAllSubjects() {
 
 function getHwForSubject(subj) {
   if (!subj) return [];
-  const base = subj.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim().toLowerCase();
+  const base = subj.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim().toLowerCase();
   return state.homework.filter(h => {
-    const hBase = (h.subject || '').replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim().toLowerCase();
+    const hBase = (h.subject || '').replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim().toLowerCase();
     return hBase === base;
   });
 }
@@ -628,7 +767,7 @@ function openHwModal(preSubject) {
   sel.appendChild(co);
 
   if (preSubject) {
-    const base = preSubject.replace(/\s*\(л|пр|пз|лаб|с\)\s*$/, '').trim();
+    const base = preSubject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
     const match = all.find(s => s.toLowerCase() === base.toLowerCase());
     sel.value = match || '__custom__';
     if (!match) { customWrap.classList.remove('hidden'); custom.value = preSubject; }
