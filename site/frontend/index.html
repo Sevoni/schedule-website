@@ -59,8 +59,13 @@
           API URL (Worker)
           <input type="text" id="apiUrlInput" placeholder="https://your-worker.workers.dev">
         </label>
+        <label class="settings-toggle">
+          <input type="checkbox" id="campusToggle">
+          <span>Загружать расписание с campus.syktsu.ru</span>
+        </label>
         <div class="settings-note">
-          API URL указывается автоматически. Нажмите 🔄 для синхронизации расписания.
+          Если загрузка из кампуса отключена, расписание берётся только из БД.
+          Нажмите 🔄 для принудительной синхронизации (только когда нагрузка с кампуса включена).
         </div>
         <button id="saveSettings" class="save-btn">Сохранить</button>
       </div>

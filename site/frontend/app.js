@@ -12,6 +12,8 @@ const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 let state = {
   apiBase: localStorage.getItem('apiBase') || DEFAULT_API,
   group: localStorage.getItem('group') || DEFAULT_GROUP,
+  // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
+  campusEnabled: localStorage.getItem('campusEnabled') !== '0',
   schedule: null,
   weeks: [],
   currentWeekIdx: -1,
@@ -31,81 +33,155 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ── Main data loading ─────────────────────────────────────────
-// 1. Пробуем получить расписание из KV-кеша Worker'а
-// 2. Если кеш пуст — парсим campus.syktsu.ru в браузере и сохраняем в кеш
-// 3. Если campus недоступен — показываем что есть в кеше
+//
+// Поведение:
+//  1. При загрузке сайта берём из БД: предыдущую неделю, текущую и две следующих.
+//     Параллельно (если campusEnabled) идём в кампус за текущей и двумя следующими
+//     (предыдущую из кампуса НЕ тянем). Если расписание изменилось или его не было
+//     в БД — оно записывается в БД и текущий экран обновляется.
+//  2. loadSchedule(idx) — переключение недели. Назад → из БД, при отсутствии из кампуса.
+//     Вперёд > 2 недель от текущей → из БД + фоне кампус-обновление.
+//  3. syncAll() — кнопка обновления. На прошлой неделе → только её из кампуса.
+//     На текущей/будущей → текущую + 2 следующих из кампуса. Неделю не меняем.
 
 async function loadData() {
   try {
     await loadWeeks();
-    await loadSchedule();
+    if (state.weeks.length === 0) {
+      // Кеш недель пуст — пробуем взять недели из кампуса (если разрешено)
+      if (state.campusEnabled) {
+        await syncWeeksFromCampus(true);
+      }
+    }
+    if (state.weeks.length === 0) {
+      showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите 🔄.', () => syncAll());
+      return;
+    }
+    findCurrentWeek();
+    renderWeekNav();
+    await loadInitialSchedules();
     loadHomework();
-    backgroundSync();
   } catch (e) {
     showError('Не удалось загрузить данные: ' + e.message, () => syncAll());
   }
 }
 
-async function backgroundSync() {
-  if (state.weeks.length === 0) return;
+// Список недель, которые надо загрузить с кампуса/из БД при первом открытии:
+// от (currentIdx-1) до (currentIdx+2) включительно.
+function getInitialWeekIndices() {
+  const cur = findRealCurrentIdx();
+  const from = Math.max(0, cur - 1);
+  const to = Math.min(state.weeks.length - 1, cur + 2);
+  const result = [];
+  for (let i = from; i <= to; i++) result.push(i);
+  return result;
+}
 
-  const today = new Date();
-  let realCurrentIdx = 0;
-  for (let i = 0; i < state.weeks.length; i++) {
-    const w = state.weeks[i];
-    if (w.dates.length >= 2) {
-      const start = parseDate(w.dates[0]);
-      const end = parseDate(w.dates[1]);
-      if (today >= start && today <= end) {
-        realCurrentIdx = i;
-        break;
+// Загрузка исходных расписаний (БД + фоне кампус) при открытии страницы.
+async function loadInitialSchedules() {
+  const indices = getInitialWeekIndices();
+  if (indices.length === 0) return;
+
+  const content = document.getElementById('scheduleContent');
+  content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
+
+  // 1) Из БД параллельно по всем стартовым неделям
+  const dbResults = await Promise.all(
+    indices.map(async (i) => {
+      try {
+        const data = await apiFetch('/api/schedule', { group: state.group, week: state.weeks[i].value });
+        return { idx: i, data };
+      } catch (e) {
+        return { idx: i, data: null };
       }
-    }
+    })
+  );
+
+  const dbMap = new Map();
+  for (const r of dbResults) if (r.data) dbMap.set(r.idx, r.data);
+
+  // 2) Параллельно из кампуса: текущая + 2 следующих (previous НЕ грузим)
+  const campusIndices = indices.filter(i => {
+    const cur = findRealCurrentIdx();
+    return i >= cur;
+  });
+
+  if (state.campusEnabled && campusIndices.length > 0) {
+    backgroundSync(campusIndices, dbMap);
   }
 
-  const toIdx = Math.min(realCurrentIdx + 2, state.weeks.length - 1);
-  const weekRange = [];
-  for (let i = realCurrentIdx; i <= toIdx; i++) weekRange.push(state.weeks[i]);
+  // 3) Если есть данные для текущей недели в БД — показываем сразу
+  const cur = findRealCurrentIdx();
+  state.currentWeekIdx = cur;
+  const currentData = dbMap.get(cur);
+  if (currentData) {
+    state.schedule = currentData;
+    applyScheduleHeader();
+    renderDayTabs();
+  } else {
+    // Текущей недели в БД нет, но из кампуса может подтянуться через backgroundSync.
+    // Если кампус отключён или campusIndices пусто — покажем что-нибудь из БД.
+    let fallbackIdx = indices.find(i => dbMap.has(i));
+    if (fallbackIdx !== undefined) {
+      state.currentWeekIdx = fallbackIdx;
+      state.schedule = dbMap.get(fallbackIdx);
+      applyScheduleHeader();
+      renderDayTabs();
+    } else if (!state.campusEnabled || campusIndices.length === 0) {
+      content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
+    }
+  }
+}
 
-  console.log('[bgSync] weeks:', state.weeks.length, 'currentIdx:', realCurrentIdx, 'toIdx:', toIdx, 'range:', weekRange.map(w => w.value));
-
-  if (weekRange.length === 0) return;
+// Фоновая синхронизация: скачивает из кампуса недели по списку индексов,
+// сравнивает с тем, что уже есть в dbMap (если есть), и при наличии изменений
+// загружает в БД. Если текущая на экране неделя обновилась — перерисуем её.
+async function backgroundSync(campusIndices, dbMap) {
+  if (!state.campusEnabled || campusIndices.length === 0) return;
 
   try {
-    const results = await Promise.all(
-      weekRange.map(async (w) => {
+    const fetched = await Promise.all(
+      campusIndices.map(async (i) => {
         try {
-          const data = await fetchScheduleFromCampus(state.group, w.value);
+          const data = await fetchScheduleFromCampus(state.group, state.weeks[i].value);
           const hasPairs = data.days && Object.values(data.days).some(d => d.pairs && d.pairs.length > 0);
-          console.log('[bgSync] fetched', w.value, 'days:', Object.keys(data.days || {}).length, 'hasPairs:', hasPairs);
           if (!hasPairs) return null;
-          return { weekCode: w.value, data };
+          return { idx: i, weekCode: state.weeks[i].value, data };
         } catch (e) {
-          console.warn('[bgSync] failed', w.value, e.message);
+          console.warn('[bgSync] failed', state.weeks[i]?.value, e.message);
           return null;
         }
       })
     );
 
-    const valid = results.filter(Boolean);
-    console.log('[bgSync] valid:', valid.length, 'of', weekRange.length);
+    const valid = fetched.filter(Boolean);
     if (valid.length === 0) return;
 
-    const res = await apiPost('/api/upload', {
-      type: 'schedule-batch',
-      group: state.group,
-      schedules: valid,
-    });
-    console.log('[bgSync] uploaded, updated:', res.updated, 'of', res.total);
-
-    const currentWeek = state.weeks[state.currentWeekIdx];
-    if (currentWeek) {
-      const match = valid.find(s => s.weekCode === currentWeek.value);
-      if (match) {
-        state.schedule = match.data;
-        applyScheduleHeader();
-        renderDayTabs();
+    // Загружаем в БД только изменённые/отсутствующие
+    const toUpload = [];
+    for (const v of valid) {
+      const existing = dbMap ? dbMap.get(v.idx) : null;
+      if (!existing || JSON.stringify(stripComparable(existing)) !== JSON.stringify(stripComparable(v.data))) {
+        toUpload.push({ weekCode: v.weekCode, data: v.data });
       }
+    }
+
+    if (toUpload.length > 0) {
+      await apiPost('/api/upload', {
+        type: 'schedule-batch',
+        group: state.group,
+        schedules: toUpload,
+      });
+      console.log('[bgSync] uploaded', toUpload.length, 'weeks');
+    }
+
+    // Если текущая открытая неделя изменилась — перерисуем
+    const currentWeek = state.weeks[state.currentWeekIdx];
+    const match = currentWeek && valid.find(v => v.weekCode === currentWeek.value);
+    if (match) {
+      state.schedule = match.data;
+      applyScheduleHeader();
+      renderDayTabs();
     }
   } catch (e) {
     console.warn('[bgSync] error:', e.message);
@@ -118,79 +194,150 @@ async function loadWeeks() {
     findCurrentWeek();
     renderWeekNav();
   } catch (e) {
-    // Кеш пуст — пробуем с campus
-    await syncWeeksFromCampus();
+    // Кеш пуст — оставляем недели пустыми, разберёмся дальше
+    state.weeks = [];
+    state.currentWeekIdx = -1;
   }
 }
 
-async function loadSchedule() {
+// Загрузка расписания для произвольной недели (при навигации).
+//  - Назад: из БД; если нет — из кампуса и пишем в БД.
+//  - Вперёд, дальше чем на +2 от текущей: из БД, параллельно обновляем из кампуса.
+//  - Вперёд в пределах текущая/+2: эти недели уже должны быть загружены из БД
+//    при открытии; если по какой-то причине нет — берём из кампуса и пишем в БД.
+async function loadSchedule(targetIdx) {
+  if (targetIdx < 0 || targetIdx >= state.weeks.length) return;
+  state.currentWeekIdx = targetIdx;
+
+  const w = state.weeks[targetIdx];
   const content = document.getElementById('scheduleContent');
   content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
 
-  const w = state.weeks[state.currentWeekIdx];
-
-  // 1. Пробуем из кеша Worker'а
+  // 1) Из БД
+  let dbData = null;
   try {
-    const params = { group: state.group };
-    if (w) params.week = w.value;
-
-    state.schedule = await apiFetch('/api/schedule', params);
-    applyScheduleHeader();
-    renderDayTabs();
-    return;
+    dbData = await apiFetch('/api/schedule', { group: state.group, week: w.value });
   } catch (e) {
-    // Кеш пуст
+    dbData = null;
   }
 
-  // 2. Парсим campus.syktsu.ru
-  if (w) {
+  if (dbData) {
+    state.schedule = dbData;
+    applyScheduleHeader();
+    renderDayTabs();
+
+    const cur = findRealCurrentIdx();
+    const distance = targetIdx - cur;
+
+    // Вперёд дальше +2 от текущей → фоне тянем из кампуса и обновляем БД при изменениях
+    if (distance > 2 && state.campusEnabled) {
+      backgroundSyncSingle(targetIdx, dbData);
+    }
+    return;
+  }
+
+  // 2) Нет в БД
+  if (state.campusEnabled) {
     try {
-      state.schedule = await fetchScheduleFromCampus(state.group, w.value);
+      const campusData = await fetchScheduleFromCampus(state.group, w.value);
+      const hasPairs = campusData.days && Object.values(campusData.days).some(d => d.pairs && d.pairs.length > 0);
+      if (hasPairs) {
+        await apiPost('/api/upload', {
+          type: 'schedule-batch',
+          group: state.group,
+          schedules: [{ weekCode: w.value, data: campusData }],
+        });
+      }
+      state.schedule = campusData;
       applyScheduleHeader();
       renderDayTabs();
-      // Сохраняем в кеш
-      await apiPost('/api/upload', {
-        type: 'schedule',
-        group: state.group,
-        weekCode: w.value,
-        data: state.schedule,
-      });
       return;
     } catch (e) {
       console.warn('Campus unavailable:', e.message);
     }
   }
 
-  // 3. Полный синхрон
-  await syncAll();
+  content.innerHTML = '<div class="no-pairs">Нет данных для этой недели.</div>';
+  applyScheduleHeader();
 }
 
-function applyScheduleHeader() {
-  document.getElementById('groupName').textContent = state.schedule.group || state.group;
-  if (state.schedule.weekStart) {
-    document.getElementById('weekRange').textContent =
-      state.schedule.weekStart + ' — ' + state.schedule.weekEnd;
+// Фоновое обновление одной недели из кампуса (для случая «идём вперёд дальше +2»).
+async function backgroundSyncSingle(idx, dbData) {
+  if (!state.campusEnabled) return;
+  try {
+    const w = state.weeks[idx];
+    const data = await fetchScheduleFromCampus(state.group, w.value);
+    const hasPairs = data.days && Object.values(data.days).some(d => d.pairs && d.pairs.length > 0);
+    if (!hasPairs) return;
+
+    const changed = !dbData || JSON.stringify(stripComparable(dbData)) !== JSON.stringify(stripComparable(data));
+    if (changed) {
+      await apiPost('/api/upload', {
+        type: 'schedule-batch',
+        group: state.group,
+        schedules: [{ weekCode: w.value, data }],
+      });
+    }
+
+    // Если пользователь всё ещё на этой неделе — обновим экран
+    if (state.weeks[state.currentWeekIdx] && state.weeks[state.currentWeekIdx].value === w.value) {
+      state.schedule = data;
+      applyScheduleHeader();
+      renderDayTabs();
+    }
+  } catch (e) {
+    console.warn('[bgSyncSingle] error:', e.message);
   }
 }
 
-// ── Sync: загрузить всё из campus и сохранить в кеш ───────────
+function applyScheduleHeader() {
+  document.getElementById('groupName').textContent = (state.schedule && state.schedule.group) || state.group;
+  if (state.schedule && state.schedule.weekStart) {
+    document.getElementById('weekRange').textContent =
+      state.schedule.weekStart + ' — ' + state.schedule.weekEnd;
+  } else {
+    document.getElementById('weekRange').textContent = '';
+  }
+}
+
+// ── Sync (кнопка обновления) ──────────────────────────────────
+//
+// При обновлении пользователь НЕ перемещается на другую неделю.
+//  - Если текущая выбранная неделя в прошлом (до текущей по календарю):
+//    из кампуса качается только она и перезаписывает запись в БД.
+//  - Если текущая или будущая: качаем текущую + 2 следующих из кампуса,
+//    перезаписываем в БД только изменившиеся.
 
 async function syncAll() {
   if (state.syncing) return;
+  if (!state.campusEnabled) {
+    updateSyncUI('error', 'Загрузка из кампуса отключена в настройках');
+    return;
+  }
   state.syncing = true;
   updateSyncUI('syncing');
 
+  // Сохраняем выбранную неделю, чтобы остаться на ней
   const savedWeekValue = state.weeks[state.currentWeekIdx]?.value;
+  let savedIdx = state.currentWeekIdx;
 
   try {
+    // Обновляем список недель, сохраняя выбор
     await syncWeeksFromCampus(true);
 
     if (savedWeekValue) {
       const idx = state.weeks.findIndex(w => w.value === savedWeekValue);
-      if (idx >= 0) state.currentWeekIdx = idx;
+      if (idx >= 0) savedIdx = idx;
+      state.currentWeekIdx = savedIdx;
     }
+    renderWeekNav();
 
-    const weekIndices = getWeeksToSync();
+    const realCurrentIdx = findRealCurrentIdx();
+    const userIsOnPast = savedIdx < realCurrentIdx;
+
+    const weekIndices = userIsOnPast
+      ? [savedIdx]
+      : collectForwardRange(savedIdx, 2);
 
     const results = await Promise.all(
       weekIndices.map(async (i) => {
@@ -206,7 +353,6 @@ async function syncAll() {
     );
 
     const validSchedules = results.filter(Boolean);
-
     if (validSchedules.length === 0) {
       throw new Error('Не удалось получить расписание ни для одной недели');
     }
@@ -217,6 +363,7 @@ async function syncAll() {
       schedules: validSchedules,
     });
 
+    // Обновляем только ту неделю, на которой находится пользователь
     const currentWeek = state.weeks[state.currentWeekIdx];
     if (currentWeek) {
       const match = validSchedules.find(s => s.weekCode === currentWeek.value);
@@ -237,6 +384,15 @@ async function syncAll() {
   } finally {
     state.syncing = false;
   }
+}
+
+// Собрать диапазон индексов: startIdx..(startIdx + ahead) включительно,
+// ограниченный длиной state.weeks. Используется при обновлении вперёд.
+function collectForwardRange(startIdx, ahead) {
+  const result = [];
+  const to = Math.min(state.weeks.length - 1, startIdx + ahead);
+  for (let i = startIdx; i <= to; i++) result.push(i);
+  return result;
 }
 
 async function syncWeeksFromCampus(preserveWeek = false) {
@@ -485,58 +641,34 @@ async function apiDelete(path, params = {}) {
 
 // ── Weeks ─────────────────────────────────────────────────────
 
-function findCurrentWeek() {
+// Индекс «реальной» текущей недели по календарю (или 0, если не нашлось).
+function findRealCurrentIdx() {
   const today = new Date();
-  let found = -1;
-
   for (let i = 0; i < state.weeks.length; i++) {
     const w = state.weeks[i];
     if (w.dates.length >= 2) {
       const start = parseDate(w.dates[0]);
       const end = parseDate(w.dates[1]);
-      if (today >= start && today <= end) {
-        found = i;
-        break;
-      }
+      if (today >= start && today <= end) return i;
     }
   }
+  return 0;
+}
 
-  state.currentWeekIdx = found >= 0 ? found : 0;
+function findCurrentWeek() {
+  state.currentWeekIdx = findRealCurrentIdx();
+}
+
+// Убираем поле parsedAt для сравнения расписаний «тело vs тело».
+function stripComparable(data) {
+  if (!data || typeof data !== 'object') return data;
+  const { parsedAt, ...rest } = data;
+  return rest;
 }
 
 function getWeeksToSync() {
-  const today = new Date();
-  const userIdx = state.currentWeekIdx;
-
-  let realCurrentIdx = -1;
-  for (let i = 0; i < state.weeks.length; i++) {
-    const w = state.weeks[i];
-    if (w.dates.length >= 2) {
-      const start = parseDate(w.dates[0]);
-      const end = parseDate(w.dates[1]);
-      if (today >= start && today <= end) {
-        realCurrentIdx = i;
-        break;
-      }
-    }
-  }
-  if (realCurrentIdx < 0) realCurrentIdx = 0;
-
-  let from, to;
-  if (userIdx < realCurrentIdx) {
-    from = userIdx;
-    to = userIdx;
-  } else if (userIdx === realCurrentIdx) {
-    from = realCurrentIdx;
-    to = Math.min(realCurrentIdx + 4, state.weeks.length - 1);
-  } else {
-    from = realCurrentIdx;
-    to = Math.min(userIdx + 2, state.weeks.length - 1);
-  }
-
-  const result = [];
-  for (let i = from; i <= to; i++) result.push(i);
-  return result;
+  // Не используется напрямую после рефакторинга, оставлено для совместимости.
+  return collectForwardRange(findRealCurrentIdx(), 4);
 }
 
 function renderWeekNav() {
@@ -546,17 +678,15 @@ function renderWeekNav() {
 
   document.getElementById('prevWeek').onclick = () => {
     if (state.currentWeekIdx > 0) {
-      state.currentWeekIdx--;
+      loadSchedule(state.currentWeekIdx - 1);
       renderWeekNav();
-      loadSchedule();
     }
   };
 
   document.getElementById('nextWeek').onclick = () => {
     if (state.currentWeekIdx < state.weeks.length - 1) {
-      state.currentWeekIdx++;
+      loadSchedule(state.currentWeekIdx + 1);
       renderWeekNav();
-      loadSchedule();
     }
   };
 }
@@ -877,6 +1007,7 @@ function setupSettingsModal() {
   document.getElementById('settingsBtn').onclick = () => {
     document.getElementById('groupInput').value = state.group;
     document.getElementById('apiUrlInput').value = state.apiBase;
+    document.getElementById('campusToggle').checked = state.campusEnabled;
     modal.classList.remove('hidden');
   };
 
@@ -886,8 +1017,10 @@ function setupSettingsModal() {
   document.getElementById('saveSettings').onclick = () => {
     state.group = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
     state.apiBase = document.getElementById('apiUrlInput').value.trim();
+    state.campusEnabled = document.getElementById('campusToggle').checked;
     localStorage.setItem('group', state.group);
     localStorage.setItem('apiBase', state.apiBase);
+    localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
     modal.classList.add('hidden');
     state.selectedDay = null;
     loadData();
