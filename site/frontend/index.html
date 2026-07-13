@@ -87,15 +87,13 @@
           <label>
             Тип пары
             <select id="hwPairType">
+              <option value="л">Лекция (л.)</option>
+              <option value="пр">Практика (пр.)</option>
+              <option value="лаб">Лабораторная (лаб.)</option>
+              <option value="зчО">Зачёт с оценкой (зчО.)</option>
+              <option value="зач">Зачёт (зач.)</option>
+              <option value="экз">Экзамен (экз.)</option>
               <option value="any">Любой</option>
-              <option value="л">Лекция</option>
-              <option value="пр">Практика</option>
-              <option value="пз">Практическое занятие</option>
-              <option value="лаб">Лабораторная</option>
-              <option value="с">Семинар</option>
-              <option value="зчО">Зачёт с оценкой</option>
-              <option value="зач">Зачёт</option>
-              <option value="экз">Экзамен</option>
             </select>
           </label>
         </div>
@@ -108,6 +106,7 @@
         <label>
           Задание
           <textarea id="hwTask" rows="3" placeholder="Выполнить упражнения 1-5..."></textarea>
+          <div id="hwTaskError" class="hw-error hidden">Заполните поле задания</div>
         </label>
         <div class="hw-due-mode">
           <label class="hw-mode-radio">

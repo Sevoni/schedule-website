@@ -340,8 +340,32 @@ header {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-word;
+}
+
+.hw-error {
+  color: var(--red);
+  font-size: 0.8rem;
+  margin-top: 2px;
+}
+
+.hw-show-more {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 4px;
+  text-decoration: underline;
+  flex-shrink: 0;
+}
+
+.hw-full[hidden] {
+  display: none;
+}
+
+.hw-short-collapsed {
+  display: none;
 }
 
 .pair-hw-due {
@@ -565,6 +589,8 @@ header {
   border-radius: var(--radius);
   width: 100%;
   max-width: 400px;
+  max-height: 90vh;
+  overflow-y: auto;
 }
 
 .modal-header {

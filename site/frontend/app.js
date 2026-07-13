@@ -507,6 +507,8 @@ const PAIR_TYPE_NAMES = {
   'экз': 'экзамен',
 };
 
+const ALLOWED_PAIR_TYPES = ['л', 'пр', 'лаб', 'зчО', 'зач', 'экз'];
+
 function parsePairCell(html) {
   const subgroupMatch = html.match(/<b>\s*(подгруппа\s*\d)\s*<\/b>/i);
   const subgroup = subgroupMatch ? subgroupMatch[1].trim() : '';
@@ -766,7 +768,7 @@ function renderDaySchedule(day) {
       const typeClass = PAIR_TYPE_NAMES[p.type] || '';
       const typeFullName = PAIR_TYPE_NAMES[p.type] || p.type || '';
 
-      const hwItems = getHwForSubject(p.subject);
+      const hwItems = getHwForPair(p.subject, p.type, dayData.date);
       let hwHtml = '';
       if (hwItems.length) {
         hwHtml = '<div class="pair-hw">' + hwItems.map(hw => {
@@ -779,7 +781,8 @@ function renderDaySchedule(day) {
             if (df < 0) dc = ' overdue';
             else if (df <= 2) dc = ' due-soon';
           }
-          return `<div class="pair-hw-item${dc}"><span class="pair-hw-task">${escHtml(hw.task || 'задание')}</span>${hw.dueDate ? `<span class="pair-hw-due">${escHtml(hw.dueDate)}</span>` : ''}</div>`;
+          const dueText = (hw.dueDate ? escHtml(hw.dueDate) : '') + (hw.author ? ' · ' + escHtml(hw.author) : '');
+          return `<div class="pair-hw-item${dc}"><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
 
@@ -807,16 +810,18 @@ function renderDaySchedule(day) {
     }
   }
 
-  content.innerHTML = `
-    <div class="day-schedule">
-      <div class="day-header">
-        ${day}
-        <span class="day-date">${dayData.date}</span>
-      </div>
-      ${pairsHtml}
-    </div>`;
+   content.innerHTML = `
+     <div class="day-schedule">
+       <div class="day-header">
+         ${day}
+         <span class="day-date">${dayData.date}</span>
+       </div>
+       ${pairsHtml}
+     </div>`;
 
-  content.querySelectorAll('.pair-add-hw').forEach(btn => {
+   attachShowMore(content);
+
+   content.querySelectorAll('.pair-add-hw').forEach(btn => {
     btn.onclick = (e) => {
       e.stopPropagation();
       openHwModal(btn.dataset.subj, btn.dataset.type);
@@ -905,6 +910,16 @@ function getAllSubjects() {
   return { today, all: [...today, ...rest] };
 }
 
+function normalizeDateToISO(str) {
+  if (!str) return '';
+  str = str.trim();
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return str;
+}
+
 function getHwForSubject(subj) {
   if (!subj) return [];
   const base = subj.trim().toLowerCase();
@@ -912,6 +927,53 @@ function getHwForSubject(subj) {
     const hBase = (h.subject || '').toLowerCase();
     if (hBase !== base) return false;
     return true;
+  });
+}
+
+function getHwForPair(subject, pairType, dayDate) {
+  if (!subject) return [];
+  const base = subject.trim().toLowerCase();
+  const dISO = normalizeDateToISO(dayDate);
+  return state.homework.filter(h => {
+    if (!h.dueDate) return false;
+    if ((h.subject || '').trim().toLowerCase() !== base) return false;
+    if (h.pairType && h.pairType !== 'any' && h.pairType !== pairType) return false;
+    if (normalizeDateToISO(h.dueDate) !== dISO) return false;
+    return true;
+  });
+}
+
+function hwTaskMarkup(task, fallback) {
+  const full = task || fallback || '';
+  if (full.length <= 120) {
+    return `<span class="hw-text"><span class="hw-short">${escHtml(full)}</span></span>`;
+  }
+  return `<span class="hw-text">`
+    + `<span class="hw-short">${escHtml(full.slice(0, 120))}… </span>`
+    + `<span class="hw-full" hidden>${escHtml(full)}</span>`
+    + `<button type="button" class="hw-show-more">показать полностью</button>`
+    + `</span>`;
+}
+
+function attachShowMore(container) {
+  container.querySelectorAll('.hw-show-more').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const root = btn.closest('.hw-text');
+      if (!root) return;
+      const full = root.querySelector('.hw-full');
+      const short = root.querySelector('.hw-short');
+      const expanded = full.hasAttribute('hidden');
+      if (expanded) {
+        full.removeAttribute('hidden');
+        if (short) short.classList.add('hw-short-collapsed');
+        btn.textContent = 'скрыть';
+      } else {
+        full.setAttribute('hidden', '');
+        if (short) short.classList.remove('hw-short-collapsed');
+        btn.textContent = 'показать полностью';
+      }
+    });
   });
 }
 
@@ -1069,11 +1131,20 @@ function setupHomeworkModal() {
     const isCustom = sel.value === '__custom__';
     const subject = isCustom
       ? document.getElementById('hwSubjectCustom').value.trim()
-      : (sel.options[sel.selectedIndex]?.textContent || sel.value);
+      : sel.value;
 
     if (!subject) return;
 
-    const task = document.getElementById('hwTask').value.trim();
+    const taskEl = document.getElementById('hwTask');
+    const task = taskEl.value.trim();
+    const taskError = document.getElementById('hwTaskError');
+    if (!task) {
+      taskError.classList.remove('hidden');
+      taskEl.focus();
+      return;
+    }
+    taskError.classList.add('hidden');
+
     const author = document.getElementById('hwAuthor').value.trim();
 
     // Определяем dueMode
@@ -1109,12 +1180,41 @@ function setupHomeworkModal() {
   };
 }
 
+function populatePairTypeSelect(subject) {
+  const sel = document.getElementById('hwPairType');
+  sel.innerHTML = '';
+  const entry = loadedSubjects.find(s => s.subject.toLowerCase() === (subject || '').toLowerCase());
+  const types = entry ? entry.pairTypes.filter(t => ALLOWED_PAIR_TYPES.includes(t)) : [];
+  for (const t of types) {
+    const o = document.createElement('option');
+    o.value = t;
+    o.textContent = (PAIR_TYPE_NAMES[t] || t) + ' (' + t + '.)';
+    sel.appendChild(o);
+  }
+  const anyO = document.createElement('option');
+  anyO.value = 'any';
+  anyO.textContent = 'Любой';
+  sel.appendChild(anyO);
+}
+
 function setPairTypeFromSelected(val) {
   const sel = document.getElementById('hwPairType');
+  populatePairTypeSelect(val);
   sel.disabled = false;
+  if (val === '__custom__') {
+    sel.value = 'any';
+    return;
+  }
   const todayPairs = getTodaySubjectPairs();
-  const match = todayPairs.find(p => p.subject === val && p.type);
-  if (match) {
+  const match = todayPairs.find(p => p.subject.toLowerCase() === val.toLowerCase() && p.type);
+  if (match && ALLOWED_PAIR_TYPES.includes(match.type)) {
+    let opt = [...sel.options].find(o => o.value === match.type);
+    if (!opt) {
+      opt = document.createElement('option');
+      opt.value = match.type;
+      opt.textContent = (PAIR_TYPE_NAMES[match.type] || match.type) + ' (' + match.type + '.)';
+      sel.insertBefore(opt, sel.querySelector('option[value="any"]'));
+    }
     sel.value = match.type;
   } else {
     sel.value = 'any';
@@ -1202,6 +1302,7 @@ function openHwModal(preSubject, prePairType) {
 
   // Сброс form
   document.getElementById('hwTask').value = '';
+  document.getElementById('hwTaskError').classList.add('hidden');
   document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
 
   // Due mode
@@ -1299,13 +1400,15 @@ function renderHomework() {
       <div class="hw-card ${cardClass}">
         <div class="hw-info">
           <div class="hw-subject">${subjectHtml} ${dueModeHint}</div>
-          <div class="hw-task">${escHtml(hw.task)}</div>
+          <div class="hw-task">${hwTaskMarkup(hw.task)}</div>
           ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
           ${authorHtml}
         </div>
         <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
       </div>`;
   }).join('');
+
+  attachShowMore(list);
 
   list.querySelectorAll('.hw-delete').forEach(btn => {
     btn.onclick = async () => {
