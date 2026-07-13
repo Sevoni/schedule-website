@@ -28,6 +28,12 @@ export default {
       if (path === '/api/upload' && method === 'POST') {
         return await handleUpload(request, env, corsHeaders);
       }
+      if (path === '/api/subjects' && method === 'GET') {
+        return await handleGetSubjects(request, env, corsHeaders);
+      }
+      if (path === '/api/subjects' && method === 'POST') {
+        return await handlePutSubjects(request, env, corsHeaders);
+      }
       if (path === '/api/hw' && method === 'GET') {
         return await handleGetHw(request, env, corsHeaders);
       }
@@ -36,6 +42,9 @@ export default {
       }
       if (path === '/api/hw' && method === 'DELETE') {
         return await handleDeleteHw(request, env, corsHeaders);
+      }
+      if (path === '/api/hw/recalc' && method === 'POST') {
+        return await handleRecalcHw(request, env, corsHeaders);
       }
 
       // ── Auth endpoints ───────────────────────────────────
@@ -263,7 +272,32 @@ async function handleUpload(request, env, corsHeaders) {
       lastWeek: 'batch',
     }), { expirationTtl: 604800 });
 
-    return jsonResponse({ ok: true, type: 'schedule-batch', updated: updated.length, total: schedules.length }, corsHeaders);
+    // Обновим список предметов для текущего семестра по всем неделям в БД
+    let subjectsUpdated = false;
+    try {
+      subjectsUpdated = await updateSubjectsForCurrentSemester(env, group);
+    } catch (e) {
+      console.log('subjects update skipped:', e.message);
+    }
+
+    // Если записано изменённое расписание — пересчитаем dueDate для ДЗ с nextPair
+    let recalcResult = null;
+    if (updated.length > 0) {
+      try {
+        recalcResult = await recalcHomeworkForGroup(env, group);
+      } catch (e) {
+        console.log('hw recalc skipped:', e.message);
+      }
+    }
+
+    return jsonResponse({
+      ok: true,
+      type: 'schedule-batch',
+      updated: updated.length,
+      total: schedules.length,
+      subjectsUpdated,
+      recalc: recalcResult,
+    }, corsHeaders);
   }
 
   return jsonResponse({ error: 'Invalid type' }, corsHeaders, 400);
@@ -297,24 +331,34 @@ async function handleAddHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { group, subject, task, dueDate, author } = body;
+  const { group, subject, task, dueDate, dueMode, pairType, author } = body;
 
   if (!group || !subject) {
     return jsonResponse({ error: 'Missing group or subject' }, corsHeaders, 400);
   }
 
-  const key = `hw:${group}`;
-  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  if (!dueMode || !['nextPair', 'date'].includes(dueMode)) {
+    return jsonResponse({ error: 'Invalid dueMode' }, corsHeaders, 400);
+  }
 
   const item = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     subject,
+    pairType: pairType || 'any',
     task: task || '',
+    dueMode,
     dueDate: dueDate || '',
     author: author || '',
     createdAt: new Date().toISOString(),
   };
 
+  // Если nextPair — посчитаем dueDate сразу на основе расписаний в БД
+  if (dueMode === 'nextPair') {
+    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType);
+  }
+
+  const key = `hw:${group}`;
+  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
   existing.push(item);
   await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
@@ -345,7 +389,232 @@ async function handleDeleteHw(request, env, corsHeaders) {
   return jsonResponse({ ok: true, count: filtered.length }, corsHeaders);
 }
 
-// ── GET /api/status ────────────────────────────────────────────
+// ── GET /api/subjects?group=... ─────────────────────────────────
+// Возвращает { semester, subjects: [{subject, pairTypes: ['л','пр',...]}] }
+
+async function handleGetSubjects(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const semester = currentSemesterKey();
+
+  const key = `subjects:${group}:${semester}`;
+  const data = await env.SCHEDULE.get(key, { type: 'json' });
+  return jsonResponse({ semester, subjects: data || [] }, corsHeaders);
+}
+
+// ── POST /api/subjects ─────────────────────────────────────────
+// Body: { group, semester?, subjects } — пересохраняет список предметов.
+
+async function handlePutSubjects(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json();
+  const { group, subjects, semester } = body;
+  if (!group || !Array.isArray(subjects)) {
+    return jsonResponse({ error: 'Missing group or subjects' }, corsHeaders, 400);
+  }
+
+  const sem = semester || currentSemesterKey();
+  await env.SCHEDULE.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
+    expirationTtl: 365 * 24 * 60 * 60,
+  });
+  return jsonResponse({ ok: true, semester: sem, count: subjects.length }, corsHeaders);
+}
+
+// ── POST /api/hw/recalc ─────────────────────────────────────────
+// Тело: { group } — пересчитывает dueDate для всех ДЗ с dueMode='nextPair'
+// на основе всех расписаний в БД. Возвращает обновлённые items.
+
+async function handleRecalcHw(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const group = body.group || env.DEFAULT_GROUP || '131-ИБо';
+
+  const result = await recalcHomeworkForGroup(env, group);
+  return jsonResponse({ ok: true, ...result }, corsHeaders);
+}
+
+// ── Семестр (ключ для storage) ─────────────────────────────────────
+// Границы: 31 января → весна (31.01 - 30.06), 1 августа → осень (01.08 - 30.01).
+// Возвращает строку вида "2025-2026-весна" / "2026-2027-осень".
+
+function currentSemesterKey(now = new Date()) {
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const d = now.getDate();
+
+  // осень: с 1 августа по 30 января
+  if (m >= 8) {
+    return `${y}-${y + 1}-осень`;
+  }
+  if (m === 1 && d < 31) {
+    return `${y - 1}-${y}-осень`;
+  }
+  // весна: с 31 января по 31 июля
+  return `${y - 1}-${y}-весна`;
+}
+
+function semesterFromWeekDates(startStr, endStr) {
+  // start/end в формате dd.MM.yyyy
+  if (!startStr) return null;
+  const dt = parseDateLocal(startStr);
+  if (!dt) return null;
+  return currentSemesterKey(dt);
+}
+
+// Парсим dd.MM.yyyy в локальную полночь Date (как в браузере)
+function parseDateLocal(str) {
+  if (!str) return null;
+  const m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (!m) return null;
+  return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+}
+
+// ── Обновление предметов в текущем семестре по всем расписаниям в БД ──
+
+async function updateSubjectsForCurrentSemester(env, group) {
+  const semester = currentSemesterKey();
+  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  if (!list || list.keys.length === 0) return false;
+
+  const subjectsMap = new Map(); // subject -> Set(pairType)
+
+  for (const k of list.keys) {
+    const weekValue = k.name.split(`schedule:${group}:`)[1];
+    if (!weekValue || weekValue === 'current') continue;
+    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    if (!data || !data.days) continue;
+
+    if (semesterFromWeekDates(data.weekStart, data.weekEnd) !== semester) continue;
+
+    for (const day of Object.values(data.days)) {
+      for (const p of (day.pairs || [])) {
+        if (!p.subject) continue;
+        if (!subjectsMap.has(p.subject)) subjectsMap.set(p.subject, new Set());
+        if (p.type) subjectsMap.get(p.subject).add(p.type);
+      }
+    }
+  }
+
+  const subjects = [...subjectsMap.entries()]
+    .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
+    .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
+
+  await env.SCHEDULE.put(`subjects:${group}:${semester}`, JSON.stringify(subjects), {
+    expirationTtl: 365 * 24 * 60 * 60,
+  });
+  return true;
+}
+
+// ── Пересчёт dueDate для ДЗ с dueMode='nextPair' ────────────────────
+
+async function recalcHomeworkForGroup(env, group) {
+  const key = `hw:${group}`;
+  const homework = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  if (homework.length === 0) return { updated: 0, items: [] };
+
+  // Загружаем все расписания группы
+  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  const weekData = [];
+  for (const k of list.keys) {
+    const weekValue = k.name.split(`schedule:${group}:`)[1];
+    if (!weekValue || weekValue === 'current') continue;
+    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    if (data && data.days && data.weekStart) {
+      const startDate = parseDateLocal(data.weekStart);
+      if (startDate) weekData.push({ startDate, data });
+    }
+  }
+  weekData.sort((a, b) => a.startDate - b.startDate);
+
+  let changed = false;
+  const updatedItems = [];
+  for (const hw of homework) {
+    if (hw.dueMode !== 'nextPair') {
+      updatedItems.push(hw);
+      continue;
+    }
+    const newDate = findNextPairDate(weekData, hw.subject, hw.pairType, new Date());
+    if (!newDate || newDate === hw.dueDate) {
+      updatedItems.push(hw);
+      continue;
+    }
+    changed = true;
+    const upd = { ...hw, dueDate: newDate };
+    updatedItems.push(upd);
+  }
+
+  if (changed) {
+    await env.SCHEDULE.put(key, JSON.stringify(updatedItems), { expirationTtl: 2592000 });
+  }
+  return { updated: changed ? updatedItems.length : 0, items: updatedItems, changed };
+}
+
+// ── Найти следующую дату пары для предмета с учётом типа ──────────
+// Возвращает дату в формате yyyy-MM-dd (локальная) или null.
+
+function findNextPairDate(weekData, subject, pairType, fromDate) {
+  if (!subject || weekData.length === 0) return null;
+  const baseLower = subject.trim().toLowerCase();
+  const t = pairType || 'any';
+
+  const fmt = (dt) => {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, '0');
+    const d = String(dt.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  };
+  const todayStr = fmt(fromDate);
+
+  for (const week of weekData) {
+    for (const [, dayInfo] of Object.entries(week.data.days || {})) {
+      const dayDate = parseDateLocal(dayInfo.date);
+      if (!dayDate) continue;
+      const dayStr = fmt(dayDate);
+      if (dayStr < todayStr) continue;
+
+      const has = (dayInfo.pairs || []).some(p => {
+        if (!p.subject) return false;
+        if (p.subject.trim().toLowerCase() !== baseLower) return false;
+        if (t === 'any') return true;
+        return p.type === t;
+      });
+      if (has) return dayStr;
+    }
+  }
+  return null;
+}
+
+// ── Вычислить дату следующей пары для одного ДЗ ─────────────────────
+
+async function computeNextPairDate(env, group, subject, pairType) {
+  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  const weekData = [];
+  for (const k of list.keys) {
+    const weekValue = k.name.split(`schedule:${group}:`)[1];
+    if (!weekValue || weekValue === 'current') continue;
+    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    if (data && data.days && data.weekStart) {
+      const startDate = parseDateLocal(data.weekStart);
+      if (startDate) weekData.push({ startDate, data });
+    }
+  }
+  weekData.sort((a, b) => a.startDate - b.startDate);
+  return findNextPairDate(weekData, subject, pairType, new Date());
+}
+
+// ── Разделить название предмета на базу и тип пары ──────────────────
+// "Математика (л)" -> { base: "Математика", type: "л" }
+
 
 async function handleStatus(env, corsHeaders) {
   if (!env.SCHEDULE) {

@@ -61,6 +61,7 @@ async function loadData() {
     renderWeekNav();
     await loadInitialSchedules();
     loadHomework();
+    loadSubjects();
   } catch (e) {
     showError('Не удалось загрузить данные: ' + e.message, () => syncAll());
   }
@@ -173,6 +174,8 @@ async function backgroundSync(campusIndices, dbMap) {
         schedules: toUpload,
       });
       console.log('[bgSync] uploaded', toUpload.length, 'weeks');
+      loadHomework();
+      loadSubjects();
     }
 
     // Если текущая открытая неделя изменилась — перерисуем
@@ -277,6 +280,8 @@ async function backgroundSyncSingle(idx, dbData) {
         group: state.group,
         schedules: [{ weekCode: w.value, data }],
       });
+      loadHomework();
+      loadSubjects();
     }
 
     // Если пользователь всё ещё на этой неделе — обновим экран
@@ -376,6 +381,8 @@ async function syncAll() {
     renderWeekNav();
     renderDayTabs();
     updateSyncUI('ok');
+    loadHomework();
+    loadSubjects();
   } catch (e) {
     updateSyncUI('error', e.message);
     if (!state.schedule) {
@@ -485,17 +492,20 @@ function parseWeekOptions(html) {
 }
 
 function parsePairType(subject) {
-  const m = subject.match(/\((л|пр|пз|лаб|с)\)/);
-  if (!m) return '';
-  const map = {
-    'л': 'лекция',
-    'пр': 'практика',
-    'пз': 'практическое занятие',
-    'лаб': 'лабораторная',
-    'с': 'семинар',
-  };
-  return map[m[1]] || m[1];
+  const m = subject.match(/\((л|пр|пз|лаб|с|зчО|зач|экз)\.?\)/);
+  return m ? m[1] : '';
 }
+
+const PAIR_TYPE_NAMES = {
+  'л': 'лекция',
+  'пр': 'практика',
+  'пз': 'практическое занятие',
+  'лаб': 'лабораторная',
+  'с': 'семинар',
+  'зчО': 'зачёт с оценкой',
+  'зач': 'зачёт',
+  'экз': 'экзамен',
+};
 
 function parsePairCell(html) {
   const subgroupMatch = html.match(/<b>\s*(подгруппа\s*\d)\s*<\/b>/i);
@@ -510,7 +520,9 @@ function parsePairCell(html) {
     .trim();
 
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const subject = lines[0] || '';
+  const rawSubject = lines[0] || '';
+  const type = parsePairType(rawSubject);
+  const subject = rawSubject.replace(/\s*\((?:л|пр|пз|лаб|с|зчО|зач|экз)\.?\)\s*$/, '').trim();
   let teacher = '';
   let room = '';
 
@@ -525,7 +537,7 @@ function parsePairCell(html) {
     }
   }
 
-  return { subject, teacher, room, type: parsePairType(subject), subgroup };
+  return { subject, teacher, room, type, subgroup };
 }
 
 function parseScheduleHTML(html) {
@@ -751,12 +763,8 @@ function renderDaySchedule(day) {
     pairsHtml = '<div class="no-pairs">Нет пар 🎉</div>';
   } else {
     for (const p of activePairs) {
-      const typeClass = p.type
-        ? (p.type.includes('лекц') ? 'лекция'
-          : p.type.includes('лабор') ? 'лабораторная'
-          : p.type.includes('семинар') ? 'семинар'
-          : 'практика')
-        : '';
+      const typeClass = PAIR_TYPE_NAMES[p.type] || '';
+      const typeFullName = PAIR_TYPE_NAMES[p.type] || p.type || '';
 
       const hwItems = getHwForSubject(p.subject);
       let hwHtml = '';
@@ -775,7 +783,8 @@ function renderDaySchedule(day) {
         }).join('') + '</div>';
       }
 
-      const baseSubj = p.subject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
+      const baseSubj = p.subject;
+      const pairTypeCode = p.type || '';
 
       pairsHtml += `
         <div class="pair-card${p.subgroup ? ' has-subgroup' : ''}">
@@ -786,8 +795,8 @@ function renderDaySchedule(day) {
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
-              ${p.type ? `<span class="pair-type ${typeClass}">${p.type}</span>` : ''}
-              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" title="Добавить ДЗ">+</button>
+              ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
+              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" title="Добавить ДЗ">+</button>
             </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
@@ -810,7 +819,7 @@ function renderDaySchedule(day) {
   content.querySelectorAll('.pair-add-hw').forEach(btn => {
     btn.onclick = (e) => {
       e.stopPropagation();
-      openHwModal(btn.dataset.subj);
+      openHwModal(btn.dataset.subj, btn.dataset.type);
     };
   });
 }
@@ -835,19 +844,59 @@ function updateSyncUI(status, errorMsg) {
 
 // ── Subjects ─────────────────────────────────────────────────
 
+let loadedSubjects = [];
+
+async function loadSubjects() {
+  try {
+    const res = await apiFetch('/api/subjects', { group: state.group });
+    loadedSubjects = res.subjects || [];
+  } catch (e) {
+    loadedSubjects = [];
+  }
+  // Если из БД ничего нет — собираем из текущего расписания
+  if (loadedSubjects.length === 0 && state.schedule) {
+    const map = new Map();
+    for (const day of Object.values(state.schedule.days)) {
+      for (const p of (day.pairs || [])) {
+        if (!p.subject) continue;
+        if (!map.has(p.subject)) map.set(p.subject, new Set());
+        if (p.type) map.get(p.subject).add(p.type);
+      }
+    }
+    loadedSubjects = [...map.entries()]
+      .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
+      .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
+  }
+}
+
+function getTodaySubjectPairs() {
+  if (!state.schedule) return [];
+  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+  const day = state.schedule.days[todayName];
+  if (!day) return [];
+  const seen = new Set();
+  const result = [];
+  for (const p of day.pairs) {
+    if (!p.subject) continue;
+    if (seen.has(p.subject)) continue;
+    seen.add(p.subject);
+    result.push(p);
+  }
+  return result;
+}
+
 function getAllSubjects() {
   if (!state.schedule) return { today: [], all: [] };
 
+  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
   const allSet = new Set();
   const todaySet = new Set();
-  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
 
   for (const [day, data] of Object.entries(state.schedule.days)) {
     for (const p of data.pairs) {
       if (!p.subject) continue;
-      const name = p.subject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
-      allSet.add(name);
-      if (day === todayName) todaySet.add(name);
+      allSet.add(p.subject);
+      if (day === todayName) todaySet.add(p.subject);
     }
   }
 
@@ -858,59 +907,328 @@ function getAllSubjects() {
 
 function getHwForSubject(subj) {
   if (!subj) return [];
-  const base = subj.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim().toLowerCase();
+  const base = subj.trim().toLowerCase();
   return state.homework.filter(h => {
-    const hBase = (h.subject || '').replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim().toLowerCase();
-    return hBase === base;
+    const hBase = (h.subject || '').toLowerCase();
+    if (hBase !== base) return false;
+    return true;
   });
 }
 
-function openHwModal(preSubject) {
-  const modal = document.getElementById('homeworkModal');
-  const sel = document.getElementById('hwSubject');
-  const custom = document.getElementById('hwSubjectCustom');
-  const customWrap = document.getElementById('hwSubjectCustomWrap');
+// ── Calendar widget ──────────────────────────────────────────
 
-  const { all } = getAllSubjects();
+let calState = { year: 0, month: 0, selectedDate: '' };
 
-  sel.innerHTML = '';
-  if (all.length) {
-    const { today } = getAllSubjects();
-    if (today.length) {
-      const og = document.createElement('optgroup');
-      og.label = 'Сегодня';
-      today.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; og.appendChild(o); });
-      sel.appendChild(og);
-    }
-    const rest = all.filter(s => !today.includes(s));
-    if (rest.length) {
-      const og = document.createElement('optgroup');
-      og.label = 'Все предметы';
-      rest.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; og.appendChild(o); });
-      sel.appendChild(og);
-    }
+function renderCalendar(year, month, selectedDateStr) {
+  const grid = document.getElementById('hwCalGrid');
+  const title = document.getElementById('hwCalTitle');
+  const monthNames = [
+    'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+  ];
+
+  title.textContent = monthNames[month] + ' ' + year;
+
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const daysInPrev = new Date(year, month, 0).getDate();
+  const today = new Date();
+  const todayStr = formatDateISO(today);
+  const selected = selectedDateStr || '';
+
+  const dayHeaders = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+  let html = '';
+  for (const h of dayHeaders) {
+    html += '<div class="cal-day-header">' + h + '</div>';
   }
 
+  // Дни предыдущего месяца
+  const startOffset = firstDay === 0 ? 6 : firstDay - 1;
+  for (let i = startOffset - 1; i >= 0; i--) {
+    const d = daysInPrev - i;
+    html += '<div class="cal-day other-month" data-date="">' + d + '</div>';
+  }
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(year, month, d);
+    const dateStr = formatDateISO(date);
+    let cls = 'cal-day';
+    if (dateStr === todayStr) cls += ' today';
+    if (dateStr === selected) cls += ' selected';
+    if (dateStr < todayStr) cls += ' other-month'; // прошлое недоступно
+    html += '<div class="' + cls + '" data-date="' + dateStr + '">' + d + '</div>';
+  }
+
+  // Дни следующего месяца
+  const totalCells = startOffset + daysInMonth;
+  const remaining = (7 - (totalCells % 7)) % 7;
+  for (let d = 1; d <= remaining; d++) {
+    html += '<div class="cal-day other-month" data-date="">' + d + '</div>';
+  }
+
+  grid.innerHTML = html;
+
+  grid.querySelectorAll('.cal-day').forEach(el => {
+    const dateStr = el.dataset.date;
+    if (!dateStr) return;
+    if (dateStr < todayStr) {
+      el.style.cursor = 'default';
+      el.title = 'Прошедшая дата';
+      return;
+    }
+    el.onclick = () => {
+      document.querySelectorAll('.cal-day.selected').forEach(c => c.classList.remove('selected'));
+      el.classList.add('selected');
+      document.getElementById('hwDateSelected').textContent = formatDateDisplay(dateStr);
+      calState.selectedDate = dateStr;
+    };
+  });
+}
+
+function formatDateISO(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function formatDateDisplay(str) {
+  if (!str) return '—';
+  const [y, m, d] = str.split('-');
+  return `${d}.${m}.${y}`;
+}
+
+// ── Homework Modal ────────────────────────────────────────────
+
+function setupHomeworkModal() {
+  const modal = document.getElementById('homeworkModal');
+  const sel = document.getElementById('hwSubject');
+  const customWrap = document.getElementById('hwSubjectCustomWrap');
+  const pairTypeWrap = document.getElementById('hwPairTypeWrap');
+
+  document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
+
+  document.getElementById('closeHomework').onclick = () => modal.classList.add('hidden');
+  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+
+  // Предмет → управление custom / pairType / dueMode
+  sel.onchange = () => {
+    const val = sel.value;
+    if (val === '__custom__') {
+      customWrap.classList.remove('hidden');
+      pairTypeWrap.classList.add('hidden');
+      document.getElementById('hwSubjectCustom').focus();
+      // Disable nextPair for custom subjects
+      document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
+        if (r.value === 'nextPair') r.disabled = true;
+      });
+      const dateRadio = document.querySelector('input[name="hwDueMode"][value="date"]');
+      if (dateRadio) dateRadio.checked = true;
+      document.getElementById('hwDateWrap').classList.remove('hidden');
+    } else {
+      customWrap.classList.add('hidden');
+      pairTypeWrap.classList.remove('hidden');
+      setPairTypeFromSelected(val);
+      document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
+    }
+  };
+
+  // Due mode radio
+  document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
+    r.onchange = () => {
+      const dateWrap = document.getElementById('hwDateWrap');
+      if (document.querySelector('input[name="hwDueMode"]:checked')?.value === 'date') {
+        dateWrap.classList.remove('hidden');
+      } else {
+        dateWrap.classList.add('hidden');
+      }
+    };
+  });
+
+  // Calendar navigation
+  document.getElementById('hwCalPrev').onclick = () => {
+    const { year, month } = calState;
+    const newMonth = month === 0 ? 11 : month - 1;
+    const newYear = month === 0 ? year - 1 : year;
+    renderCalendar(newYear, newMonth, calState.selectedDate);
+    calState.year = newYear;
+    calState.month = newMonth;
+  };
+
+  document.getElementById('hwCalNext').onclick = () => {
+    const { year, month } = calState;
+    const newMonth = month === 11 ? 0 : month + 1;
+    const newYear = month === 11 ? year + 1 : year;
+    renderCalendar(newYear, newMonth, calState.selectedDate);
+    calState.year = newYear;
+    calState.month = newMonth;
+  };
+
+  // Save
+  document.getElementById('saveHomework').onclick = async () => {
+    const isCustom = sel.value === '__custom__';
+    const subject = isCustom
+      ? document.getElementById('hwSubjectCustom').value.trim()
+      : (sel.options[sel.selectedIndex]?.textContent || sel.value);
+
+    if (!subject) return;
+
+    const task = document.getElementById('hwTask').value.trim();
+    const author = document.getElementById('hwAuthor').value.trim();
+
+    // Определяем dueMode
+    const modeRadio = document.querySelector('input[name="hwDueMode"]:checked');
+    const dueMode = modeRadio ? modeRadio.value : 'date';
+    const dueDate = calState.selectedDate;
+    let pairType = document.getElementById('hwPairType').value;
+
+    if (!isCustom) {
+      // При выборе из select — pairType уже правильно установлен в onchange/onmount
+    }
+
+    if (author) localStorage.setItem('hwAuthor', author);
+
+    try {
+      const result = await apiPost('/api/hw', {
+        group: state.group,
+        subject: isCustom ? subject : subject,
+        pairType,
+        task,
+        dueMode,
+        dueDate,
+        author,
+      });
+
+      state.homework.push(result.item);
+      renderHomework();
+      if (state.schedule) renderDayTabs();
+      modal.classList.add('hidden');
+    } catch (e) {
+      console.warn('HW save failed:', e.message);
+    }
+  };
+}
+
+function setPairTypeFromSelected(val) {
+  const sel = document.getElementById('hwPairType');
+  sel.disabled = false;
+  const todayPairs = getTodaySubjectPairs();
+  const match = todayPairs.find(p => p.subject === val && p.type);
+  if (match) {
+    sel.value = match.type;
+  } else {
+    sel.value = 'any';
+  }
+}
+
+function openHwModal(preSubject, prePairType) {
+  const modal = document.getElementById('homeworkModal');
+  const sel = document.getElementById('hwSubject');
+  const customWrap = document.getElementById('hwSubjectCustomWrap');
+  const pairTypeWrap = document.getElementById('hwPairTypeWrap');
+
+  // Build subject list from loadedSubjects + today + current schedule
+  sel.innerHTML = '';
+
+  const todayPairs = getTodaySubjectPairs();
+  if (todayPairs.length) {
+    const og = document.createElement('optgroup');
+    og.label = 'Сегодня';
+    for (const p of todayPairs) {
+      const o = document.createElement('option');
+      const typeHint = p.type ? ' (' + (PAIR_TYPE_NAMES[p.type] || p.type) + ')' : '';
+      o.value = p.subject;
+      o.textContent = p.subject + typeHint;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+
+  // Все предметы из loadedSubjects (кроме тех, что сегодня)
+  const todayBases = new Set(todayPairs.map(p => p.subject));
+  const allItems = loadedSubjects.filter(s => !todayBases.has(s.subject));
+  if (allItems.length) {
+    const og = document.createElement('optgroup');
+    og.label = 'Все предметы';
+    for (const s of allItems) {
+      const o = document.createElement('option');
+      o.value = s.subject;
+      const typeHint = s.pairTypes.length ? ' (' + s.pairTypes.join(', ') + ')' : '';
+      o.textContent = s.subject + typeHint;
+      og.appendChild(o);
+    }
+    sel.appendChild(og);
+  }
+
+  // Другой
   const co = document.createElement('option');
   co.value = '__custom__';
   co.textContent = 'Другой...';
   sel.appendChild(co);
 
+  // Preselect
   if (preSubject) {
-    const base = preSubject.replace(/\s*\((?:л|пр|пз|лаб|с)\)\s*$/, '').trim();
-    const match = all.find(s => s.toLowerCase() === base.toLowerCase());
-    sel.value = match || '__custom__';
-    if (!match) { customWrap.classList.remove('hidden'); custom.value = preSubject; }
-    else { customWrap.classList.add('hidden'); custom.value = ''; }
+    const match = loadedSubjects.find(s => s.subject.toLowerCase() === preSubject.toLowerCase());
+    const todayMatch = todayPairs.find(p => p.subject.toLowerCase() === preSubject.toLowerCase());
+    if (todayMatch) {
+      sel.value = preSubject;
+    } else if (match) {
+      sel.value = match.subject;
+      setPairTypeFromSelected(match.subject);
+      if (prePairType && prePairType !== 'any') {
+        document.getElementById('hwPairType').value = prePairType;
+        document.getElementById('hwPairType').disabled = false;
+      }
+    } else {
+      // custom
+      sel.value = '__custom__';
+      customWrap.classList.remove('hidden');
+      document.getElementById('hwSubjectCustom').value = preSubject;
+    }
   } else {
-    sel.value = all.length ? all[0] : '__custom__';
-    customWrap.classList.add('hidden');
-    custom.value = '';
+    sel.value = todayPairs.length ? todayPairs[0].subject : (allItems.length ? allItems[0].subject : '__custom__');
+    if (sel.value !== '__custom__') {
+      customWrap.classList.add('hidden');
+      setPairTypeFromSelected(sel.value);
+    } else {
+      customWrap.classList.remove('hidden');
+      pairTypeWrap.classList.add('hidden');
+    }
   }
 
+  if (sel.value !== '__custom__') {
+    pairTypeWrap.classList.remove('hidden');
+  }
+
+  // Сброс form
   document.getElementById('hwTask').value = '';
-  document.getElementById('hwDueDate').value = '';
   document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
+
+  // Due mode
+  document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
+  const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
+  if (defaultMode) defaultMode.checked = true;
+  if (sel.value === '__custom__') {
+    document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
+    document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
+  }
+  document.getElementById('hwDateWrap').classList.add('hidden');
+
+  // Calendar init
+  const today = new Date();
+  calState.year = today.getFullYear();
+  calState.month = today.getMonth();
+  calState.selectedDate = '';
+  renderCalendar(calState.year, calState.month, '');
+  document.getElementById('hwDateSelected').textContent = '—';
+
+  if (preSubject && prePairType) {
+    setPairTypeFromSelected(preSubject);
+    if (prePairType !== 'any') {
+      document.getElementById('hwPairType').value = prePairType;
+    }
+  }
+
   modal.classList.remove('hidden');
   document.getElementById('hwTask').focus();
 }
@@ -973,10 +1291,14 @@ function renderHomework() {
       ? '<div class="hw-author">— ' + escHtml(hw.author) + '</div>'
       : '';
 
+    const subjectHtml = escHtml(hw.subject) +
+      (hw.pairType && hw.pairType !== 'any' ? ' <span class="hw-pair-type">(' + escHtml(hw.pairType) + ')</span>' : '');
+    const dueModeHint = hw.dueMode === 'nextPair' ? '<span class="hw-mode-hint" title="Автоматически">↻</span>' : '';
+
     return `
       <div class="hw-card ${cardClass}">
         <div class="hw-info">
-          <div class="hw-subject">${escHtml(hw.subject)}</div>
+          <div class="hw-subject">${subjectHtml} ${dueModeHint}</div>
           <div class="hw-task">${escHtml(hw.task)}</div>
           ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
           ${authorHtml}
@@ -1024,58 +1346,6 @@ function setupSettingsModal() {
     modal.classList.add('hidden');
     state.selectedDay = null;
     loadData();
-  };
-}
-
-// ── Homework Modal ────────────────────────────────────────────
-
-function setupHomeworkModal() {
-  const modal = document.getElementById('homeworkModal');
-  const sel = document.getElementById('hwSubject');
-  const customWrap = document.getElementById('hwSubjectCustomWrap');
-
-  document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
-
-  document.getElementById('closeHomework').onclick = () => modal.classList.add('hidden');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
-
-  sel.onchange = () => {
-    if (sel.value === '__custom__') {
-      customWrap.classList.remove('hidden');
-      document.getElementById('hwSubjectCustom').focus();
-    } else {
-      customWrap.classList.add('hidden');
-    }
-  };
-
-  document.getElementById('saveHomework').onclick = async () => {
-    const subject = sel.value === '__custom__'
-      ? document.getElementById('hwSubjectCustom').value.trim()
-      : sel.value;
-    const task = document.getElementById('hwTask').value.trim();
-    const dueDate = document.getElementById('hwDueDate').value;
-    const author = document.getElementById('hwAuthor').value.trim();
-
-    if (!subject) return;
-
-    if (author) localStorage.setItem('hwAuthor', author);
-
-    try {
-      const result = await apiPost('/api/hw', {
-        group: state.group,
-        subject,
-        task,
-        dueDate,
-        author,
-      });
-
-      state.homework.push(result.item);
-      renderHomework();
-      if (state.schedule) renderDayTabs();
-      modal.classList.add('hidden');
-    } catch (e) {
-      console.warn('HW save failed:', e.message);
-    }
   };
 }
 

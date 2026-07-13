@@ -656,6 +656,124 @@ header {
   opacity: 0.85;
 }
 
+/* ── Homework modal additions ───────────────────────────────── */
+
+.hw-due-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hw-mode-radio {
+  display: flex;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9rem !important;
+  color: var(--text) !important;
+  cursor: pointer;
+}
+
+.hw-mode-radio input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.hw-calendar-wrap {
+  margin-top: 4px;
+}
+
+.hw-calendar {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  user-select: none;
+}
+
+.hw-cal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.hw-cal-header button {
+  background: none;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 4px 8px;
+}
+
+.hw-cal-header button:hover {
+  opacity: 0.7;
+}
+
+#hwCalTitle {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.hw-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+  text-align: center;
+}
+
+.hw-cal-grid .cal-day-header {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  padding: 4px 0;
+}
+
+.hw-cal-grid .cal-day {
+  padding: 6px 0;
+  font-size: 0.85rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.hw-cal-grid .cal-day:hover {
+  background: var(--border);
+}
+
+.hw-cal-grid .cal-day.selected {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.hw-cal-grid .cal-day.other-month {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+
+.hw-cal-grid .cal-day.today {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.hw-date-selected {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+#hwDateSelected {
+  color: var(--text);
+  font-weight: 600;
+}
+
+#hwPairTypeWrap {
+  margin-top: 4px;
+}
+
 /* Mobile tweaks */
 @media (max-width: 400px) {
   .container { padding: 10px; }

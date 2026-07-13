@@ -34,6 +34,21 @@ No install step needed — only `wrangler` is a devDependency.
 - **Auth**: simple token scheme — `btoa(JSON.stringify({group, ts}))` as Bearer token, 30-day expiry. Passwords stored as SHA-256 hashes in KV.
 - **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
 
+## Data model
+
+- **Schedule pair** `{ subject, teacher, room, type, subgroup }`:
+  - `subject`: clean name, no type suffix (e.g. `"Математика"`)
+  - `type`: pair type code (`"л"`, `"пр"`, `"пз"`, `"лаб"`, `"с"`, `"зчО"`, `"зач"`, `""`)
+  - Display name via `PAIR_TYPE_NAMES[type]` (e.g. `"лекция"`)
+- **Homework** `{ subject, pairType, dueMode, ... }`:
+  - `pairType`: code (`"л"`, `"пр"`, etc.) or `"any"` for all types
+  - `dueMode`: `"nextPair"` or `"date"`
+- Subject matching in worker uses `p.subject` and `p.type` directly — no `splitSubjectType()` needed.
+
+## Campus sync
+
+Campus sync updates the **server-side KV cache** — it fetches HTML from `campus.syktsu.ru`, parses it, and stores schedule data in the Worker's KV storage. This is needed because the campus API is not available to the browser (CORS), so the Worker acts as a proxy/cache. The frontend always reads from KV first, and only falls back to parsing campus directly in the browser if the cache is empty.
+
 ## HTML parser
 
 Both frontends parse `campus.syktsu.ru` HTML with regex (not DOM). The parser extracts: week options (`<select name="weeks">`), schedule table (`<table class="schedule">`), day headers, pair cells. If the university changes their HTML structure, these regexes break.

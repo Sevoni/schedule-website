@@ -83,6 +83,22 @@
           Предмет
           <select id="hwSubject"></select>
         </label>
+        <div id="hwPairTypeWrap">
+          <label>
+            Тип пары
+            <select id="hwPairType">
+              <option value="any">Любой</option>
+              <option value="л">Лекция</option>
+              <option value="пр">Практика</option>
+              <option value="пз">Практическое занятие</option>
+              <option value="лаб">Лабораторная</option>
+              <option value="с">Семинар</option>
+              <option value="зчО">Зачёт с оценкой</option>
+              <option value="зач">Зачёт</option>
+              <option value="экз">Экзамен</option>
+            </select>
+          </label>
+        </div>
         <div id="hwSubjectCustomWrap" class="hidden">
           <label>
             Название предмета
@@ -93,10 +109,27 @@
           Задание
           <textarea id="hwTask" rows="3" placeholder="Выполнить упражнения 1-5..."></textarea>
         </label>
-        <label>
-          Сдать до
-          <input type="date" id="hwDueDate">
-        </label>
+        <div class="hw-due-mode">
+          <label class="hw-mode-radio">
+            <input type="radio" name="hwDueMode" value="nextPair">
+            <span>Следующая пара</span>
+          </label>
+          <label class="hw-mode-radio">
+            <input type="radio" name="hwDueMode" value="date">
+            <span>Дата</span>
+          </label>
+        </div>
+        <div id="hwDateWrap" class="hw-calendar-wrap hidden">
+          <div class="hw-calendar">
+            <div class="hw-cal-header">
+              <button type="button" id="hwCalPrev">◀</button>
+              <span id="hwCalTitle"></span>
+              <button type="button" id="hwCalNext">▶</button>
+            </div>
+            <div class="hw-cal-grid" id="hwCalGrid"></div>
+          </div>
+          <div class="hw-date-selected">Выбрано: <span id="hwDateSelected">—</span></div>
+        </div>
         <label>
           Автор
           <input type="text" id="hwAuthor" placeholder="Ваше имя (необязательно)">

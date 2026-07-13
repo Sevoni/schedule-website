@@ -29,17 +29,20 @@ export function parseWeekOptions(html) {
 }
 
 export function parsePairType(subject) {
-  const m = subject.match(/\((л|пр|пз|лаб|с)\)/);
-  if (!m) return '';
-  const map = {
-    'л': 'лекция',
-    'пр': 'практика',
-    'пз': 'практическое занятие',
-    'лаб': 'лабораторная',
-    'с': 'семинар',
-  };
-  return map[m[1]] || m[1];
+  const m = subject.match(/\((л|пр|пз|лаб|с|зчО|зач|экз)\.?\)/);
+  return m ? m[1] : '';
 }
+
+export const PAIR_TYPE_NAMES = {
+  'л': 'лекция',
+  'пр': 'практика',
+  'пз': 'практическое занятие',
+  'лаб': 'лабораторная',
+  'с': 'семинар',
+  'зчО': 'зачёт с оценкой',
+  'зач': 'зачёт',
+  'экз': 'экзамен',
+};
 
 export function parsePairCell(html) {
   const subgroupMatch = html.match(/<b>\s*(подгруппа\s*\d)\s*<\/b>/i);
@@ -54,7 +57,9 @@ export function parsePairCell(html) {
     .trim();
 
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const subject = lines[0] || '';
+  const rawSubject = lines[0] || '';
+  const type = parsePairType(rawSubject);
+  const subject = rawSubject.replace(/\s*\((?:л|пр|пз|лаб|с|зчО|зач|экз)\.?\)\s*$/, '').trim();
   let teacher = '';
   let room = '';
 
@@ -69,7 +74,7 @@ export function parsePairCell(html) {
     }
   }
 
-  return { subject, teacher, room, type: parsePairType(subject), subgroup };
+  return { subject, teacher, room, type, subgroup };
 }
 
 export function parseScheduleHTML(html) {
@@ -175,7 +180,7 @@ export function escHtml(str) {
 }
 
 export function extractBaseSubject(subject) {
-  return subject;
+  return subject.replace(/\s*\((?:л|пр|пз|лаб|с|зчО|зач|экз)\.?\)\s*$/, '').trim();
 }
 
 /**
