@@ -240,6 +240,12 @@ async function handleUpload(request, env, corsHeaders) {
       lastWeek: weekCode || 'current',
     }), { expirationTtl: 604800 });
 
+    try {
+      await updateSubjectsForCurrentSemester(env, group);
+    } catch (e) {
+      console.log('subjects update skipped:', e.message);
+    }
+
     return jsonResponse({ ok: true, type: 'schedule', group, weekCode }, corsHeaders);
   }
 
@@ -402,7 +408,17 @@ async function handleGetSubjects(request, env, corsHeaders) {
   const semester = currentSemesterKey();
 
   const key = `subjects:${group}:${semester}`;
-  const data = await env.SCHEDULE.get(key, { type: 'json' });
+  let data = await env.SCHEDULE.get(key, { type: 'json' });
+
+  if (!data || data.length === 0) {
+    try {
+      await updateSubjectsForCurrentSemester(env, group);
+      data = await env.SCHEDULE.get(key, { type: 'json' });
+    } catch (e) {
+      console.log('subjects auto-recompute failed:', e.message);
+    }
+  }
+
   return jsonResponse({ semester, subjects: data || [] }, corsHeaders);
 }
 
@@ -464,9 +480,9 @@ function currentSemesterKey(now = new Date()) {
 }
 
 function semesterFromWeekDates(startStr, endStr) {
-  // start/end в формате dd.MM.yyyy
-  if (!startStr) return null;
-  const dt = parseDateLocal(startStr);
+  // dd.MM.yyyy — классифицируем по концу недели
+  if (!endStr) return null;
+  const dt = parseDateLocal(endStr);
   if (!dt) return null;
   return currentSemesterKey(dt);
 }
@@ -491,7 +507,12 @@ async function updateSubjectsForCurrentSemester(env, group) {
   for (const k of list.keys) {
     const weekValue = k.name.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    let data;
+    try {
+      data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    } catch (e) {
+      continue;
+    }
     if (!data || !data.days) continue;
 
     if (semesterFromWeekDates(data.weekStart, data.weekEnd) !== semester) continue;
