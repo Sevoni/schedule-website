@@ -269,6 +269,13 @@ async function handleUpload(request, env, corsHeaders) {
       if (existingStr !== newStr) {
         await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
         updated.push(weekCode);
+
+        // Инкрементально дополним список предметов этой недели
+        try {
+          await addSubjectsFromWeek(env, group, data);
+        } catch (e) {
+          console.log('addSubjectsFromWeek skipped:', e.message);
+        }
       }
     }
 
@@ -278,13 +285,9 @@ async function handleUpload(request, env, corsHeaders) {
       lastWeek: 'batch',
     }), { expirationTtl: 604800 });
 
-    // Обновим список предметов для текущего семестра по всем неделям в БД
-    let subjectsUpdated = false;
-    try {
-      subjectsUpdated = await updateSubjectsForCurrentSemester(env, group);
-    } catch (e) {
-      console.log('subjects update skipped:', e.message);
-    }
+    // Полный rebuild предметов больше не нужен — addSubjectsFromWeek
+    // поддерживает список актуальным инкрементально. updateSubjectsForCurrentSemester
+    // остаётся как fallback в handleGetSubjects при пустом списке.
 
     // Если записано изменённое расписание — пересчитаем dueDate для ДЗ с nextPair
     let recalcResult = null;
@@ -301,7 +304,6 @@ async function handleUpload(request, env, corsHeaders) {
       type: 'schedule-batch',
       updated: updated.length,
       total: schedules.length,
-      subjectsUpdated,
       recalc: recalcResult,
     }, corsHeaders);
   }
@@ -493,6 +495,59 @@ function parseDateLocal(str) {
   const m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
   if (!m) return null;
   return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+}
+
+// ── Инкрементальное обновление предметов из одной недели ──
+// Извлекает {subject, pairTypes} из weekData.days, читает текущий список
+// из subjects:{group}:{semester}, дополняет отсутствующие предметы и новые
+// типы пар, записывает обратно. Не заменяет, а объединяет.
+
+async function addSubjectsFromWeek(env, group, weekData) {
+  if (!weekData || !weekData.days) return false;
+
+  // Определяем семестр по датам недели (если не получилось — текущий)
+  const semester = semesterFromWeekDates(weekData.weekStart, weekData.weekEnd)
+    || currentSemesterKey();
+  const key = `subjects:${group}:${semester}`;
+
+  // Читаем существующий список
+  let subjects = await env.SCHEDULE.get(key, { type: 'json' });
+  if (!Array.isArray(subjects)) subjects = [];
+
+  const subjectsMap = new Map(); // subject -> Set(pairType)
+  for (const s of subjects) {
+    if (s && s.subject) subjectsMap.set(s.subject, new Set(s.pairTypes || []));
+  }
+
+  let changed = false;
+
+  for (const day of Object.values(weekData.days)) {
+    for (const p of (day.pairs || [])) {
+      if (!p.subject) continue;
+      if (!subjectsMap.has(p.subject)) {
+        subjectsMap.set(p.subject, new Set());
+        changed = true;
+      }
+      if (p.type) {
+        const types = subjectsMap.get(p.subject);
+        if (!types.has(p.type)) {
+          types.add(p.type);
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (!changed) return false;
+
+  const merged = [...subjectsMap.entries()]
+    .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
+    .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
+
+  await env.SCHEDULE.put(key, JSON.stringify(merged), {
+    expirationTtl: 365 * 24 * 60 * 60,
+  });
+  return true;
 }
 
 // ── Обновление предметов в текущем семестре по всем расписаниям в БД ──

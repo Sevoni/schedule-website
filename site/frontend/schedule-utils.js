@@ -83,7 +83,6 @@ export function parseScheduleHTML(html) {
     weekStart: '',
     weekEnd: '',
     days: {},
-    parsedAt: new Date().toISOString(),
   };
 
   const headerMatch = html.match(/на\s+неделю\s+c\s+(\d{2}\.\d{2}\.\d{4})\s+по\s+(\d{2}\.\d{2}\.\d{4})/);
