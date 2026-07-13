@@ -15,6 +15,7 @@ let state = {
   // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
   campusEnabled: localStorage.getItem('campusEnabled') !== '0',
   schedule: null,
+  scheduleCache: {},
   weeks: [],
   currentWeekIdx: -1,
   selectedDay: null,
@@ -23,6 +24,21 @@ let state = {
 };
 
 // ── Init ──────────────────────────────────────────────────────
+
+// Возвращает расписание недели, которая календарно содержит сегодняшнюю дату
+// (а не неделю, на которой сейчас находится пользователь).
+function getCurrentWeekSchedule() {
+  const today = new Date();
+  for (const w of state.weeks) {
+    if (!w.dates || w.dates.length < 2) continue;
+    const start = parseDate(w.dates[0]);
+    const end = parseDate(w.dates[1]);
+    if (today >= start && today <= end) {
+      return state.scheduleCache[w.value] || null;
+    }
+  }
+  return null;
+}
 
 document.addEventListener('DOMContentLoaded', () => {
   setupSettingsModal();
@@ -46,6 +62,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function loadData() {
   try {
+    state.scheduleCache = {};
     await loadWeeks();
     if (state.weeks.length === 0) {
       // Кеш недель пуст — пробуем взять недели из кампуса (если разрешено)
@@ -99,7 +116,7 @@ async function loadInitialSchedules() {
   );
 
   const dbMap = new Map();
-  for (const r of dbResults) if (r.data) dbMap.set(r.idx, r.data);
+  for (const r of dbResults) if (r.data) { dbMap.set(r.idx, r.data); state.scheduleCache[state.weeks[r.idx].value] = r.data; }
 
   // 2) Параллельно из кампуса: текущая + 2 следующих (previous НЕ грузим)
   const campusIndices = indices.filter(i => {
@@ -157,6 +174,7 @@ async function backgroundSync(campusIndices, dbMap) {
 
     const valid = fetched.filter(Boolean);
     if (valid.length === 0) return;
+    for (const v of valid) state.scheduleCache[v.weekCode] = v.data;
 
     // Загружаем в БД только изменённые/отсутствующие
     const toUpload = [];
@@ -183,6 +201,7 @@ async function backgroundSync(campusIndices, dbMap) {
     const match = currentWeek && valid.find(v => v.weekCode === currentWeek.value);
     if (match) {
       state.schedule = match.data;
+      state.scheduleCache[match.weekCode] = match.data;
       applyScheduleHeader();
       renderDayTabs();
     }
@@ -226,6 +245,7 @@ async function loadSchedule(targetIdx) {
 
   if (dbData) {
     state.schedule = dbData;
+    state.scheduleCache[w.value] = dbData;
     applyScheduleHeader();
     renderDayTabs();
 
@@ -252,6 +272,7 @@ async function loadSchedule(targetIdx) {
         });
       }
       state.schedule = campusData;
+      state.scheduleCache[w.value] = campusData;
       applyScheduleHeader();
       renderDayTabs();
       return;
@@ -287,6 +308,7 @@ async function backgroundSyncSingle(idx, dbData) {
     // Если пользователь всё ещё на этой неделе — обновим экран
     if (state.weeks[state.currentWeekIdx] && state.weeks[state.currentWeekIdx].value === w.value) {
       state.schedule = data;
+      state.scheduleCache[w.value] = data;
       applyScheduleHeader();
       renderDayTabs();
     }
@@ -362,6 +384,8 @@ async function syncAll() {
       throw new Error('Не удалось получить расписание ни для одной недели');
     }
 
+    for (const s of validSchedules) state.scheduleCache[s.weekCode] = s.data;
+
     await apiPost('/api/upload', {
       type: 'schedule-batch',
       group: state.group,
@@ -374,6 +398,7 @@ async function syncAll() {
       const match = validSchedules.find(s => s.weekCode === currentWeek.value);
       if (match) {
         state.schedule = match.data;
+        state.scheduleCache[currentWeek.value] = match.data;
         applyScheduleHeader();
       }
     }
@@ -858,26 +883,30 @@ async function loadSubjects() {
   } catch (e) {
     loadedSubjects = [];
   }
-  // Если из БД ничего нет — собираем из текущего расписания
-  if (loadedSubjects.length === 0 && state.schedule) {
-    const map = new Map();
-    for (const day of Object.values(state.schedule.days)) {
-      for (const p of (day.pairs || [])) {
-        if (!p.subject) continue;
-        if (!map.has(p.subject)) map.set(p.subject, new Set());
-        if (p.type) map.get(p.subject).add(p.type);
+  // Если из БД ничего нет — собираем из расписания текущей (календарно) недели
+  if (loadedSubjects.length === 0) {
+    const sched = getCurrentWeekSchedule() || state.schedule;
+    if (sched) {
+      const map = new Map();
+      for (const day of Object.values(sched.days)) {
+        for (const p of (day.pairs || [])) {
+          if (!p.subject) continue;
+          if (!map.has(p.subject)) map.set(p.subject, new Set());
+          if (p.type) map.get(p.subject).add(p.type);
+        }
       }
+      loadedSubjects = [...map.entries()]
+        .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
+        .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
     }
-    loadedSubjects = [...map.entries()]
-      .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
-      .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
   }
 }
 
 function getTodaySubjectPairs() {
-  if (!state.schedule) return [];
+  const sched = getCurrentWeekSchedule();
+  if (!sched) return [];
   const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
-  const day = state.schedule.days[todayName];
+  const day = sched.days[todayName];
   if (!day) return [];
   const seen = new Set();
   const result = [];
@@ -891,13 +920,14 @@ function getTodaySubjectPairs() {
 }
 
 function getAllSubjects() {
-  if (!state.schedule) return { today: [], all: [] };
+  const sched = getCurrentWeekSchedule();
+  if (!sched) return { today: [], all: [] };
 
   const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
   const allSet = new Set();
   const todaySet = new Set();
 
-  for (const [day, data] of Object.entries(state.schedule.days)) {
+  for (const [day, data] of Object.entries(sched.days)) {
     for (const p of data.pairs) {
       if (!p.subject) continue;
       allSet.add(p.subject);

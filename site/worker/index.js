@@ -580,7 +580,7 @@ function findNextPairDate(weekData, subject, pairType, fromDate) {
       const dayDate = parseDateLocal(dayInfo.date);
       if (!dayDate) continue;
       const dayStr = fmt(dayDate);
-      if (dayStr < todayStr) continue;
+      if (dayStr <= todayStr) continue;
 
       const has = (dayInfo.pairs || []).some(p => {
         if (!p.subject) return false;
