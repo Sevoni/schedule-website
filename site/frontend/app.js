@@ -1160,17 +1160,27 @@ async function loadSubjects() {
   if (loadedSubjects.length === 0) {
     const sched = getCurrentWeekSchedule() || state.schedule;
     if (sched) {
-      const map = new Map();
+      const map = new Map(); // subject -> { types:Set, sub:Map<type,Set<code>> }
       for (const day of Object.values(sched.days)) {
         for (const p of (day.pairs || [])) {
           if (!p.subject) continue;
-          if (!map.has(p.subject)) map.set(p.subject, new Set());
-          if (p.type) map.get(p.subject).add(p.type);
+          if (!map.has(p.subject)) map.set(p.subject, { types: new Set(), sub: new Map() });
+          const info = map.get(p.subject);
+          if (p.type) info.types.add(p.type);
+          const sub = (p.subgroup || '').replace(/\D/g, '');
+          if (sub) {
+            if (!info.sub.has(p.type)) info.sub.set(p.type, new Set());
+            info.sub.get(p.type).add(sub);
+          }
         }
       }
-      loadedSubjects = [...map.entries()]
-        .map(([subject, types]) => ({ subject, pairTypes: [...types].sort() }))
-        .sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
+      loadedSubjects = [...map.entries()].map(([subject, info]) => {
+        const subgroups = {};
+        for (const [t, codes] of info.sub) {
+          if (codes.size) subgroups[t] = [...codes].sort();
+        }
+        return { subject, pairTypes: [...info.types].sort(), subgroups };
+      }).sort((a, b) => a.subject.localeCompare(b.subject, 'ru'));
     }
   }
 }
@@ -1371,6 +1381,72 @@ function formatDateDisplay(str) {
   return `${d}.${m}.${y}`;
 }
 
+// Подгруппа сегодняшнего занятия выбранного предмета/типа ("" — если нет).
+function getTodaySubgroupFor(subject, pairType) {
+  const base = (subject || '').trim().toLowerCase();
+  if (!base) return '';
+  for (const p of getTodaySubjectPairs()) {
+    if (!p.subject || p.subject.trim().toLowerCase() !== base) continue;
+    if (pairType && pairType !== 'any' && p.type !== pairType) continue;
+    const sub = (p.subgroup || '').replace(/\D/g, '');
+    if (sub) return sub;
+  }
+  return '';
+}
+
+// Показывает/прячет селектор подгруппы в зависимости от того, есть ли у
+// выбранного предмета+типа разбиение на подгруппы (по loadedSubjects).
+// preSubgroup — явно заданная подгруппа (например, с кнопки «+» на паре).
+function updateSubgroupVisibility(preSubgroup) {
+  const subject = document.getElementById('hwSubject').value;
+  const pairType = document.getElementById('hwPairType').value; // 'any' или код
+  const entry = loadedSubjects.find(s => s.subject.toLowerCase() === (subject || '').toLowerCase());
+
+  let available = [];
+  if (entry && entry.subgroups) {
+    if (!pairType || pairType === 'any') {
+      // «Любой» тип пары — подгруппы не показываем, по умолчанию «любая».
+      available = [];
+    } else {
+      available = entry.subgroups[pairType] || [];
+    }
+  }
+
+  const wrap = document.getElementById('hwSubgroupWrap');
+  const sel = document.getElementById('hwSubgroup');
+
+  if (available.length === 0) {
+    wrap.classList.add('hidden');
+    sel.innerHTML = '<option value="any">Обе подгруппы</option>';
+    sel.value = 'any';
+    return;
+  }
+
+  wrap.classList.remove('hidden');
+  sel.innerHTML = '';
+  for (const s of available) {
+    const o = document.createElement('option');
+    o.value = s;
+    o.textContent = 'Подгруппа ' + s;
+    sel.appendChild(o);
+  }
+  const anyO = document.createElement('option');
+  anyO.value = 'any';
+  anyO.textContent = 'Обе подгруппы';
+  sel.appendChild(anyO);
+
+  // Приоритет: явно переданная подгруппа (кнопка «+»), иначе — подгруппа
+  // сегодняшнего занятия этого предмета/типа, иначе «любая».
+  let selected = 'any';
+  if (preSubgroup && available.includes(preSubgroup)) {
+    selected = preSubgroup;
+  } else {
+    const todaySub = getTodaySubgroupFor(subject, pairType);
+    if (todaySub && available.includes(todaySub)) selected = todaySub;
+  }
+  sel.value = selected;
+}
+
 // ── Homework Modal ────────────────────────────────────────────
 
 function setupHomeworkModal() {
@@ -1378,8 +1454,6 @@ function setupHomeworkModal() {
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
-  const subgroupWrap = document.getElementById('hwSubgroupWrap');
-  const subgroupSel = document.getElementById('hwSubgroup');
 
   document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
 
@@ -1392,8 +1466,6 @@ function setupHomeworkModal() {
     if (val === '__custom__') {
       customWrap.classList.remove('hidden');
       pairTypeWrap.classList.add('hidden');
-      subgroupWrap.classList.add('hidden');
-      subgroupSel.value = 'any';
       document.getElementById('hwSubjectCustom').focus();
       // Disable nextPair for custom subjects
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
@@ -1405,12 +1477,14 @@ function setupHomeworkModal() {
     } else {
       customWrap.classList.add('hidden');
       pairTypeWrap.classList.remove('hidden');
-      subgroupWrap.classList.remove('hidden');
-      subgroupSel.value = 'any';
       setPairTypeFromSelected(val);
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
     }
+    updateSubgroupVisibility();
   };
+
+  // Смена типа пары → пересчёт доступных подгрупп
+  document.getElementById('hwPairType').onchange = () => updateSubgroupVisibility();
 
   // Due mode radio
   document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
@@ -1545,8 +1619,6 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
-  const subgroupWrap = document.getElementById('hwSubgroupWrap');
-  const subgroupSel = document.getElementById('hwSubgroup');
 
   // Build subject list from loadedSubjects + today + current schedule
   sel.innerHTML = '';
@@ -1619,11 +1691,6 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
 
   if (sel.value !== '__custom__') {
     pairTypeWrap.classList.remove('hidden');
-    subgroupWrap.classList.remove('hidden');
-    subgroupSel.value = preSubgroup || 'any';
-  } else {
-    subgroupWrap.classList.add('hidden');
-    subgroupSel.value = 'any';
   }
 
   // Сброс form
@@ -1655,6 +1722,10 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
       document.getElementById('hwPairType').value = prePairType;
     }
   }
+
+  // Подгруппы: показываем только если у предмета+типа есть разбиение,
+  // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
+  updateSubgroupVisibility(preSubgroup);
 
   modal.classList.remove('hidden');
   document.getElementById('hwTask').focus();
