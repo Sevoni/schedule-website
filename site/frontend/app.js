@@ -77,7 +77,8 @@ async function loadData() {
     findCurrentWeek();
     renderWeekNav();
     await loadInitialSchedules();
-    loadHomework();
+    await loadHomework();
+    recalcNextPairDates();
     loadSubjects();
   } catch (e) {
     showError('Не удалось загрузить данные: ' + e.message, () => syncAll());
@@ -125,7 +126,7 @@ async function loadInitialSchedules() {
   });
 
   if (state.campusEnabled && campusIndices.length > 0) {
-    backgroundSync(campusIndices, dbMap);
+    await backgroundSync(campusIndices, dbMap);
   }
 
   // 3) Если есть данные для текущей недели в БД — показываем сразу
@@ -192,8 +193,6 @@ async function backgroundSync(campusIndices, dbMap) {
         schedules: toUpload,
       });
       console.log('[bgSync] uploaded', toUpload.length, 'weeks');
-      loadHomework();
-      loadSubjects();
     }
 
     // Если текущая открытая неделя изменилась — перерисуем
@@ -302,6 +301,7 @@ async function backgroundSyncSingle(idx, dbData) {
         schedules: [{ weekCode: w.value, data }],
       });
       loadHomework();
+      recalcNextPairDates();
       loadSubjects();
     }
 
@@ -406,7 +406,8 @@ async function syncAll() {
     renderWeekNav();
     renderDayTabs();
     updateSyncUI('ok');
-    loadHomework();
+    await loadHomework();
+    recalcNextPairDates();
     loadSubjects();
   } catch (e) {
     updateSyncUI('error', e.message);
@@ -677,6 +678,17 @@ async function apiDelete(path, params = {}) {
   return data;
 }
 
+async function apiPut(path, body) {
+  const resp = await fetch(state.apiBase + path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || 'API ' + resp.status);
+  return data;
+}
+
 // ── Weeks ─────────────────────────────────────────────────────
 
 // Индекс «реальной» текущей недели по календарю (или 0, если не нашлось).
@@ -707,6 +719,193 @@ function stripComparable(data) {
 function getWeeksToSync() {
   // Не используется напрямую после рефакторинга, оставлено для совместимости.
   return collectForwardRange(findRealCurrentIdx(), 4);
+}
+
+// ── Поиск следующей даты пары в кэше расписаний ──────────────
+// Ищет ближайшую дату пары subject + pairType среди дней сегодня или позже.
+// Возвращает {date: 'yyyy-MM-dd', weekCode} или null.
+
+function findNextPairInCache(subject, pairType) {
+  if (!subject) return null;
+  const baseLower = subject.trim().toLowerCase();
+  const t = pairType || 'any';
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const fmt = (dt) => {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, '0');
+    const d = String(dt.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  };
+  const todayStr = fmt(today);
+
+  // Перебираем недели по порядку из state.weeks
+  for (let i = 0; i < state.weeks.length; i++) {
+    const w = state.weeks[i];
+    const data = state.scheduleCache[w.value];
+    if (!data || !data.days) continue;
+
+    for (const dayInfo of Object.values(data.days)) {
+      const dayDate = parseDate(dayInfo.date);
+      if (!dayDate) continue;
+      const dayStr = fmt(dayDate);
+      if (dayStr < todayStr) continue; // пропускаем прошедшие дни (< сегодня)
+
+      const has = (dayInfo.pairs || []).some(p => {
+        if (!p.subject) return false;
+        if (p.subject.trim().toLowerCase() !== baseLower) return false;
+        if (t === 'any') return true;
+        return p.type === t;
+      });
+      if (has) return { date: dayStr, weekCode: w.value };
+    }
+  }
+  return null;
+}
+
+// ── Пересчёт dueDate для ДЗ с nextPair (клиентский) ───────────
+// Для каждого ДЗ с dueMode='nextPair':
+//   - Если dueDate < сегодня → не трогаем (просроченные не перемещаем)
+//   - Ищем ближайшую дату пары в scheduleCache
+//   - Если нашли и дата изменилась → PUT /api/hw
+//   - Если не нашли → загружаем ещё 2 недели из кампуса, повторяем
+//   - Если кампус закончился → dueDate = null (показать "Следующая пара")
+
+async function recalcNextPairDates() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const fmt = (dt) => {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, '0');
+    const d = String(dt.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  };
+  const todayStr = fmt(today);
+
+  // Фильтруем: nextPair и dueDate >= сегодня (или null/пусто)
+  const items = state.homework.filter(h => {
+    if (h.dueMode !== 'nextPair') return false;
+    if (!h.dueDate) return true; // нет даты — надо проверить
+    return h.dueDate >= todayStr; // просроченные не трогаем
+  });
+
+  console.log('[recalc] today:', todayStr, 'nextPair items:', items.length, 'of', state.homework.length, 'total');
+  if (items.length === 0) return;
+
+  // Множество weekCode, которые мы уже запросили (чтобы не запрашивать повторно)
+  const fetchedWeekCodes = new Set(Object.keys(state.scheduleCache));
+  console.log('[recalc] cached weeks:', [...fetchedWeekCodes]);
+
+  let changed = true;
+  let iterations = 0;
+  const maxIterations = 20; // защита от бесконечного цикла
+
+  while (changed && iterations < maxIterations) {
+    changed = false;
+    iterations++;
+    const stillMissing = [];
+
+    for (const hw of items) {
+      // Если уже dueDate=null и мы уже проверили все недели — пропускаем
+      if (!hw.dueDate && fetchedWeekCodes.size === state.weeks.length) continue;
+
+      const found = findNextPairInCache(hw.subject, hw.pairType);
+      console.log('[recalc]', hw.subject, hw.pairType, '→ dueDate:', hw.dueDate, '→ found:', found);
+      if (found) {
+        if (found.date !== hw.dueDate) {
+          // Дата изменилась — обновляем
+          try {
+            await apiPut('/api/hw', { id: hw.id, group: state.group, dueDate: found.date });
+            console.log('[recalc] updated', hw.subject, hw.dueDate, '→', found.date);
+            hw.dueDate = found.date;
+            changed = true;
+          } catch (e) {
+            console.warn('HW update failed:', e.message);
+          }
+        }
+        // else: дата совпала, ничего не делаем
+      } else {
+        // Не нашли — надо загрузить ещё недели
+        stillMissing.push(hw);
+      }
+    }
+
+    if (stillMissing.length === 0) break;
+
+    // Есть ДЗ, для которых пара не найдена — загрузим ещё 2 недели из кампуса
+    if (!state.campusEnabled) break;
+
+    // Ищем индекс последней закэшированной недели
+    let lastCachedIdx = -1;
+    for (let i = state.weeks.length - 1; i >= 0; i--) {
+      if (state.scheduleCache[state.weeks[i].value]) {
+        lastCachedIdx = i;
+        break;
+      }
+    }
+
+    // Следующие 2 недели после последней закэшированной
+    const nextIndices = [];
+    for (let i = lastCachedIdx + 1; i < state.weeks.length && nextIndices.length < 2; i++) {
+      const wc = state.weeks[i].value;
+      if (!fetchedWeekCodes.has(wc)) {
+        nextIndices.push(i);
+      }
+    }
+
+    if (nextIndices.length === 0) break; // кампус закончился
+
+    // Скачиваем параллельно
+    const fetched = await Promise.all(
+      nextIndices.map(async (i) => {
+        try {
+          const wc = state.weeks[i].value;
+          fetchedWeekCodes.add(wc);
+          const data = await fetchScheduleFromCampus(state.group, wc);
+          const hasPairs = data.days && Object.values(data.days).some(d => d.pairs && d.pairs.length > 0);
+          if (!hasPairs) return null;
+          return { weekCode: wc, data };
+        } catch (e) {
+          console.warn('fetch more weeks failed:', e.message);
+          return null;
+        }
+      })
+    );
+
+    const valid = fetched.filter(Boolean);
+    if (valid.length === 0) break;
+
+    // Обновляем кэш
+    for (const v of valid) state.scheduleCache[v.weekCode] = v.data;
+
+    // Отправляем в KV (fire-and-forget, не ждём результат)
+    apiPost('/api/upload', {
+      type: 'schedule-batch',
+      group: state.group,
+      schedules: valid,
+    }).catch(e => console.warn('upload more weeks failed:', e.message));
+  }
+
+  // Для ДЗ, которые так и не нашли — ставим dueDate=null
+  for (const hw of items) {
+    if (hw.dueDate && hw.dueDate !== null) {
+      const found = findNextPairInCache(hw.subject, hw.pairType);
+      if (!found && hw.dueDate !== null) {
+        // Пары больше нет в расписании — обнуляем
+        try {
+          await apiPut('/api/hw', { id: hw.id, group: state.group, dueDate: null });
+          hw.dueDate = null;
+        } catch (e) {
+          console.warn('HW reset failed:', e.message);
+        }
+      }
+    }
+  }
+
+  // Обновляем стейт
+  state.homework = [...state.homework];
+  renderHomework();
 }
 
 function renderWeekNav() {
@@ -1415,6 +1614,8 @@ function renderHomework() {
       } else {
         dueText = hw.dueDate;
       }
+    } else if (hw.dueMode === 'nextPair') {
+      dueText = 'Следующая пара';
     }
 
     const authorHtml = hw.author

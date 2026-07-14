@@ -6,7 +6,7 @@ export default {
 
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
@@ -39,6 +39,9 @@ export default {
       }
       if (path === '/api/hw' && method === 'POST') {
         return await handleAddHw(request, env, corsHeaders);
+      }
+      if (path === '/api/hw' && method === 'PUT') {
+        return await handleUpdateHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'DELETE') {
         return await handleDeleteHw(request, env, corsHeaders);
@@ -285,26 +288,11 @@ async function handleUpload(request, env, corsHeaders) {
       lastWeek: 'batch',
     }), { expirationTtl: 604800 });
 
-    // Полный rebuild предметов больше не нужен — addSubjectsFromWeek
-    // поддерживает список актуальным инкрементально. updateSubjectsForCurrentSemester
-    // остаётся как fallback в handleGetSubjects при пустом списке.
-
-    // Если записано изменённое расписание — пересчитаем dueDate для ДЗ с nextPair
-    let recalcResult = null;
-    if (updated.length > 0) {
-      try {
-        recalcResult = await recalcHomeworkForGroup(env, group);
-      } catch (e) {
-        console.log('hw recalc skipped:', e.message);
-      }
-    }
-
     return jsonResponse({
       ok: true,
       type: 'schedule-batch',
       updated: updated.length,
       total: schedules.length,
-      recalc: recalcResult,
     }, corsHeaders);
   }
 
@@ -371,6 +359,34 @@ async function handleAddHw(request, env, corsHeaders) {
   await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   return jsonResponse({ ok: true, item }, corsHeaders);
+}
+
+// ── PUT /api/hw ────────────────────────────────────────────────
+// Body: { id, group, dueDate } — обновляет dueDate у конкретного ДЗ.
+
+async function handleUpdateHw(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json();
+  const { id, group, dueDate } = body;
+
+  if (!id || !group) {
+    return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
+  }
+
+  const key = `hw:${group}`;
+  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const idx = existing.findIndex(h => h.id === id);
+  if (idx === -1) {
+    return jsonResponse({ error: 'Homework not found' }, corsHeaders, 404);
+  }
+
+  existing[idx] = { ...existing[idx], dueDate: dueDate || '' };
+  await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+
+  return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
 }
 
 // ── DELETE /api/hw?id=...&group=... ────────────────────────────
