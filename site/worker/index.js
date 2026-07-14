@@ -50,6 +50,14 @@ export default {
         return await handleRecalcHw(request, env, corsHeaders);
       }
 
+      // ── Campus sync (frontend-parse flow) ───────────────
+      if (path === '/api/check-campus-update' && method === 'POST') {
+        return await handleCheckCampusUpdate(request, env, corsHeaders);
+      }
+      if (path === '/api/sync-from-campus' && method === 'POST') {
+        return await handleSyncFromCampus(request, env, corsHeaders);
+      }
+
       // ── Auth endpoints ───────────────────────────────────
       if (path === '/api/auth' && method === 'POST') {
         return await handleAuth(request, env, corsHeaders);
@@ -301,8 +309,114 @@ async function handleUpload(request, env, corsHeaders) {
 
 function stripComparable(data) {
   if (!data || typeof data !== 'object') return data;
-  const { parsedAt, ...rest } = data;
+  const { parsedAt, campusUpdatedAt, ...rest } = data;
   return rest;
+}
+
+// ── POST /api/check-campus-update ─────────────────────────────
+// Body: { group, campusUpdatedAt }
+// Возвращает { needUpdate: bool, stored: <iso|null> }.
+// needUpdate=false, если сохранённая в KV дата совпадает с присланной.
+
+async function handleCheckCampusUpdate(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const { group, campusUpdatedAt } = body;
+
+  if (!group) {
+    return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
+  }
+
+  const stored = await env.SCHEDULE.get(`campus-updated:${group}`);
+  const needUpdate = !stored || stored !== (campusUpdatedAt || '');
+
+  return jsonResponse({ needUpdate, stored: stored || null }, corsHeaders);
+}
+
+// ── POST /api/sync-from-campus ───────────────────────────────
+// Фронт сам скачал и распарсил HTML с campus.syktsu.ru и прислал готовые
+// расписания. Бэкенд сохраняет их, обновляет предметы (инкрементально по
+// каждой неделе), пересчитывает ДЗ с dueMode='nextPair', и записывает
+// дату обновления кампуса.
+//
+// Body: { group, campusUpdatedAt, schedules: [{ weekCode, data }, ...] }
+
+async function handleSyncFromCampus(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const { group, campusUpdatedAt, schedules } = body;
+
+  if (!group || !Array.isArray(schedules)) {
+    return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
+  }
+
+  const updated = [];
+
+  for (const { weekCode, data } of schedules) {
+    if (!weekCode || !data) continue;
+
+    const existing = await env.SCHEDULE.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+    const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
+    const newStr = JSON.stringify(stripComparable(data));
+
+    if (existingStr !== newStr) {
+      await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+      updated.push(weekCode);
+
+      // Инкрементально дополняем список предметов этой недели
+      try {
+        await addSubjectsFromWeek(env, group, data);
+      } catch (e) {
+        console.log('addSubjectsFromWeek skipped:', e.message);
+      }
+    }
+  }
+
+  // Записываем дату обновления кампуса (если прислали)
+  if (campusUpdatedAt) {
+    await env.SCHEDULE.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 604800 });
+  }
+
+  // Пересчёт ДЗ с dueMode='nextPair' — расписание могло измениться
+  let hwResult = null;
+  try {
+    hwResult = await recalcHomeworkForGroup(env, group);
+  } catch (e) {
+    console.log('recalcHomeworkForGroup skipped:', e.message);
+  }
+
+  // Читаем актуальный список предметов текущего семестра
+  // (он был обновлён через addSubjectsFromWeek выше)
+  let subjects = [];
+  try {
+    const semester = currentSemesterKey();
+    subjects = (await env.SCHEDULE.get(`subjects:${group}:${semester}`, { type: 'json' })) || [];
+  } catch (e) {
+    console.log('subjects read skipped:', e.message);
+  }
+
+  await env.SCHEDULE.put('sync:meta', JSON.stringify({
+    lastSync: new Date().toISOString(),
+    lastGroup: group,
+    lastWeek: 'batch',
+    campusUpdatedAt: campusUpdatedAt || null,
+  }), { expirationTtl: 604800 });
+
+  return jsonResponse({
+    ok: true,
+    type: 'sync-from-campus',
+    updated: updated.length,
+    total: schedules.length,
+    // Возвращаем пользователю обновлённые списки сразу в ответе
+    hw: hwResult ? hwResult.items : [],
+    subjects,
+  }, corsHeaders);
 }
 
 // ── GET /api/hw?group=... ──────────────────────────────────────
@@ -348,9 +462,11 @@ async function handleAddHw(request, env, corsHeaders) {
     createdAt: new Date().toISOString(),
   };
 
-  // Если nextPair — посчитаем dueDate сразу на основе расписаний в БД
+  // Если nextPair — посчитаем dueDate сразу на основе расписаний в БД.
+  // Якорная дата — день создания: следующая пара ищется СТРОГО ПОСЛЕ него,
+  // то есть ДЗ не попадает на день его создания.
   if (dueMode === 'nextPair') {
-    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType);
+    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(item.createdAt));
   }
 
   const key = `hw:${group}`;
@@ -513,6 +629,14 @@ function parseDateLocal(str) {
   return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
 }
 
+// Форматирует Date в локальную yyyy-MM-dd (как даты расписания/ДЗ).
+function fmtDate(dt) {
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const d = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 // ── Инкрементальное обновление предметов из одной недели ──
 // Извлекает {subject, pairTypes} из weekData.days, читает текущий список
 // из subjects:{group}:{semester}, дополняет отсутствующие предметы и новые
@@ -630,13 +754,30 @@ async function recalcHomeworkForGroup(env, group) {
 
   let changed = false;
   const updatedItems = [];
+  const todayStr = fmtDate(new Date());
   for (const hw of homework) {
     if (hw.dueMode !== 'nextPair') {
       updatedItems.push(hw);
       continue;
     }
-    const newDate = findNextPairDate(weekData, hw.subject, hw.pairType, new Date());
-    if (!newDate || newDate === hw.dueDate) {
+    // День создания ДЗ всегда <= сегодня, поэтому поиск следующей пары
+    // строго ПОСЛЕ сегодня (dayStr <= сегодня исключается) автоматически
+    // исключает и день создания — ДЗ никогда не попадает на день его создания.
+    const fromDate = new Date();
+    let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate);
+    // Следующая пара должна быть в будущем (не в прошлом).
+    if (newDate && newDate < todayStr) newDate = null;
+    if (!newDate) {
+      // Пары больше нет в будущем расписании — обнуляем дату
+      if (hw.dueDate !== null) {
+        changed = true;
+        updatedItems.push({ ...hw, dueDate: null });
+      } else {
+        updatedItems.push(hw);
+      }
+      continue;
+    }
+    if (newDate === hw.dueDate) {
       updatedItems.push(hw);
       continue;
     }
@@ -659,12 +800,7 @@ function findNextPairDate(weekData, subject, pairType, fromDate) {
   const baseLower = subject.trim().toLowerCase();
   const t = pairType || 'any';
 
-  const fmt = (dt) => {
-    const y = dt.getFullYear();
-    const m = String(dt.getMonth() + 1).padStart(2, '0');
-    const d = String(dt.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-  };
+  const fmt = fmtDate;
   const todayStr = fmt(fromDate);
 
   for (const week of weekData) {
@@ -688,7 +824,7 @@ function findNextPairDate(weekData, subject, pairType, fromDate) {
 
 // ── Вычислить дату следующей пары для одного ДЗ ─────────────────────
 
-async function computeNextPairDate(env, group, subject, pairType) {
+async function computeNextPairDate(env, group, subject, pairType, fromDate = new Date()) {
   const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
   const weekData = [];
   for (const k of list.keys) {
@@ -701,7 +837,7 @@ async function computeNextPairDate(env, group, subject, pairType) {
     }
   }
   weekData.sort((a, b) => a.startDate - b.startDate);
-  return findNextPairDate(weekData, subject, pairType, new Date());
+  return findNextPairDate(weekData, subject, pairType, fromDate);
 }
 
 // ── Разделить название предмета на базу и тип пары ──────────────────

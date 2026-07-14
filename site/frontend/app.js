@@ -187,11 +187,7 @@ async function backgroundSync(campusIndices, dbMap) {
     }
 
     if (toUpload.length > 0) {
-      await apiPost('/api/upload', {
-        type: 'schedule-batch',
-        group: state.group,
-        schedules: toUpload,
-      });
+      await uploadSchedulesToBackend(toUpload);
       console.log('[bgSync] uploaded', toUpload.length, 'weeks');
     }
 
@@ -264,11 +260,7 @@ async function loadSchedule(targetIdx) {
       const campusData = await fetchScheduleFromCampus(state.group, w.value);
       const hasPairs = campusData.days && Object.values(campusData.days).some(d => d.pairs && d.pairs.length > 0);
       if (hasPairs) {
-        await apiPost('/api/upload', {
-          type: 'schedule-batch',
-          group: state.group,
-          schedules: [{ weekCode: w.value, data: campusData }],
-        });
+        await uploadSchedulesToBackend([{ weekCode: w.value, data: campusData }]);
       }
       state.schedule = campusData;
       state.scheduleCache[w.value] = campusData;
@@ -295,11 +287,7 @@ async function backgroundSyncSingle(idx, dbData) {
 
     const changed = !dbData || JSON.stringify(stripComparable(dbData)) !== JSON.stringify(stripComparable(data));
     if (changed) {
-      await apiPost('/api/upload', {
-        type: 'schedule-batch',
-        group: state.group,
-        schedules: [{ weekCode: w.value, data }],
-      });
+      await uploadSchedulesToBackend([{ weekCode: w.value, data }]);
       loadHomework();
       recalcNextPairDates();
       loadSubjects();
@@ -329,11 +317,15 @@ function applyScheduleHeader() {
 
 // ── Sync (кнопка обновления) ──────────────────────────────────
 //
-// При обновлении пользователь НЕ перемещается на другую неделю.
-//  - Если текущая выбранная неделя в прошлом (до текущей по календарю):
-//    из кампуса качается только она и перезаписывает запись в БД.
-//  - Если текущая или будущая: качаем текущую + 2 следующих из кампуса,
-//    перезаписываем в БД только изменившиеся.
+// Новый поток (логика перенесена на бэкенд-проверку):
+//  1. Качаем с кампуса HTML текущей недели, параллельно парсим её и
+//     извлекаем campusUpdatedAt («Расписание обновлено ...»).
+//  2. Шлём POST /api/check-campus-update { group, campusUpdatedAt }.
+//     - needUpdate:false → расписание уже актуально, стоп.
+//     - needUpdate:true  → качаем с кампуса следующие 4 недели (параллельно),
+//       парсим, шлём всё одним батчем на /api/sync-from-campus.
+//     Бэкенд сам сохраняет, обновляет предметы/ДЗ, записывает дату.
+//  Пользователь НЕ перемещается на другую неделю.
 
 async function syncAll() {
   if (state.syncing) return;
@@ -360,14 +352,41 @@ async function syncAll() {
     renderWeekNav();
 
     const realCurrentIdx = findRealCurrentIdx();
-    const userIsOnPast = savedIdx < realCurrentIdx;
 
-    const weekIndices = userIsOnPast
-      ? [savedIdx]
-      : collectForwardRange(savedIdx, 2);
+    // 1) Качаем текущую неделю, парсим + извлекаем campusUpdatedAt
+    const currentWeekCode = state.weeks[realCurrentIdx]?.value;
+    if (!currentWeekCode) {
+      throw new Error('Не удалось определить текущую неделю');
+    }
 
-    const results = await Promise.all(
-      weekIndices.map(async (i) => {
+    const currentData = await fetchScheduleFromCampus(state.group, currentWeekCode);
+    const campusUpdatedAt = currentData.campusUpdatedAt || '';
+
+    state.scheduleCache[currentWeekCode] = currentData;
+
+    // 2) Спрашиваем бэкенд, нужно ли обновление
+    const check = await apiPost('/api/check-campus-update', {
+      group: state.group,
+      campusUpdatedAt,
+    });
+
+    if (!check.needUpdate) {
+      // Расписание уже актуально. Обновляем только экран текущей недели.
+      const currentWeek = state.weeks[state.currentWeekIdx];
+      if (currentWeek && currentWeek.value === currentWeekCode) {
+        state.schedule = currentData;
+        state.scheduleCache[currentWeekCode] = currentData;
+        applyScheduleHeader();
+        renderDayTabs();
+      }
+      updateSyncUI('ok');
+      return;
+    }
+
+    // 3) Нужно обновление: качаем ещё 4 следующих недели (параллельно)
+    const extraIndices = collectForwardRange(realCurrentIdx + 1, 4);
+    const extraResults = await Promise.all(
+      extraIndices.map(async (i) => {
         try {
           const w = state.weeks[i];
           const data = await fetchScheduleFromCampus(state.group, w.value);
@@ -379,23 +398,32 @@ async function syncAll() {
       })
     );
 
-    const validSchedules = results.filter(Boolean);
-    if (validSchedules.length === 0) {
-      throw new Error('Не удалось получить расписание ни для одной недели');
-    }
+    const validExtra = extraResults.filter(Boolean);
+    for (const s of validExtra) state.scheduleCache[s.weekCode] = s.data;
 
-    for (const s of validSchedules) state.scheduleCache[s.weekCode] = s.data;
+    // Собираем полный батч: текущая + 4 следующих
+    const schedules = [{ weekCode: currentWeekCode, data: currentData }, ...validExtra];
 
-    await apiPost('/api/upload', {
-      type: 'schedule-batch',
+    // 4) Шлём батч на бэкенд, он сам сохраняет и обновляет ДЗ/предметы
+    const syncRes = await apiPost('/api/sync-from-campus', {
       group: state.group,
-      schedules: validSchedules,
+      campusUpdatedAt,
+      schedules,
     });
 
-    // Обновляем только ту неделю, на которой находится пользователь
+    // Используем обновлённые списки сразу из ответа бэкенда
+    if (Array.isArray(syncRes.hw)) {
+      state.homework = syncRes.hw;
+      renderHomework();
+    }
+    if (Array.isArray(syncRes.subjects)) {
+      loadedSubjects = syncRes.subjects;
+    }
+
+    // Обновляем экран той недели, на которой находится пользователь
     const currentWeek = state.weeks[state.currentWeekIdx];
     if (currentWeek) {
-      const match = validSchedules.find(s => s.weekCode === currentWeek.value);
+      const match = schedules.find(s => s.weekCode === currentWeek.value);
       if (match) {
         state.schedule = match.data;
         state.scheduleCache[currentWeek.value] = match.data;
@@ -406,8 +434,10 @@ async function syncAll() {
     renderWeekNav();
     renderDayTabs();
     updateSyncUI('ok');
+    // Пересчёт nextPair (может догрузить ещё недели и обновить ДЗ на бэкенде)
+    await recalcNextPairDates();
+    // Финальная авторитетная версия ДЗ и предметов из БД
     await loadHomework();
-    recalcNextPairDates();
     loadSubjects();
   } catch (e) {
     updateSyncUI('error', e.message);
@@ -467,7 +497,23 @@ async function fetchWeeksFromCampus(group) {
 
   if (!resp.ok) throw new Error('Campus: ' + resp.status);
   const html = await resp.text();
-  return parseWeekOptions(html);
+  const weeks = parseWeekOptions(html);
+  // Заодно извлекаем дату обновления (на случай, если она пригодится позже)
+  weeks._campusUpdatedAt = extractCampusUpdatedAt(html);
+  return weeks;
+}
+
+// Извлекает дату обновления расписания с кампуса.
+// Строка вида "Расписание обновлено 03.07.2026 11:18:53." в <i>.
+// Возвращает ISO-строку или '' если не нашлось.
+function extractCampusUpdatedAt(html) {
+  const m = html.match(/Расписание обновлено\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})/);
+  if (!m) return '';
+  const [_, date, time] = m;
+  // dd.MM.yyyy HH:mm:ss -> ISO (считаем локальное время кампуса, UTC+3/Syktyvkar)
+  const [d, mo, y] = date.split('.');
+  const iso = `${y}-${mo}-${d}T${time}`;
+  return iso;
 }
 
 async function fetchScheduleFromCampus(group, weekCode) {
@@ -487,7 +533,9 @@ async function fetchScheduleFromCampus(group, weekCode) {
 
   if (!resp.ok) throw new Error('Campus: ' + resp.status);
   const html = await resp.text();
-  return parseScheduleHTML(html);
+  const data = parseScheduleHTML(html);
+  data.campusUpdatedAt = extractCampusUpdatedAt(html);
+  return data;
 }
 
 // ── HTML Parser ───────────────────────────────────────────────
@@ -689,6 +737,20 @@ async function apiPut(path, body) {
   return data;
 }
 
+// Единая точка отправки расписаний на бэкенд.
+// schedules: [{ weekCode, data }]. Бэкенд сам сравнивает с KV, сохраняет
+// изменённые, обновляет предметы/ДЗ и записывает campusUpdatedAt.
+async function uploadSchedulesToBackend(schedules) {
+  if (!schedules || schedules.length === 0) return null;
+  const withMeta = schedules.find(s => s.data && s.data.campusUpdatedAt);
+  const campusUpdatedAt = withMeta ? withMeta.data.campusUpdatedAt : '';
+  return apiPost('/api/sync-from-campus', {
+    group: state.group,
+    campusUpdatedAt,
+    schedules,
+  });
+}
+
 // ── Weeks ─────────────────────────────────────────────────────
 
 // Индекс «реальной» текущей недели по календарю (или 0, если не нашлось).
@@ -725,20 +787,29 @@ function getWeeksToSync() {
 // Ищет ближайшую дату пары subject + pairType среди дней сегодня или позже.
 // Возвращает {date: 'yyyy-MM-dd', weekCode} или null.
 
-function findNextPairInCache(subject, pairType) {
+function findNextPairInCache(subject, pairType, createdAt) {
   if (!subject) return null;
   const baseLower = subject.trim().toLowerCase();
   const t = pairType || 'any';
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
   const fmt = (dt) => {
     const y = dt.getFullYear();
     const m = String(dt.getMonth() + 1).padStart(2, '0');
     const d = String(dt.getDate()).padStart(2, '0');
     return `${y}-${m}-${d}`;
   };
-  const todayStr = fmt(today);
+
+  // Якорная дата — максимум из (день создания ДЗ, сегодня). День создания
+  // всегда <= сегодня, поэтому поиск строго ПОСЛЕ якоря автоматически
+  // исключает и день создания — ДЗ никогда не попадает на день его создания,
+  // при этом дата всегда остаётся в будущем.
+  let anchor = new Date();
+  if (createdAt) {
+    const cd = new Date(createdAt);
+    if (!isNaN(cd.getTime()) && cd > anchor) anchor = cd;
+  }
+  anchor.setHours(0, 0, 0, 0);
+  const anchorStr = fmt(anchor);
 
   // Перебираем недели по порядку из state.weeks
   for (let i = 0; i < state.weeks.length; i++) {
@@ -750,7 +821,7 @@ function findNextPairInCache(subject, pairType) {
       const dayDate = parseDate(dayInfo.date);
       if (!dayDate) continue;
       const dayStr = fmt(dayDate);
-      if (dayStr < todayStr) continue; // пропускаем прошедшие дни (< сегодня)
+      if (dayStr <= anchorStr) continue; // день создания и раньше — исключаем
 
       const has = (dayInfo.pairs || []).some(p => {
         if (!p.subject) return false;
@@ -810,7 +881,7 @@ async function recalcNextPairDates() {
       // Если уже dueDate=null и мы уже проверили все недели — пропускаем
       if (!hw.dueDate && fetchedWeekCodes.size === state.weeks.length) continue;
 
-      const found = findNextPairInCache(hw.subject, hw.pairType);
+      const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt);
       console.log('[recalc]', hw.subject, hw.pairType, '→ dueDate:', hw.dueDate, '→ found:', found);
       if (found) {
         if (found.date !== hw.dueDate) {
@@ -880,18 +951,14 @@ async function recalcNextPairDates() {
     for (const v of valid) state.scheduleCache[v.weekCode] = v.data;
 
     // Отправляем в KV (fire-and-forget, не ждём результат)
-    apiPost('/api/upload', {
-      type: 'schedule-batch',
-      group: state.group,
-      schedules: valid,
-    }).catch(e => console.warn('upload more weeks failed:', e.message));
+    uploadSchedulesToBackend(valid).catch(e => console.warn('upload more weeks failed:', e.message));
   }
 
   // Для ДЗ, которые так и не нашли — ставим dueDate=null
   for (const hw of items) {
     if (hw.dueDate && hw.dueDate !== null) {
-      const found = findNextPairInCache(hw.subject, hw.pairType);
-      if (!found && hw.dueDate !== null) {
+       const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt);
+       if (!found && hw.dueDate !== null) {
         // Пары больше нет в расписании — обнуляем
         try {
           await apiPut('/api/hw', { id: hw.id, group: state.group, dueDate: null });
@@ -906,6 +973,7 @@ async function recalcNextPairDates() {
   // Обновляем стейт
   state.homework = [...state.homework];
   renderHomework();
+  refreshScheduleView();
 }
 
 function renderWeekNav() {
@@ -1567,11 +1635,19 @@ function openHwModal(preSubject, prePairType) {
 async function loadHomework() {
   try {
     state.homework = await apiFetch('/api/hw', { group: state.group });
-    renderHomework();
   } catch (e) {
     console.warn('HW load failed:', e.message);
     state.homework = [];
-    renderHomework();
+  }
+  renderHomework();
+  refreshScheduleView();
+}
+
+// Перерисовывает текущий день расписания (вместе с ДЗ) после изменения
+// списка ДЗ, чтобы домашка появилась в списке пар без переключения дня/недели.
+function refreshScheduleView() {
+  if (state.schedule && state.selectedDay) {
+    renderDaySchedule(state.selectedDay);
   }
 }
 
@@ -1622,6 +1698,10 @@ function renderHomework() {
       ? '<div class="hw-author">— ' + escHtml(hw.author) + '</div>'
       : '';
 
+    const createdHtml = hw.createdAt
+      ? '<div class="hw-created">добавлено: ' + escHtml(formatDateDisplay(hw.createdAt.slice(0, 10))) + '</div>'
+      : '';
+
     const subjectHtml = escHtml(hw.subject) +
       (hw.pairType && hw.pairType !== 'any' ? ' <span class="hw-pair-type">(' + escHtml(hw.pairType) + ')</span>' : '');
     const dueModeHint = hw.dueMode === 'nextPair' ? '<span class="hw-mode-hint" title="Автоматически">↻</span>' : '';
@@ -1631,9 +1711,10 @@ function renderHomework() {
         <div class="hw-info">
           <div class="hw-subject">${subjectHtml} ${dueModeHint}</div>
           <div class="hw-task">${hwTaskMarkup(hw.task)}</div>
-          ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
-          ${authorHtml}
-        </div>
+           ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
+           ${authorHtml}
+           ${createdHtml}
+         </div>
         <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
       </div>`;
   }).join('');
