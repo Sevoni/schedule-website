@@ -441,7 +441,7 @@ async function handleAddHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { group, subject, task, dueDate, dueMode, pairType, author } = body;
+  const { group, subject, task, dueDate, dueMode, pairType, author, subgroup } = body;
 
   if (!group || !subject) {
     return jsonResponse({ error: 'Missing group or subject' }, corsHeaders, 400);
@@ -455,6 +455,7 @@ async function handleAddHw(request, env, corsHeaders) {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     subject,
     pairType: pairType || 'any',
+    subgroup: subgroup || 'any',
     task: task || '',
     dueMode,
     dueDate: dueDate || '',
@@ -466,7 +467,7 @@ async function handleAddHw(request, env, corsHeaders) {
   // Якорная дата — день создания: следующая пара ищется СТРОГО ПОСЛЕ него,
   // то есть ДЗ не попадает на день его создания.
   if (dueMode === 'nextPair') {
-    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(item.createdAt));
+    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(item.createdAt), item.subgroup);
   }
 
   const key = `hw:${group}`;
@@ -764,7 +765,7 @@ async function recalcHomeworkForGroup(env, group) {
     // строго ПОСЛЕ сегодня (dayStr <= сегодня исключается) автоматически
     // исключает и день создания — ДЗ никогда не попадает на день его создания.
     const fromDate = new Date();
-    let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate);
+    let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate, hw.subgroup || 'any');
     // Следующая пара должна быть в будущем (не в прошлом).
     if (newDate && newDate < todayStr) newDate = null;
     if (!newDate) {
@@ -795,10 +796,11 @@ async function recalcHomeworkForGroup(env, group) {
 // ── Найти следующую дату пары для предмета с учётом типа ──────────
 // Возвращает дату в формате yyyy-MM-dd (локальная) или null.
 
-function findNextPairDate(weekData, subject, pairType, fromDate) {
+function findNextPairDate(weekData, subject, pairType, fromDate, subgroup = 'any') {
   if (!subject || weekData.length === 0) return null;
   const baseLower = subject.trim().toLowerCase();
   const t = pairType || 'any';
+  const subNum = (subgroup || 'any').replace(/\D/g, ''); // "1" / "2" / "" (любая)
 
   const fmt = fmtDate;
   const todayStr = fmt(fromDate);
@@ -813,8 +815,13 @@ function findNextPairDate(weekData, subject, pairType, fromDate) {
       const has = (dayInfo.pairs || []).some(p => {
         if (!p.subject) return false;
         if (p.subject.trim().toLowerCase() !== baseLower) return false;
-        if (t === 'any') return true;
-        return p.type === t;
+        if (t !== 'any' && p.type !== t) return false;
+        // Для конкретной подгруппы учитываем только пары этой подгруппы.
+        if (subNum) {
+          const pairSub = (p.subgroup || '').replace(/\D/g, '');
+          if (pairSub && pairSub !== subNum) return false;
+        }
+        return true;
       });
       if (has) return dayStr;
     }
@@ -824,7 +831,7 @@ function findNextPairDate(weekData, subject, pairType, fromDate) {
 
 // ── Вычислить дату следующей пары для одного ДЗ ─────────────────────
 
-async function computeNextPairDate(env, group, subject, pairType, fromDate = new Date()) {
+async function computeNextPairDate(env, group, subject, pairType, fromDate = new Date(), subgroup = 'any') {
   const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
   const weekData = [];
   for (const k of list.keys) {
@@ -837,7 +844,7 @@ async function computeNextPairDate(env, group, subject, pairType, fromDate = new
     }
   }
   weekData.sort((a, b) => a.startDate - b.startDate);
-  return findNextPairDate(weekData, subject, pairType, fromDate);
+  return findNextPairDate(weekData, subject, pairType, fromDate, subgroup);
 }
 
 // ── Разделить название предмета на базу и тип пары ──────────────────

@@ -787,10 +787,11 @@ function getWeeksToSync() {
 // Ищет ближайшую дату пары subject + pairType среди дней сегодня или позже.
 // Возвращает {date: 'yyyy-MM-dd', weekCode} или null.
 
-function findNextPairInCache(subject, pairType, createdAt) {
+function findNextPairInCache(subject, pairType, createdAt, subgroup) {
   if (!subject) return null;
   const baseLower = subject.trim().toLowerCase();
   const t = pairType || 'any';
+  const subNum = (subgroup || 'any').replace(/\D/g, ''); // "1" / "2" / "" (любая)
 
   const fmt = (dt) => {
     const y = dt.getFullYear();
@@ -826,8 +827,13 @@ function findNextPairInCache(subject, pairType, createdAt) {
       const has = (dayInfo.pairs || []).some(p => {
         if (!p.subject) return false;
         if (p.subject.trim().toLowerCase() !== baseLower) return false;
-        if (t === 'any') return true;
-        return p.type === t;
+        if (t !== 'any' && p.type !== t) return false;
+        // Для конкретной подгруппы учитываем только пары этой подгруппы.
+        if (subNum) {
+          const pairSub = (p.subgroup || '').replace(/\D/g, '');
+          if (pairSub && pairSub !== subNum) return false;
+        }
+        return true;
       });
       if (has) return { date: dayStr, weekCode: w.value };
     }
@@ -881,7 +887,7 @@ async function recalcNextPairDates() {
       // Если уже dueDate=null и мы уже проверили все недели — пропускаем
       if (!hw.dueDate && fetchedWeekCodes.size === state.weeks.length) continue;
 
-      const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt);
+       const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt, hw.subgroup);
       console.log('[recalc]', hw.subject, hw.pairType, '→ dueDate:', hw.dueDate, '→ found:', found);
       if (found) {
         if (found.date !== hw.dueDate) {
@@ -957,7 +963,7 @@ async function recalcNextPairDates() {
   // Для ДЗ, которые так и не нашли — ставим dueDate=null
   for (const hw of items) {
     if (hw.dueDate && hw.dueDate !== null) {
-       const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt);
+      const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt, hw.subgroup);
        if (!found && hw.dueDate !== null) {
         // Пары больше нет в расписании — обнуляем
         try {
@@ -1059,7 +1065,7 @@ function renderDaySchedule(day) {
       const typeClass = PAIR_TYPE_NAMES[p.type] || '';
       const typeFullName = PAIR_TYPE_NAMES[p.type] || p.type || '';
 
-      const hwItems = getHwForPair(p.subject, p.type, dayData.date);
+      const hwItems = getHwForPair(p.subject, p.type, dayData.date, p.subgroup);
       let hwHtml = '';
       if (hwItems.length) {
         hwHtml = '<div class="pair-hw">' + hwItems.map(hw => {
@@ -1079,6 +1085,7 @@ function renderDaySchedule(day) {
 
       const baseSubj = p.subject;
       const pairTypeCode = p.type || '';
+      const subgroupNum = p.subgroup ? p.subgroup.replace(/\D/g, '') : '';
 
       pairsHtml += `
         <div class="pair-card${p.subgroup ? ' has-subgroup' : ''}">
@@ -1090,7 +1097,7 @@ function renderDaySchedule(day) {
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
               ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
-              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" title="Добавить ДЗ">+</button>
+              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ">+</button>
             </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
@@ -1112,10 +1119,10 @@ function renderDaySchedule(day) {
 
    attachShowMore(content);
 
-   content.querySelectorAll('.pair-add-hw').forEach(btn => {
+    content.querySelectorAll('.pair-add-hw').forEach(btn => {
     btn.onclick = (e) => {
       e.stopPropagation();
-      openHwModal(btn.dataset.subj, btn.dataset.type);
+      openHwModal(btn.dataset.subj, btn.dataset.type, btn.dataset.subgroup);
     };
   });
 }
@@ -1226,16 +1233,24 @@ function getHwForSubject(subj) {
   });
 }
 
-function getHwForPair(subject, pairType, dayDate) {
+function getHwForPair(subject, pairType, dayDate, pairSubgroup) {
   if (!subject) return [];
   const base = subject.trim().toLowerCase();
   const dISO = normalizeDateToISO(dayDate);
+  const pairSub = (pairSubgroup || '').replace(/\D/g, ''); // "1" / "2" / "" (общая)
   return state.homework.filter(h => {
     if (!h.dueDate) return false;
     if ((h.subject || '').trim().toLowerCase() !== base) return false;
     if (h.pairType && h.pairType !== 'any' && h.pairType !== pairType) return false;
     if (normalizeDateToISO(h.dueDate) !== dISO) return false;
-    return true;
+    // Фильтр по подгруппе:
+    //  - ДЗ "any" (обе) показывается на всех парах;
+    //  - ДЗ для подгруппы N — только на парах подгруппы N;
+    //  - общая пара (без подгруппы) получает только ДЗ "any".
+    const hwSub = h.subgroup || 'any';
+    if (hwSub === 'any') return true;
+    if (!pairSub) return false;
+    return hwSub === pairSub;
   });
 }
 
@@ -1363,18 +1378,22 @@ function setupHomeworkModal() {
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
+  const subgroupWrap = document.getElementById('hwSubgroupWrap');
+  const subgroupSel = document.getElementById('hwSubgroup');
 
   document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
 
   document.getElementById('closeHomework').onclick = () => modal.classList.add('hidden');
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 
-  // Предмет → управление custom / pairType / dueMode
+  // Предмет → управление custom / pairType / subgroup / dueMode
   sel.onchange = () => {
     const val = sel.value;
     if (val === '__custom__') {
       customWrap.classList.remove('hidden');
       pairTypeWrap.classList.add('hidden');
+      subgroupWrap.classList.add('hidden');
+      subgroupSel.value = 'any';
       document.getElementById('hwSubjectCustom').focus();
       // Disable nextPair for custom subjects
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
@@ -1386,6 +1405,8 @@ function setupHomeworkModal() {
     } else {
       customWrap.classList.add('hidden');
       pairTypeWrap.classList.remove('hidden');
+      subgroupWrap.classList.remove('hidden');
+      subgroupSel.value = 'any';
       setPairTypeFromSelected(val);
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
     }
@@ -1448,6 +1469,7 @@ function setupHomeworkModal() {
     const dueMode = modeRadio ? modeRadio.value : 'date';
     const dueDate = calState.selectedDate;
     let pairType = document.getElementById('hwPairType').value;
+    const subgroup = document.getElementById('hwSubgroup').value || 'any';
 
     if (!isCustom) {
       // При выборе из select — pairType уже правильно установлен в onchange/onmount
@@ -1460,6 +1482,7 @@ function setupHomeworkModal() {
         group: state.group,
         subject: isCustom ? subject : subject,
         pairType,
+        subgroup,
         task,
         dueMode,
         dueDate,
@@ -1517,11 +1540,13 @@ function setPairTypeFromSelected(val) {
   }
 }
 
-function openHwModal(preSubject, prePairType) {
+function openHwModal(preSubject, prePairType, preSubgroup) {
   const modal = document.getElementById('homeworkModal');
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
+  const subgroupWrap = document.getElementById('hwSubgroupWrap');
+  const subgroupSel = document.getElementById('hwSubgroup');
 
   // Build subject list from loadedSubjects + today + current schedule
   sel.innerHTML = '';
@@ -1594,6 +1619,11 @@ function openHwModal(preSubject, prePairType) {
 
   if (sel.value !== '__custom__') {
     pairTypeWrap.classList.remove('hidden');
+    subgroupWrap.classList.remove('hidden');
+    subgroupSel.value = preSubgroup || 'any';
+  } else {
+    subgroupWrap.classList.add('hidden');
+    subgroupSel.value = 'any';
   }
 
   // Сброс form
@@ -1662,12 +1692,21 @@ function renderHomework() {
     return new Date(a.dueDate) - new Date(b.dueDate);
   });
 
-  if (sorted.length === 0) {
+  // Просроченные ДЗ убираем из общего списка внизу. Их всё ещё можно увидеть
+  // на дне сдачи — при переходе на прошедший день через расписание.
+  const visible = sorted.filter(hw => {
+    if (!hw.dueDate) return true;
+    const due = new Date(hw.dueDate);
+    due.setHours(0, 0, 0, 0);
+    return due >= today;
+  });
+
+  if (visible.length === 0) {
     list.innerHTML = '<div class="no-homework">Нет заданий</div>';
     return;
   }
 
-  list.innerHTML = sorted.map(hw => {
+  list.innerHTML = visible.map(hw => {
     let cardClass = '';
     let dueClass = '';
     let dueText = '';
@@ -1698,22 +1737,17 @@ function renderHomework() {
       ? '<div class="hw-author">— ' + escHtml(hw.author) + '</div>'
       : '';
 
-    const createdHtml = hw.createdAt
-      ? '<div class="hw-created">добавлено: ' + escHtml(formatDateDisplay(hw.createdAt.slice(0, 10))) + '</div>'
-      : '';
-
     const subjectHtml = escHtml(hw.subject) +
-      (hw.pairType && hw.pairType !== 'any' ? ' <span class="hw-pair-type">(' + escHtml(hw.pairType) + ')</span>' : '');
-    const dueModeHint = hw.dueMode === 'nextPair' ? '<span class="hw-mode-hint" title="Автоматически">↻</span>' : '';
+      (hw.pairType && hw.pairType !== 'any' ? ' <span class="hw-pair-type">(' + escHtml(hw.pairType) + ')</span>' : '') +
+      (hw.subgroup && hw.subgroup !== 'any' ? ' <span class="hw-pair-type">· подгруппа ' + escHtml(hw.subgroup) + '</span>' : '');
 
     return `
       <div class="hw-card ${cardClass}">
         <div class="hw-info">
-          <div class="hw-subject">${subjectHtml} ${dueModeHint}</div>
+          <div class="hw-subject">${subjectHtml}</div>
           <div class="hw-task">${hwTaskMarkup(hw.task)}</div>
            ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
            ${authorHtml}
-           ${createdHtml}
          </div>
         <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
       </div>`;
