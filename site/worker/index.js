@@ -493,7 +493,8 @@ async function handleAddHw(request, env, corsHeaders) {
 }
 
 // ── PUT /api/hw ────────────────────────────────────────────────
-// Body: { id, group, dueDate } — обновляет dueDate у конкретного ДЗ.
+// Body: { id, group, subject, pairType, subgroup, task, dueMode, dueDate, author }
+// — обновляет все поля конкретного ДЗ.
 
 async function handleUpdateHw(request, env, corsHeaders) {
   if (!env.SCHEDULE) {
@@ -501,7 +502,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { id, group, dueDate } = body;
+  const { id, group } = body;
 
   if (!id || !group) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
@@ -514,7 +515,24 @@ async function handleUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Homework not found' }, corsHeaders, 404);
   }
 
-  existing[idx] = { ...existing[idx], dueDate: dueDate || '' };
+  const prev = existing[idx];
+  const item = {
+    ...prev,
+    subject: body.subject != null ? body.subject : prev.subject,
+    pairType: body.pairType != null ? body.pairType : prev.pairType,
+    subgroup: body.subgroup != null ? body.subgroup : prev.subgroup,
+    task: body.task != null ? body.task : prev.task,
+    dueMode: body.dueMode != null ? body.dueMode : prev.dueMode,
+    author: body.author != null ? body.author : prev.author,
+  };
+
+  if (item.dueMode === 'nextPair') {
+    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(prev.createdAt), item.subgroup);
+  } else {
+    item.dueDate = body.dueDate || '';
+  }
+
+  existing[idx] = item;
   await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);

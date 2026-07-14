@@ -536,6 +536,13 @@ header {
   color: var(--red);
 }
 
+.hw-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .hw-delete {
   background: none;
   border: none;
@@ -551,6 +558,23 @@ header {
 .hw-delete:hover {
   color: var(--red);
   background: rgba(248, 113, 113, 0.1);
+}
+
+.hw-edit {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 4px;
+  border-radius: 6px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.hw-edit:hover {
+  color: var(--text);
+  background: rgba(148, 163, 184, 0.12);
 }
 
 .hw-author {

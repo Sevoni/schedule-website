@@ -23,6 +23,8 @@ let state = {
   syncing: false,
 };
 
+let editingHwId = null;
+
 // ── Init ──────────────────────────────────────────────────────
 
 // Возвращает расписание недели, которая календарно содержит сегодняшнюю дату
@@ -1078,7 +1080,7 @@ function renderDaySchedule(day) {
             if (df < 0) dc = ' overdue';
             else if (df <= 2) dc = ' due-soon';
           }
-          const dueText = (hw.dueDate ? escHtml(hw.dueDate) : '') + (hw.author ? ' · ' + escHtml(hw.author) : '');
+          const dueText = (hw.author ? escHtml(hw.author) : '');
           return `<div class="pair-hw-item${dc}"><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
@@ -1455,10 +1457,10 @@ function setupHomeworkModal() {
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
 
-  document.getElementById('addHomeworkBtn').onclick = () => openHwModal();
+  document.getElementById('addHomeworkBtn').onclick = () => { editingHwId = null; openHwModal(); };
 
-  document.getElementById('closeHomework').onclick = () => modal.classList.add('hidden');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+  document.getElementById('closeHomework').onclick = () => { editingHwId = null; modal.classList.add('hidden'); };
+  modal.onclick = (e) => { if (e.target === modal) { editingHwId = null; modal.classList.add('hidden'); } };
 
   // Предмет → управление custom / pairType / subgroup / dueMode
   sel.onchange = () => {
@@ -1552,18 +1554,35 @@ function setupHomeworkModal() {
     if (author) localStorage.setItem('hwAuthor', author);
 
     try {
-      const result = await apiPost('/api/hw', {
-        group: state.group,
-        subject: isCustom ? subject : subject,
-        pairType,
-        subgroup,
-        task,
-        dueMode,
-        dueDate,
-        author,
-      });
-
-      state.homework.push(result.item);
+      let result;
+      if (editingHwId) {
+        result = await apiPut('/api/hw', {
+          id: editingHwId,
+          group: state.group,
+          subject,
+          pairType,
+          subgroup,
+          task,
+          dueMode,
+          dueDate,
+          author,
+        });
+        const idx = state.homework.findIndex(h => h.id === editingHwId);
+        if (idx >= 0) state.homework[idx] = result.item;
+      } else {
+        result = await apiPost('/api/hw', {
+          group: state.group,
+          subject: isCustom ? subject : subject,
+          pairType,
+          subgroup,
+          task,
+          dueMode,
+          dueDate,
+          author,
+        });
+        state.homework.push(result.item);
+      }
+      editingHwId = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
       modal.classList.add('hidden');
@@ -1614,11 +1633,16 @@ function setPairTypeFromSelected(val) {
   }
 }
 
-function openHwModal(preSubject, prePairType, preSubgroup) {
+function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
   const modal = document.getElementById('homeworkModal');
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
+  const titleEl = modal.querySelector('.modal-header h2');
+
+  editingHwId = existingHw ? existingHw.id : null;
+  titleEl.textContent = existingHw ? 'Редактировать задание' : 'Новое задание';
+  document.getElementById('saveHomework').textContent = existingHw ? 'Сохранить' : 'Добавить';
 
   // Build subject list from loadedSubjects + today + current schedule
   sel.innerHTML = '';
@@ -1660,7 +1684,49 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
   sel.appendChild(co);
 
   // Preselect
-  if (preSubject) {
+  if (existingHw) {
+    const match = loadedSubjects.find(s => s.subject.toLowerCase() === existingHw.subject.toLowerCase());
+    const todayMatch = todayPairs.find(p => p.subject.toLowerCase() === existingHw.subject.toLowerCase());
+    if (todayMatch) {
+      sel.value = existingHw.subject;
+    } else if (match) {
+      sel.value = match.subject;
+    } else {
+      sel.value = '__custom__';
+      customWrap.classList.remove('hidden');
+      document.getElementById('hwSubjectCustom').value = existingHw.subject;
+    }
+    pairTypeWrap.classList.remove('hidden');
+    setPairTypeFromSelected(sel.value === '__custom__' ? '' : sel.value);
+    document.getElementById('hwPairType').value = (existingHw.pairType && existingHw.pairType !== 'any') ? existingHw.pairType : 'any';
+    document.getElementById('hwSubgroup').value = (existingHw.subgroup && existingHw.subgroup !== 'any') ? existingHw.subgroup : 'any';
+
+    document.getElementById('hwTask').value = existingHw.task || '';
+    document.getElementById('hwTaskError').classList.add('hidden');
+    document.getElementById('hwAuthor').value = existingHw.author || '';
+
+    document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
+    const mode = existingHw.dueMode === 'date' ? 'date' : 'nextPair';
+    const modeRadio = document.querySelector('input[name="hwDueMode"][value="' + mode + '"]');
+    if (modeRadio) modeRadio.checked = true;
+    if (mode === 'date') {
+      document.getElementById('hwDateWrap').classList.remove('hidden');
+      if (existingHw.dueDate) {
+        const parts = existingHw.dueDate.split('-').map(Number);
+        if (parts[0]) {
+          calState.year = parts[0];
+          calState.month = parts[1] - 1;
+          calState.selectedDate = existingHw.dueDate;
+          renderCalendar(calState.year, calState.month, existingHw.dueDate);
+          document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
+        }
+      }
+    } else {
+      document.getElementById('hwDateWrap').classList.add('hidden');
+    }
+
+    updateSubgroupVisibility(existingHw.subgroup);
+  } else if (preSubject) {
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === preSubject.toLowerCase());
     const todayMatch = todayPairs.find(p => p.subject.toLowerCase() === preSubject.toLowerCase());
     if (todayMatch) {
@@ -1678,6 +1744,44 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
       customWrap.classList.remove('hidden');
       document.getElementById('hwSubjectCustom').value = preSubject;
     }
+
+    if (sel.value !== '__custom__') {
+      pairTypeWrap.classList.remove('hidden');
+    }
+
+    // Сброс form
+    document.getElementById('hwTask').value = '';
+    document.getElementById('hwTaskError').classList.add('hidden');
+    document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
+
+    // Due mode
+    document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
+    const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
+    if (defaultMode) defaultMode.checked = true;
+    if (sel.value === '__custom__') {
+      document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
+      document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
+    }
+    document.getElementById('hwDateWrap').classList.add('hidden');
+
+    // Calendar init
+    const today = new Date();
+    calState.year = today.getFullYear();
+    calState.month = today.getMonth();
+    calState.selectedDate = '';
+    renderCalendar(calState.year, calState.month, '');
+    document.getElementById('hwDateSelected').textContent = '—';
+
+    if (preSubject && prePairType) {
+      setPairTypeFromSelected(preSubject);
+      if (prePairType !== 'any') {
+        document.getElementById('hwPairType').value = prePairType;
+      }
+    }
+
+    // Подгруппы: показываем только если у предмета+типа есть разбиение,
+    // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
+    updateSubgroupVisibility(preSubgroup);
   } else {
     sel.value = todayPairs.length ? todayPairs[0].subject : (allItems.length ? allItems[0].subject : '__custom__');
     if (sel.value !== '__custom__') {
@@ -1687,45 +1791,37 @@ function openHwModal(preSubject, prePairType, preSubgroup) {
       customWrap.classList.remove('hidden');
       pairTypeWrap.classList.add('hidden');
     }
-  }
 
-  if (sel.value !== '__custom__') {
-    pairTypeWrap.classList.remove('hidden');
-  }
-
-  // Сброс form
-  document.getElementById('hwTask').value = '';
-  document.getElementById('hwTaskError').classList.add('hidden');
-  document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
-
-  // Due mode
-  document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
-  const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
-  if (defaultMode) defaultMode.checked = true;
-  if (sel.value === '__custom__') {
-    document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
-    document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
-  }
-  document.getElementById('hwDateWrap').classList.add('hidden');
-
-  // Calendar init
-  const today = new Date();
-  calState.year = today.getFullYear();
-  calState.month = today.getMonth();
-  calState.selectedDate = '';
-  renderCalendar(calState.year, calState.month, '');
-  document.getElementById('hwDateSelected').textContent = '—';
-
-  if (preSubject && prePairType) {
-    setPairTypeFromSelected(preSubject);
-    if (prePairType !== 'any') {
-      document.getElementById('hwPairType').value = prePairType;
+    if (sel.value !== '__custom__') {
+      pairTypeWrap.classList.remove('hidden');
     }
-  }
 
-  // Подгруппы: показываем только если у предмета+типа есть разбиение,
-  // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
-  updateSubgroupVisibility(preSubgroup);
+    // Сброс form
+    document.getElementById('hwTask').value = '';
+    document.getElementById('hwTaskError').classList.add('hidden');
+    document.getElementById('hwAuthor').value = localStorage.getItem('hwAuthor') || '';
+
+    // Due mode
+    document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
+    const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
+    if (defaultMode) defaultMode.checked = true;
+    if (sel.value === '__custom__') {
+      document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
+      document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
+    }
+    document.getElementById('hwDateWrap').classList.add('hidden');
+
+    // Calendar init
+    const today = new Date();
+    calState.year = today.getFullYear();
+    calState.month = today.getMonth();
+    calState.selectedDate = '';
+    renderCalendar(calState.year, calState.month, '');
+    document.getElementById('hwDateSelected').textContent = '—';
+
+    // Подгруппы
+    updateSubgroupVisibility(preSubgroup);
+  }
 
   modal.classList.remove('hidden');
   document.getElementById('hwTask').focus();
@@ -1820,11 +1916,21 @@ function renderHomework() {
            ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
            ${authorHtml}
          </div>
-        <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
+        <div class="hw-actions">
+          <button class="hw-edit" data-id="${hw.id}" title="Редактировать">✎</button>
+          <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
+        </div>
       </div>`;
   }).join('');
 
   attachShowMore(list);
+
+  list.querySelectorAll('.hw-edit').forEach(btn => {
+    btn.onclick = () => {
+      const hw = state.homework.find(h => h.id === btn.dataset.id);
+      if (hw) openHwModal(null, null, null, hw);
+    };
+  });
 
   list.querySelectorAll('.hw-delete').forEach(btn => {
     btn.onclick = async () => {
