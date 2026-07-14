@@ -290,6 +290,13 @@ async function handleUpload(request, env, corsHeaders) {
       }
     }
 
+    // Пересоберём агрегат предметов один раз, а не на каждую изменённую неделю
+    try {
+      await reaggregateSubjects(env, group, currentSemesterKey());
+    } catch (e) {
+      console.log('reaggregateSubjects skipped:', e.message);
+    }
+
     await env.SCHEDULE.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
       lastGroup: group,
@@ -376,9 +383,16 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
         console.log('addSubjectsFromWeek skipped:', e.message);
       }
     }
-  }
+    }
 
-  // Записываем дату обновления кампуса (если прислали)
+    // Пересоберём агрегат предметов один раз, а не на каждую изменённую неделю
+    try {
+      await reaggregateSubjects(env, group, currentSemesterKey());
+    } catch (e) {
+      console.log('reaggregateSubjects skipped:', e.message);
+    }
+
+    // Записываем дату обновления кампуса (если прислали)
   if (campusUpdatedAt) {
     await env.SCHEDULE.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 604800 });
   }
@@ -714,8 +728,9 @@ async function reaggregateSubjects(env, group, semester) {
   });
 }
 
-// Инкрементальное обновление предметов при синхронизации одной недели:
-// пересчитываем вклад этой недели и пересобираем агрегат из всех недель.
+// Записывает вклад одной недели (subjects-week:*). Пересборку агрегата
+// вызывающий код делает один раз после цикла (см. reaggregateSubjects),
+// чтобы не делать лишних KV-запросов на каждую изменённую неделю.
 async function addSubjectsFromWeek(env, group, weekCode, weekData) {
   if (!weekCode || !weekData || !weekData.days) return false;
 
@@ -726,8 +741,6 @@ async function addSubjectsFromWeek(env, group, weekCode, weekData) {
   await env.SCHEDULE.put(`subjects-week:${group}:${semester}:${weekCode}`, JSON.stringify(snapshot), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
-
-  await reaggregateSubjects(env, group, semester);
   return true;
 }
 
