@@ -817,27 +817,20 @@ async function recalcHomeworkForGroup(env, group) {
 
   let changed = false;
   const updatedItems = [];
-  const todayStr = fmtDate(new Date());
   for (const hw of homework) {
     if (hw.dueMode !== 'nextPair') {
       updatedItems.push(hw);
       continue;
     }
-    // День создания ДЗ всегда <= сегодня, поэтому поиск следующей пары
-    // строго ПОСЛЕ сегодня (dayStr <= сегодня исключается) автоматически
-    // исключает и день создания — ДЗ никогда не попадает на день его создания.
-    const fromDate = new Date();
+    // Ищем следующую пару относительно ДНЯ СОЗДАНИЯ ДЗ, а не относительно
+    // сегодня. Так dueDate остаётся привязанным к той паре, для которой
+    // было задано ДЗ, и не «переезжает» вперёд при каждой синхронизации.
+    const fromDate = new Date(hw.createdAt);
     let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate, hw.subgroup || 'any');
-    // Следующая пара должна быть в будущем (не в прошлом).
-    if (newDate && newDate < todayStr) newDate = null;
     if (!newDate) {
-      // Пары больше нет в будущем расписании — обнуляем дату
-      if (hw.dueDate !== null) {
-        changed = true;
-        updatedItems.push({ ...hw, dueDate: null });
-      } else {
-        updatedItems.push(hw);
-      }
+      // Пара после дня создания не найдена в сохранённом расписании —
+      // оставляем прежнюю дату, чтобы ДЗ не теряло привязку к своему дню.
+      updatedItems.push(hw);
       continue;
     }
     if (newDate === hw.dueDate) {

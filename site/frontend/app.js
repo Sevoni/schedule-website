@@ -802,15 +802,11 @@ function findNextPairInCache(subject, pairType, createdAt, subgroup) {
     return `${y}-${m}-${d}`;
   };
 
-  // Якорная дата — максимум из (день создания ДЗ, сегодня). День создания
-  // всегда <= сегодня, поэтому поиск строго ПОСЛЕ якоря автоматически
-  // исключает и день создания — ДЗ никогда не попадает на день его создания,
-  // при этом дата всегда остаётся в будущем.
-  let anchor = new Date();
-  if (createdAt) {
-    const cd = new Date(createdAt);
-    if (!isNaN(cd.getTime()) && cd > anchor) anchor = cd;
-  }
+  // Якорная дата — ДЕНЬ СОЗДАНИЯ ДЗ. «Следующая пара» ищется строго ПОСЛЕ
+  // него, поэтому ДЗ всегда попадает на первую пару этого предмета после дня
+  // создания и не «переезжает» вперёд каждый день при открытии сайта.
+  let anchor = createdAt ? new Date(createdAt) : new Date();
+  if (isNaN(anchor.getTime())) anchor = new Date();
   anchor.setHours(0, 0, 0, 0);
   const anchorStr = fmt(anchor);
 
