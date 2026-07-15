@@ -53,10 +53,12 @@ document.addEventListener('DOMContentLoaded', () => {
 // ── Main data loading ─────────────────────────────────────────
 //
 // Поведение:
-//  1. При загрузке сайта берём из БД: предыдущую неделю, текущую и две следующих.
-//     Параллельно (если campusEnabled) идём в кампус за текущей и двумя следующими
-//     (предыдущую из кампуса НЕ тянем). Если расписание изменилось или его не было
-//     в БД — оно записывается в БД и текущий экран обновляется.
+//  1. При загрузке сайта берём из БД: предыдущую неделю, текущую и две следующих,
+//     и сразу отрисовываем (БД — источник первым делом, кампус НЕ блокирует экран).
+//     Параллельно (если campusEnabled) фоном идём в кампус за текущей и двумя
+//     следующими (предыдущую НЕ тянем). Если расписание изменилось или его не было
+//     в БД — оно записывается в БД и текущий экран обновляется. Если в БД пусто
+//     (первый визит) — кампус используется как запасной источник.
 //  2. loadSchedule(idx) — переключение недели. Назад → из БД, при отсутствии из кампуса.
 //     Вперёд > 2 недель от текущей → из БД + фоне кампус-обновление.
 //  3. syncAll() — кнопка обновления. На прошлой неделе → только её из кампуса.
@@ -99,6 +101,11 @@ function getInitialWeekIndices() {
 }
 
 // Загрузка исходных расписаний (БД + фоне кампус) при открытии страницы.
+// БД — источник отрисовки «первым и немедленным»: экран показываем сразу из
+// кэша/БД. Кампус никогда не блокирует отрисовку: при наличии данных в БД он
+// уходит в фон (non-blocking) и перерисовывает неделю только если данные
+// реально изменились. Если БД пуста (первый визит) — кампус используется как
+// запасной источник; при его недоступности показываем «Нет данных».
 async function loadInitialSchedules() {
   const indices = getInitialWeekIndices();
   if (indices.length === 0) return;
@@ -121,36 +128,52 @@ async function loadInitialSchedules() {
   const dbMap = new Map();
   for (const r of dbResults) if (r.data) { dbMap.set(r.idx, r.data); state.scheduleCache[state.weeks[r.idx].value] = r.data; }
 
-  // 2) Параллельно из кампуса: текущая + 2 следующих (previous НЕ грузим)
-  const campusIndices = indices.filter(i => {
-    const cur = findRealCurrentIdx();
-    return i >= cur;
-  });
-
-  if (state.campusEnabled && campusIndices.length > 0) {
-    await backgroundSync(campusIndices, dbMap);
-  }
-
-  // 3) Если есть данные для текущей недели в БД — показываем сразу
+  // 2) Отрисовываем из кэша/БД сразу, НЕ дожидаясь кампуса.
+  //    Текущая неделя, иначе любая другая из стартового диапазона.
   const cur = findRealCurrentIdx();
   state.currentWeekIdx = cur;
-  const currentData = dbMap.get(cur);
-  if (currentData) {
-    state.schedule = currentData;
-    applyScheduleHeader();
-    renderDayTabs();
-  } else {
-    // Текущей недели в БД нет, но из кампуса может подтянуться через backgroundSync.
-    // Если кампус отключён или campusIndices пусто — покажем что-нибудь из БД.
-    let fallbackIdx = indices.find(i => dbMap.has(i));
-    if (fallbackIdx !== undefined) {
-      state.currentWeekIdx = fallbackIdx;
-      state.schedule = dbMap.get(fallbackIdx);
+
+  function renderFromCache() {
+    const curWeek = state.weeks[state.currentWeekIdx];
+    if (curWeek && state.scheduleCache[curWeek.value]) {
+      state.schedule = state.scheduleCache[curWeek.value];
       applyScheduleHeader();
       renderDayTabs();
-    } else if (!state.campusEnabled || campusIndices.length === 0) {
-      content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
+      return true;
     }
+    const fallbackIdx = indices.find(i => state.scheduleCache[state.weeks[i].value]);
+    if (fallbackIdx !== undefined) {
+      state.currentWeekIdx = fallbackIdx;
+      const w = state.weeks[fallbackIdx];
+      state.schedule = state.scheduleCache[w.value];
+      applyScheduleHeader();
+      renderDayTabs();
+      return true;
+    }
+    return false;
+  }
+
+  const renderedFromDb = renderFromCache();
+
+  // 3) Кампус: фоновое обновление (если уже что-то показали) либо
+  //    запасной источник (если в БД/кэше пусто — первый визит).
+  const campusIndices = indices.filter(i => i >= cur);
+
+  if (state.campusEnabled && campusIndices.length > 0) {
+    if (renderedFromDb) {
+      // Не блокируем отрисовку. backgroundSync сам перерисует текущую
+      // неделю, только если данные из кампуса отличаются.
+      backgroundSync(campusIndices, dbMap).catch(e =>
+        console.warn('[bgSync] error:', e.message));
+    } else {
+      // В кэше/БД пусто — кампус единственный шанс получить данные.
+      await backgroundSync(campusIndices, dbMap);
+      if (!renderFromCache()) {
+        content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
+      }
+    }
+  } else if (!renderedFromDb) {
+    content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
   }
 }
 
