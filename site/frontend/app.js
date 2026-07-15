@@ -1229,8 +1229,9 @@ function getTodaySubjectPairs() {
   const result = [];
   for (const p of day.pairs) {
     if (!p.subject) continue;
-    if (seen.has(p.subject)) continue;
-    seen.add(p.subject);
+    const key = p.subject + '\u0001' + (p.type || '');
+    if (seen.has(key)) continue;
+    seen.add(key);
     result.push(p);
   }
   return result;
@@ -1454,6 +1455,15 @@ function formatDateDisplay(str) {
   return `${d}.${m}.${y}`;
 }
 
+// ── Subject+Type encoded option values ────────────────────────
+const PV_SEP = '\u0001';
+function encodePairValue(s, t) { return t ? s + PV_SEP + t : s; }
+function decodePairValue(v) {
+  if (!v || v === '__custom__') return { subject: v, type: '' };
+  const i = v.indexOf(PV_SEP);
+  return i === -1 ? { subject: v, type: '' } : { subject: v.slice(0, i), type: v.slice(i + 1) };
+}
+
 // Подгруппа сегодняшнего занятия выбранного предмета/типа ("" — если нет).
 function getTodaySubgroupFor(subject, pairType) {
   const base = (subject || '').trim().toLowerCase();
@@ -1471,7 +1481,7 @@ function getTodaySubgroupFor(subject, pairType) {
 // выбранного предмета+типа разбиение на подгруппы (по loadedSubjects).
 // preSubgroup — явно заданная подгруппа (например, с кнопки «+» на паре).
 function updateSubgroupVisibility(preSubgroup) {
-  const subject = document.getElementById('hwSubject').value;
+  const subject = decodePairValue(document.getElementById('hwSubject').value).subject;
   const pairType = document.getElementById('hwPairType').value; // 'any' или код
   const entry = loadedSubjects.find(s => s.subject.toLowerCase() === (subject || '').toLowerCase());
 
@@ -1604,7 +1614,7 @@ function setupHomeworkModal() {
     const isCustom = sel.value === '__custom__';
     const subject = isCustom
       ? document.getElementById('hwSubjectCustom').value.trim()
-      : sel.value;
+      : decodePairValue(sel.value).subject;
 
     if (!subject) return;
 
@@ -1691,25 +1701,37 @@ function populatePairTypeSelect(subject) {
 
 function setPairTypeFromSelected(val) {
   const sel = document.getElementById('hwPairType');
-  populatePairTypeSelect(val);
+  const { subject: rawSubject, type: explicitType } = decodePairValue(val);
+  populatePairTypeSelect(rawSubject);
   sel.disabled = false;
   if (val === '__custom__') {
     sel.value = 'any';
     return;
   }
-  const todayPairs = getTodaySubjectPairs();
-  const match = todayPairs.find(p => p.subject.toLowerCase() === val.toLowerCase() && p.type);
-  if (match && ALLOWED_PAIR_TYPES.includes(match.type)) {
-    let opt = [...sel.options].find(o => o.value === match.type);
+  if (explicitType && ALLOWED_PAIR_TYPES.includes(explicitType)) {
+    let opt = [...sel.options].find(o => o.value === explicitType);
     if (!opt) {
       opt = document.createElement('option');
-      opt.value = match.type;
-      opt.textContent = (PAIR_TYPE_NAMES[match.type] || match.type) + ' (' + match.type + '.)';
+      opt.value = explicitType;
+      opt.textContent = (PAIR_TYPE_NAMES[explicitType] || explicitType) + ' (' + explicitType + '.)';
       sel.insertBefore(opt, sel.querySelector('option[value="any"]'));
     }
-    sel.value = match.type;
+    sel.value = explicitType;
   } else {
-    sel.value = 'any';
+    const todayPairs = getTodaySubjectPairs();
+    const match = todayPairs.find(p => p.subject.toLowerCase() === rawSubject.toLowerCase() && p.type);
+    if (match && ALLOWED_PAIR_TYPES.includes(match.type)) {
+      let opt = [...sel.options].find(o => o.value === match.type);
+      if (!opt) {
+        opt = document.createElement('option');
+        opt.value = match.type;
+        opt.textContent = (PAIR_TYPE_NAMES[match.type] || match.type) + ' (' + match.type + '.)';
+        sel.insertBefore(opt, sel.querySelector('option[value="any"]'));
+      }
+      sel.value = match.type;
+    } else {
+      sel.value = 'any';
+    }
   }
 }
 
@@ -1734,7 +1756,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     for (const p of todayPairs) {
       const o = document.createElement('option');
       const typeHint = p.type ? ' (' + (PAIR_TYPE_NAMES[p.type] || p.type) + ')' : '';
-      o.value = p.subject;
+      o.value = encodePairValue(p.subject, p.type);
       o.textContent = p.subject + typeHint;
       og.appendChild(o);
     }
@@ -1766,9 +1788,12 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
   // Preselect
   if (existingHw) {
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === existingHw.subject.toLowerCase());
-    const todayMatch = todayPairs.find(p => p.subject.toLowerCase() === existingHw.subject.toLowerCase());
+    const todayMatch = todayPairs.find(p =>
+      p.subject.toLowerCase() === existingHw.subject.toLowerCase() &&
+      (!existingHw.pairType || existingHw.pairType === 'any' || p.type === existingHw.pairType)
+    );
     if (todayMatch) {
-      sel.value = existingHw.subject;
+      sel.value = encodePairValue(todayMatch.subject, todayMatch.type);
     } else if (match) {
       sel.value = match.subject;
     } else {
@@ -1808,9 +1833,12 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     updateSubgroupVisibility(existingHw.subgroup);
   } else if (preSubject) {
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === preSubject.toLowerCase());
-    const todayMatch = todayPairs.find(p => p.subject.toLowerCase() === preSubject.toLowerCase());
+    const todayMatch = todayPairs.find(p =>
+      p.subject.toLowerCase() === preSubject.toLowerCase() &&
+      (!prePairType || prePairType === 'any' || p.type === prePairType)
+    );
     if (todayMatch) {
-      sel.value = preSubject;
+      sel.value = encodePairValue(todayMatch.subject, todayMatch.type);
     } else if (match) {
       sel.value = match.subject;
       setPairTypeFromSelected(match.subject);
@@ -1853,7 +1881,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     document.getElementById('hwDateSelected').textContent = '—';
 
     if (preSubject && prePairType) {
-      setPairTypeFromSelected(preSubject);
+      setPairTypeFromSelected(encodePairValue(preSubject, prePairType));
       if (prePairType !== 'any') {
         document.getElementById('hwPairType').value = prePairType;
       }
@@ -1863,7 +1891,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
     updateSubgroupVisibility(preSubgroup);
   } else {
-    sel.value = todayPairs.length ? todayPairs[0].subject : (allItems.length ? allItems[0].subject : '__custom__');
+    sel.value = todayPairs.length ? encodePairValue(todayPairs[0].subject, todayPairs[0].type) : (allItems.length ? allItems[0].subject : '__custom__');
     if (sel.value !== '__custom__') {
       customWrap.classList.add('hidden');
       setPairTypeFromSelected(sel.value);
