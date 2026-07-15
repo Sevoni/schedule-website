@@ -4,21 +4,26 @@
 
 Campus schedule viewer for Syktyvkar State University (campus.syktsu.ru). No build system, no tests, no linting — pure vanilla JS frontend + Cloudflare Worker backend.
 
-## Two codebases in one repo
+## Project structure
 
-| Directory | What it is | Runs where |
-|---|---|---|
-| `frontend/` | Standalone browser-only version. Parses campus HTML directly, stores HW in localStorage. No backend needed. | Open `index.html` in browser |
-| `site/` | Cloudflare Worker (KV-backed API) + Pages frontend. Has sync, auth, multi-group support. | `wrangler dev` / `wrangler deploy` |
+```
+site/
+├── worker/index.js          — Cloudflare Worker (~930 lines)
+├── frontend/
+│   ├── index.html           — SPA shell
+│   ├── app.js               — main logic (~2150 lines)
+│   ├── schedule-utils.js    — DEAD CODE (unused ES module, not imported)
+│   └── style.css            — dark theme
+├── package.json             — only devDep: wrangler
+└── wrangler.toml            — KV binding SCHEDULE, env vars CAMPUS_URL, DEFAULT_GROUP
+```
 
-**Key difference:** `frontend/app.js` is the simpler, self-contained variant. `site/frontend/app.js` is the production version that talks to the Worker API. The HTML parsers in both are near-identical — changes to parsing logic usually need to be mirrored.
-
-## Dev commands (site/ only)
+## Dev commands
 
 ```bash
 cd site
 npm run dev     # wrangler dev — local Worker + Pages
-npm run deploy  # wrangler deploy — push to Cloudflare
+npm run deploy  # wrangler deploy + pages deploy — push to Cloudflare
 npm run tail    # wrangler tail — live logs
 ```
 
@@ -26,64 +31,104 @@ No install step needed — only `wrangler` is a devDependency.
 
 ## Architecture
 
-- **Worker** (`site/worker/index.js`): single-file Cloudflare Worker, ~390 lines. Handles auth, schedule CRUD, homework CRUD, KV storage.
-- **KV namespace** `SCHEDULE`: stores schedule data, weeks, homework, group passwords. Keys: `schedule:{group}:{weekCode}`, `weeks:{group}`, `hw:{group}`, `group-pwd:{group}`.
-  - `schedule:{group}:current` is deleted during batch sync (legacy key, no longer written).
-  - `sync:meta` stores last sync metadata.
+- **Worker** (`site/worker/index.js`): single-file Cloudflare Worker, ~930 lines. Handles schedule CRUD, homework CRUD, subjects aggregation, KV storage.
+- **KV namespace** `SCHEDULE`: stores schedule data, weeks, homework, subjects, group passwords.
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
-- **Auth**: simple token scheme — `btoa(JSON.stringify({group, ts}))` as Bearer token, 30-day expiry. Passwords stored as SHA-256 hashes in KV.
+- **Auth**: token scheme defined (`btoa(JSON.stringify({group, ts}))`, SHA-256 passwords) but **NOT enforced** — `verifyAuth()` exists but is never called. All endpoints are public.
 - **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
+
+## KV key patterns
+
+| Key | TTL | Description |
+|---|---|---|
+| `schedule:{group}:{weekCode}` | 7d | Weekly schedule data |
+| `weeks:{group}` | 7d | Weeks list |
+| `hw:{group}` | 30d | Homework array |
+| `group-pwd:{group}` | none | SHA-256 password hash |
+| `sync:meta` | 7d | Last sync metadata |
+| `subjects:{group}:{semester}` | 365d | Aggregated subjects for semester |
+| `subjects-week:{group}:{semester}:{weekCode}` | 365d | Per-week subject snapshots |
+| `campus-updated:{group}` | 7d | Campus update timestamp string |
+| `schedule:{group}:current` | — | Legacy key, deleted during cleanup (not written) |
+
+## API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/status` | KV health + last sync info |
+| GET | `/api/schedule?group=&week=` | Get one week's schedule from KV |
+| GET | `/api/weeks?group=` | Get weeks list |
+| POST | `/api/upload` | Upload weeks/schedule/schedule-batch |
+| GET | `/api/subjects?group=` | Get semester subjects |
+| POST | `/api/subjects` | Override subjects list |
+| GET | `/api/hw?group=` | Get all homework |
+| POST | `/api/hw` | Create homework |
+| PUT | `/api/hw` | Update homework |
+| DELETE | `/api/hw` | Delete homework |
+| POST | `/api/hw/recalc` | Recalc all nextPair dueDates |
+| POST | `/api/check-campus-update` | Check if campus data changed |
+| POST | `/api/sync-from-campus` | Full sync: save + update subjects + recalc HW |
+| POST | `/api/auth` | Login (group + password → token) |
+| POST | `/api/group/register` | Register new group with password |
 
 ## Data model
 
-- **Schedule pair** `{ subject, teacher, room, type, subgroup }`:
+- **Schedule pair** `{ subject, teacher, room, type, subgroup, time }`:
   - `subject`: clean name, no type suffix (e.g. `"Математика"`)
   - `type`: pair type code (`"л"`, `"пр"`, `"пз"`, `"лаб"`, `"с"`, `"зчО"`, `"зач"`, `""`)
+  - `subgroup`: `"подгруппа 1"`, `"подгруппа 2"`, or `""`
   - Display name via `PAIR_TYPE_NAMES[type]` (e.g. `"лекция"`)
-- **Homework** `{ subject, pairType, dueMode, ... }`:
+- **Homework** `{ id, subject, pairType, subgroup, task, dueMode, dueDate, author, createdAt }`:
   - `pairType`: code (`"л"`, `"пр"`, etc.) or `"any"` for all types
   - `dueMode`: `"nextPair"` or `"date"`
-- Subject matching in worker uses `p.subject` and `p.type` directly — no `splitSubjectType()` needed.
+  - `subgroup`: `"1"`, `"2"`, or `"any"`
+- **Subjects** `{ subject, pairTypes: [...], subgroups: { [pairType]: [code, ...] } }`
 
 ## Campus sync
 
-Campus sync updates the **server-side KV cache** — it fetches HTML from `campus.syktsu.ru`, parses it, and stores schedule data in the Worker's KV storage. This is needed because the campus API is not available to the browser (CORS), so the Worker acts as a proxy/cache. The frontend always reads from KV first, and only falls back to parsing campus directly in the browser if the cache is empty.
+The frontend fetches HTML from `campus.syktsu.ru` directly in the browser (CORS works from browser). The Worker acts as a KV cache/database — the frontend reads from KV first, only falls back to parsing campus directly if cache is empty.
+
+### `syncAll()` (refresh button)
+
+1. Checks campus update time via `/api/check-campus-update`.
+2. Fetches current week + 4 ahead from campus in parallel.
+3. Sends to Worker via `/api/sync-from-campus` — Worker saves data, updates subjects, recalcs HW due dates.
+4. Frontend preserves user's current week selection.
+
+### `backgroundSync()` (first page load)
+
+1. Fetches weeks list from campus.
+2. Fetches current week + 2 ahead from campus in parallel.
+3. Sends to Worker — only changed data is overwritten.
+4. If campus is unavailable, silently keeps the cache.
 
 ## HTML parser
 
-Both frontends parse `campus.syktsu.ru` HTML with regex (not DOM). The parser extracts: week options (`<select name="weeks">`), schedule table (`<table class="schedule">`), day headers, pair cells. If the university changes their HTML structure, these regexes break.
+The frontend parses `campus.syktsu.ru` HTML with regex (not DOM). The parser extracts: week options (`<select name="weeks">`), schedule table (`<table class="schedule">`), day headers, pair cells. If the university changes their HTML structure, these regexes break. `schedule4.html` is a reference HTML dump for testing.
+
+## Subject option encoding
+
+The homework modal encodes `subject + type + subgroup` into `<select>` option values using `\u0001` as separator via `encodePairValue()`/`decodePairValue()`. This allows multiple types/subgroups of the same subject to appear as distinct options in the "Сегодня" list.
 
 ## Conventions
 
 - All UI text is in Russian
 - Default group: `131-ИБо`
 - No package manager lockfile — `node_modules` not tracked
-- `test.html` is a legacy standalone test page (can be ignored)
-- No TypeScript, no bundler, no transpiler — plain ES modules
+- No TypeScript, no bundler, no transpiler — plain JS
+- `schedule-utils.js` is dead code (ES module, not imported) — all its functions are duplicated inline in `app.js`
+- `test.html` is legacy (can be ignored)
+- Отвечать пользователю только на русском языке
 
-## Batch sync (`syncAll`)
+## Deploy
 
-When the user clicks the refresh button, `syncAll()` in `app.js`:
+```bash
+cd site
+npm run deploy
+```
 
-1. Fetches the weeks list from campus, preserving the user's current week selection.
-2. Determines which weeks to fetch via `getWeeksToSync()`:
-   - **Past week selected** → only that one week
-   - **Current week selected** → current + 4 ahead
-   - **Future week selected** → from current to (selected + 2)
-3. Fetches the selected range from campus in parallel via `Promise.all`.
-4. Sends everything to the Worker as a `schedule-batch` upload.
-5. The Worker compares each week's JSON against what's already in KV (ignoring `parsedAt`) and only writes if changed.
-6. Cleanup: `KV.list({ prefix: "schedule:{group}:" })` deletes `schedule:{group}:current` and any week keys not in the current weeks list.
-7. The frontend preserves the user's current week selection (does not jump to the current week).
+Это команда `wrangler deploy && wrangler pages deploy frontend --project-name=schedule-worker`. Она:
+1. Деплоит Worker (`site/worker/index.js`) на `schedule-worker.campus-schedule-syktyvkar.workers.dev`
+2. Деплоит Pages фронтенд (`site/frontend/`) на `{hash}.schedule-worker.pages.dev`
 
-The old single-week `type: 'schedule'` upload is still used by `loadSchedule()` fallback (cache miss → parse campus → upload one week).
-
-## Background sync (`backgroundSync`)
-
-On first page load, `loadData()` shows cached data immediately, then calls `backgroundSync()`:
-
-1. Fetches weeks list from campus in the background.
-2. Fetches current week + 2 weeks ahead from campus in parallel.
-3. Sends to Worker as `schedule-batch` — only changed data is overwritten in KV.
-4. If campus is unavailable (CORS, network), silently keeps the cache as-is.
-5. Updates the UI if the user's current week data changed.
+Деплой занимает ~20-30 секунд. После деплоя URL-ы меняются — проверяй вывод команды.
