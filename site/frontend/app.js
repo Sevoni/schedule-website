@@ -64,8 +64,9 @@ document.addEventListener('DOMContentLoaded', () => {
 //     запасной источник (синхронизация выполняется ожидаемо, не в фоне).
 //  2. loadSchedule(idx) — переключение недели. Назад → из БД, при отсутствии из кампуса.
 //     Вперёд > 2 недель от текущей → из БД + фоне кампус-обновление.
-//  3. syncAll() — кнопка обновления. На прошлой неделе → только её из кампуса.
-//     На текущей/будущей → текущую + 2 следующих из кампуса. Неделю не меняем.
+//  3. syncAll() — кнопка обновления. Якорь = неделя пользователя, но не раньше
+//     реальной текущей (max(currentWeekIdx, realCurrentIdx)). Качает якорь +
+//     5 недель вперёд из кампуса (при изменении по check-campus-update). Неделю не меняем.
 
 async function loadData() {
   try {
@@ -165,10 +166,12 @@ async function loadInitialSchedules() {
   if (state.campusEnabled) {
     if (renderedFromDb) {
       // Не блокируем отрисовку: БД уже показана, синхронизация идёт в фоне.
-      syncAll().catch(e => console.warn('[openSync] error:', e.message));
+      // Якорь — реальная текущая неделя (cur), чтобы авто-синк не зависел
+      // от того, на какую неделю переключил renderFromCache.
+      syncAll(cur).catch(e => console.warn('[openSync] error:', e.message));
     } else {
       // В кэше/БД пусто — кампус единственный шанс получить данные.
-      await syncAll();
+      await syncAll(cur);
       if (!renderFromCache()) {
         content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
       }
@@ -344,16 +347,20 @@ function applyScheduleHeader() {
 // ── Sync (кнопка обновления) ──────────────────────────────────
 //
 // Новый поток (логика перенесена на бэкенд-проверку):
-//  1. Качаем с кампуса HTML текущей недели, параллельно парсим её и
+//  1. Якорь синхронизации = неделя пользователя (state.currentWeekIdx),
+//     но не раньше реальной текущей календарной недели
+//     (anchorIdx = max(currentWeekIdx, realCurrentIdx)). Для авто-открытия
+//     передаётся override = реальная текущая, чтобы не зависеть от renderFromCache.
+//  2. Качаем с кампуса HTML недели-якоря, параллельно парсим её и
 //     извлекаем campusUpdatedAt («Расписание обновлено ...»).
-//  2. Шлём POST /api/check-campus-update { group, campusUpdatedAt }.
+//  3. Шлём POST /api/check-campus-update { group, campusUpdatedAt }.
 //     - needUpdate:false → расписание уже актуально, стоп.
-//     - needUpdate:true  → качаем с кампуса следующие 4 недели (параллельно),
-//       парсим, шлём всё одним батчем на /api/sync-from-campus.
+//     - needUpdate:true  → качаем с кампуса ещё 5 недель вперёд от якоря
+//       (параллельно), парсим, шлём всё одним батчем на /api/sync-from-campus.
 //     Бэкенд сам сохраняет, обновляет предметы/ДЗ, записывает дату.
 //  Пользователь НЕ перемещается на другую неделю.
 
-async function syncAll() {
+async function syncAll(anchorIdxOverride = null) {
   if (state.syncing) return;
   if (!state.campusEnabled) {
     updateSyncUI('error', 'Загрузка из кампуса отключена в настройках');
@@ -379,8 +386,15 @@ async function syncAll() {
 
     const realCurrentIdx = findRealCurrentIdx();
 
-    // 1) Качаем текущую неделю, парсим + извлекаем campusUpdatedAt
-    const currentWeekCode = state.weeks[realCurrentIdx]?.value;
+    // Якорь синхронизации: для кнопки — неделя пользователя, но не раньше
+    // реальной текущей; для авто-открытия передаётся override = реальная
+    // текущая, чтобы не зависеть от того, на какую неделю переключил renderFromCache.
+    const anchorIdx = anchorIdxOverride != null
+      ? anchorIdxOverride
+      : Math.max(state.currentWeekIdx, realCurrentIdx);
+
+    // 1) Качаем неделю-якорь, парсим + извлекаем campusUpdatedAt
+    const currentWeekCode = state.weeks[anchorIdx]?.value;
     if (!currentWeekCode) {
       throw new Error('Не удалось определить текущую неделю');
     }
@@ -409,8 +423,8 @@ async function syncAll() {
       return;
     }
 
-    // 3) Нужно обновление: качаем ещё 4 следующих недели (параллельно)
-    const extraIndices = collectForwardRange(realCurrentIdx + 1, 4);
+    // 3) Нужно обновление: качаем ещё 5 недель вперёд от якоря (параллельно)
+    const extraIndices = collectForwardRange(anchorIdx + 1, 4);
     const extraResults = await Promise.all(
       extraIndices.map(async (i) => {
         try {
@@ -427,7 +441,7 @@ async function syncAll() {
     const validExtra = extraResults.filter(Boolean);
     for (const s of validExtra) state.scheduleCache[s.weekCode] = s.data;
 
-    // Собираем полный батч: текущая + 4 следующих
+    // Собираем полный батч: якорь + 5 следующих
     const schedules = [{ weekCode: currentWeekCode, data: currentData }, ...validExtra];
 
     // 4) Шлём батч на бэкенд, он сам сохраняет и обновляет ДЗ/предметы
