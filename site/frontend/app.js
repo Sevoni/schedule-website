@@ -1229,7 +1229,9 @@ function getTodaySubjectPairs() {
   const result = [];
   for (const p of day.pairs) {
     if (!p.subject) continue;
-    const key = p.subject + '\u0001' + (p.type || '');
+    if (!pairVisibleForSubgroupFilter(p)) continue;
+    const subNum = (p.subgroup || '').replace(/\D/g, '');
+    const key = p.subject + '\u0001' + (p.type || '') + '\u0001' + subNum;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(p);
@@ -1457,11 +1459,15 @@ function formatDateDisplay(str) {
 
 // ── Subject+Type encoded option values ────────────────────────
 const PV_SEP = '\u0001';
-function encodePairValue(s, t) { return t ? s + PV_SEP + t : s; }
+function encodePairValue(s, t, sub) {
+  if (sub) return s + PV_SEP + (t || '') + PV_SEP + sub;
+  if (t) return s + PV_SEP + t;
+  return s;
+}
 function decodePairValue(v) {
-  if (!v || v === '__custom__') return { subject: v, type: '' };
-  const i = v.indexOf(PV_SEP);
-  return i === -1 ? { subject: v, type: '' } : { subject: v.slice(0, i), type: v.slice(i + 1) };
+  if (!v || v === '__custom__') return { subject: v, type: '', subgroup: '' };
+  const parts = v.split(PV_SEP);
+  return { subject: parts[0] || '', type: parts[1] || '', subgroup: parts[2] || '' };
 }
 
 // Подгруппа сегодняшнего занятия выбранного предмета/типа ("" — если нет).
@@ -1572,7 +1578,8 @@ function setupHomeworkModal() {
       setPairTypeFromSelected(val);
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
     }
-    updateSubgroupVisibility();
+    const { subgroup: sub } = decodePairValue(val);
+    updateSubgroupVisibility(sub || undefined);
   };
 
   // Смена типа пары → пересчёт доступных подгрупп
@@ -1756,8 +1763,10 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     for (const p of todayPairs) {
       const o = document.createElement('option');
       const typeHint = p.type ? ' (' + (PAIR_TYPE_NAMES[p.type] || p.type) + ')' : '';
-      o.value = encodePairValue(p.subject, p.type);
-      o.textContent = p.subject + typeHint;
+      const subNum = (p.subgroup || '').replace(/\D/g, '');
+      const subHint = subNum ? ' · ' + subNum + ' подгр.' : '';
+      o.value = encodePairValue(p.subject, p.type, subNum || undefined);
+      o.textContent = p.subject + typeHint + subHint;
       og.appendChild(o);
     }
     sel.appendChild(og);
@@ -1788,12 +1797,17 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
   // Preselect
   if (existingHw) {
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === existingHw.subject.toLowerCase());
-    const todayMatch = todayPairs.find(p =>
-      p.subject.toLowerCase() === existingHw.subject.toLowerCase() &&
-      (!existingHw.pairType || existingHw.pairType === 'any' || p.type === existingHw.pairType)
-    );
+    const todayMatch = todayPairs.find(p => {
+      if (p.subject.toLowerCase() !== existingHw.subject.toLowerCase()) return false;
+      if (existingHw.pairType && existingHw.pairType !== 'any' && p.type !== existingHw.pairType) return false;
+      const pSub = (p.subgroup || '').replace(/\D/g, '');
+      const hwSub = (existingHw.subgroup || '').replace(/\D/g, '');
+      if (hwSub && pSub && pSub !== hwSub) return false;
+      return true;
+    });
     if (todayMatch) {
-      sel.value = encodePairValue(todayMatch.subject, todayMatch.type);
+      const subNum = (todayMatch.subgroup || '').replace(/\D/g, '');
+      sel.value = encodePairValue(todayMatch.subject, todayMatch.type, subNum || undefined);
     } else if (match) {
       sel.value = match.subject;
     } else {
@@ -1833,12 +1847,17 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     updateSubgroupVisibility(existingHw.subgroup);
   } else if (preSubject) {
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === preSubject.toLowerCase());
-    const todayMatch = todayPairs.find(p =>
-      p.subject.toLowerCase() === preSubject.toLowerCase() &&
-      (!prePairType || prePairType === 'any' || p.type === prePairType)
-    );
+    const todayMatch = todayPairs.find(p => {
+      if (p.subject.toLowerCase() !== preSubject.toLowerCase()) return false;
+      if (prePairType && prePairType !== 'any' && p.type !== prePairType) return false;
+      const pSub = (p.subgroup || '').replace(/\D/g, '');
+      const preSub = (preSubgroup || '').replace(/\D/g, '');
+      if (preSub && pSub && pSub !== preSub) return false;
+      return true;
+    });
     if (todayMatch) {
-      sel.value = encodePairValue(todayMatch.subject, todayMatch.type);
+      const subNum = (todayMatch.subgroup || '').replace(/\D/g, '');
+      sel.value = encodePairValue(todayMatch.subject, todayMatch.type, subNum || undefined);
     } else if (match) {
       sel.value = match.subject;
       setPairTypeFromSelected(match.subject);
@@ -1881,7 +1900,8 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     document.getElementById('hwDateSelected').textContent = '—';
 
     if (preSubject && prePairType) {
-      setPairTypeFromSelected(encodePairValue(preSubject, prePairType));
+      const preSub = (preSubgroup || '').replace(/\D/g, '') || undefined;
+      setPairTypeFromSelected(encodePairValue(preSubject, prePairType, preSub));
       if (prePairType !== 'any') {
         document.getElementById('hwPairType').value = prePairType;
       }
@@ -1891,7 +1911,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
     updateSubgroupVisibility(preSubgroup);
   } else {
-    sel.value = todayPairs.length ? encodePairValue(todayPairs[0].subject, todayPairs[0].type) : (allItems.length ? allItems[0].subject : '__custom__');
+    sel.value = todayPairs.length ? encodePairValue(todayPairs[0].subject, todayPairs[0].type, (todayPairs[0].subgroup || '').replace(/\D/g, '') || undefined) : (allItems.length ? allItems[0].subject : '__custom__');
     if (sel.value !== '__custom__') {
       customWrap.classList.add('hidden');
       setPairTypeFromSelected(sel.value);
