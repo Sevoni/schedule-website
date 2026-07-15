@@ -1470,6 +1470,31 @@ function decodePairValue(v) {
   return { subject: parts[0] || '', type: parts[1] || '', subgroup: parts[2] || '' };
 }
 
+// Только название предмета для свёрнутого отображения селекта.
+function shortLabel(val) {
+  if (!val || val === '__custom__') return 'Другой...';
+  return decodePairValue(val).subject;
+}
+
+// Возвращает всем опциям полный текст (с типом/подгруппой) — для раскрытого списка.
+function restoreFullOptions() {
+  const sel = document.getElementById('hwSubject');
+  if (!sel) return;
+  for (const o of sel.options) {
+    if (o.dataset.full) o.textContent = o.dataset.full;
+  }
+}
+
+// Свёрнутый вид: у выбранной опции показываем только название предмета,
+// у остальных — полный текст (он виден при раскрытии списка).
+function collapseSelected() {
+  const sel = document.getElementById('hwSubject');
+  if (!sel) return;
+  restoreFullOptions();
+  const opt = [...sel.options].find(o => o.value === sel.value);
+  if (opt) opt.textContent = shortLabel(sel.value);
+}
+
 // Подгруппа сегодняшнего занятия выбранного предмета/типа ("" — если нет).
 function getTodaySubgroupFor(subject, pairType) {
   const base = (subject || '').trim().toLowerCase();
@@ -1581,6 +1606,13 @@ function setupHomeworkModal() {
     const { subgroup: sub } = decodePairValue(val);
     updateSubgroupVisibility(sub || undefined);
   };
+
+  // При раскрытии списка показываем полные подписи (тип/подгруппа),
+  // в свёрнутом виде — только название предмета.
+  sel.addEventListener('focus', restoreFullOptions);
+  sel.addEventListener('mousedown', restoreFullOptions);
+  sel.addEventListener('change', collapseSelected);
+  sel.addEventListener('blur', collapseSelected);
 
   // Смена типа пары → пересчёт доступных подгрупп
   document.getElementById('hwPairType').onchange = () => updateSubgroupVisibility();
@@ -1767,6 +1799,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
       const subHint = subNum ? ' · ' + subNum + ' подгр.' : '';
       o.value = encodePairValue(p.subject, p.type, subNum || undefined);
       o.textContent = p.subject + typeHint + subHint;
+      o.dataset.full = o.textContent;
       og.appendChild(o);
     }
     sel.appendChild(og);
@@ -1783,6 +1816,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
       o.value = s.subject;
       const typeHint = s.pairTypes.length ? ' (' + s.pairTypes.join(', ') + ')' : '';
       o.textContent = s.subject + typeHint;
+      o.dataset.full = o.textContent;
       og.appendChild(o);
     }
     sel.appendChild(og);
@@ -1792,6 +1826,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
   const co = document.createElement('option');
   co.value = '__custom__';
   co.textContent = 'Другой...';
+  co.dataset.full = 'Другой...';
   sel.appendChild(co);
 
   // Preselect
@@ -1952,6 +1987,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
   }
 
   modal.classList.remove('hidden');
+  collapseSelected();
   document.getElementById('hwTask').focus();
 }
 
