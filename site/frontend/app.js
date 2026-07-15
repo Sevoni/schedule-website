@@ -1976,6 +1976,42 @@ function refreshScheduleView() {
   }
 }
 
+// Возвращает сегодняшние пары, совпадающие с ДЗ по предмету/типу/подгруппе.
+function getTodayPairsForHw(hw) {
+  const sched = getCurrentWeekSchedule();
+  if (!sched) return [];
+  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+  const day = sched.days[todayName];
+  if (!day) return [];
+  const base = (hw.subject || '').trim().toLowerCase();
+  const hwType = hw.pairType || 'any';
+  const hwSub = (hw.subgroup || 'any').replace(/\D/g, '');
+  return day.pairs.filter(p => {
+    if (!p.subject) return false;
+    if ((p.subject || '').trim().toLowerCase() !== base) return false;
+    if (hwType !== 'any' && hwType !== (p.type || '')) return false;
+    const pSub = (p.subgroup || '').replace(/\D/g, '');
+    if (hwSub && pSub && hwSub !== pSub) return false;
+    if (hwSub && !pSub) return false;
+    return true;
+  });
+}
+
+// true, если все совпадающие с ДЗ пары сегодня уже закончились
+// (прошло >= 90 минут с начала каждой).
+function isHwPairFinished(hw) {
+  const pairs = getTodayPairsForHw(hw);
+  if (pairs.length === 0) return false;
+  if (!pairs.every(p => !!p.time)) return false;
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  return pairs.every(p => {
+    const [h, m] = p.time.split(':').map(Number);
+    const startMin = h * 60 + m;
+    return nowMin >= startMin + 90;
+  });
+}
+
 function renderHomework() {
   const list = document.getElementById('homeworkList');
   const today = new Date();
@@ -1992,9 +2028,11 @@ function renderHomework() {
    const f = state.subgroupFilter || 'any';
    const visible = sorted.filter(hw => {
      if (!hw.dueDate) return true;
-     const due = new Date(hw.dueDate);
-     due.setHours(0, 0, 0, 0);
-     if (due < today) return false;
+      const due = new Date(hw.dueDate);
+      due.setHours(0, 0, 0, 0);
+      if (due < today) return false;
+      // Сегодняшнее ДЗ на пару, которая уже прошла (>= 1.5ч с начала) — скрываем.
+      if (due.getTime() === today.getTime() && isHwPairFinished(hw)) return false;
      // Фильтр подгруппы: ДЗ «any» (для обеих) видно всегда;
      // иначе оставляем только ДЗ своей подгруппы.
      if (f !== 'any') {
