@@ -14,6 +14,8 @@ let state = {
   group: localStorage.getItem('group') || DEFAULT_GROUP,
   // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
   campusEnabled: localStorage.getItem('campusEnabled') !== '0',
+  // subgroupFilter: 'any' — показывать обе подгруппы; '1'/'2' — только свою.
+  subgroupFilter: localStorage.getItem('subgroupFilter') || 'any',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -1067,6 +1069,17 @@ function renderDayTabs() {
   renderDaySchedule(state.selectedDay);
 }
 
+// Видима ли пара с учётом выбранного фильтра подгруппы.
+//  - 'any'         → показываем всегда
+//  - пара без подгруппы (общая) → показываем всегда (относится ко всем)
+//  - иначе → только если подгруппа пары совпадает с выбранной
+function pairVisibleForSubgroupFilter(p) {
+  const f = state.subgroupFilter || 'any';
+  if (f === 'any') return true;
+  const s = (p.subgroup || '').replace(/\D/g, '');
+  return !s || s === f;
+}
+
 function renderDaySchedule(day) {
   const content = document.getElementById('scheduleContent');
   const dayData = state.schedule.days[day];
@@ -1077,7 +1090,7 @@ function renderDaySchedule(day) {
   }
 
   let pairsHtml = '';
-  const activePairs = dayData.pairs.filter(p => p.subject);
+  const activePairs = dayData.pairs.filter(p => p.subject && pairVisibleForSubgroupFilter(p));
 
   if (activePairs.length === 0) {
     pairsHtml = '<div class="no-pairs">Нет пар 🎉</div>';
@@ -1926,14 +1939,22 @@ function renderHomework() {
     return new Date(a.dueDate) - new Date(b.dueDate);
   });
 
-  // Просроченные ДЗ убираем из общего списка внизу. Их всё ещё можно увидеть
-  // на дне сдачи — при переходе на прошедший день через расписание.
-  const visible = sorted.filter(hw => {
-    if (!hw.dueDate) return true;
-    const due = new Date(hw.dueDate);
-    due.setHours(0, 0, 0, 0);
-    return due >= today;
-  });
+   // Просроченные ДЗ убираем из общего списка внизу. Их всё ещё можно увидеть
+   // на дне сдачи — при переходе на прошедший день через расписание.
+   const f = state.subgroupFilter || 'any';
+   const visible = sorted.filter(hw => {
+     if (!hw.dueDate) return true;
+     const due = new Date(hw.dueDate);
+     due.setHours(0, 0, 0, 0);
+     if (due < today) return false;
+     // Фильтр подгруппы: ДЗ «any» (для обеих) видно всегда;
+     // иначе оставляем только ДЗ своей подгруппы.
+     if (f !== 'any') {
+       const hwSub = hw.subgroup || 'any';
+       if (hwSub !== 'any' && hwSub !== f) return false;
+     }
+     return true;
+   });
 
   if (visible.length === 0) {
     list.innerHTML = '<div class="no-homework">Нет заданий</div>';
@@ -2022,6 +2043,7 @@ function setupSettingsModal() {
     document.getElementById('groupInput').value = state.group;
     document.getElementById('apiUrlInput').value = state.apiBase;
     document.getElementById('campusToggle').checked = state.campusEnabled;
+    document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
     modal.classList.remove('hidden');
   };
 
@@ -2029,15 +2051,35 @@ function setupSettingsModal() {
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 
   document.getElementById('saveSettings').onclick = () => {
-    state.group = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
-    state.apiBase = document.getElementById('apiUrlInput').value.trim();
-    state.campusEnabled = document.getElementById('campusToggle').checked;
+    const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
+    const newApiBase = document.getElementById('apiUrlInput').value.trim();
+    const newCampusEnabled = document.getElementById('campusToggle').checked;
+    const newSubgroupFilter = document.getElementById('subgroupFilter').value || 'any';
+
+    const groupChanged = newGroup !== state.group;
+    const apiChanged = newApiBase !== state.apiBase;
+    const campusChanged = newCampusEnabled !== state.campusEnabled;
+
+    state.group = newGroup;
+    state.apiBase = newApiBase;
+    state.campusEnabled = newCampusEnabled;
+    state.subgroupFilter = newSubgroupFilter;
     localStorage.setItem('group', state.group);
     localStorage.setItem('apiBase', state.apiBase);
     localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
+    localStorage.setItem('subgroupFilter', state.subgroupFilter);
     modal.classList.add('hidden');
-    state.selectedDay = null;
-    loadData();
+
+    // Если сменилась только подгруппа — перерисовываем локально,
+    // без лишних запросов к сети/кампусу. Иначе — полная перезагрузка.
+    if (!groupChanged && !apiChanged && !campusChanged) {
+      state.selectedDay = null;
+      renderHomework();
+      if (state.schedule) renderDayTabs();
+    } else {
+      state.selectedDay = null;
+      loadData();
+    }
   };
 }
 
