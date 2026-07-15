@@ -1223,6 +1223,45 @@ function getTodaySubjectPairs() {
   return result;
 }
 
+// Возвращает пару, которая идёт прямо сейчас (по реальному времени), либо null.
+// Окно пары: [время начала, время начала следующей пары); если пар после нет — [начало, начало + 2ч].
+function getCurrentPair() {
+  const sched = getCurrentWeekSchedule();
+  if (!sched) return null;
+  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+  const day = sched.days[todayName];
+  if (!day) return null;
+
+  const pairs = day.pairs
+    .filter(p => p.subject && p.time)
+    .map(p => {
+      const [h, m] = p.time.split(':').map(Number);
+      return { pair: p, startMin: h * 60 + m };
+    })
+    .sort((a, b) => a.startMin - b.startMin);
+
+  if (pairs.length === 0) return null;
+
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  for (let i = 0; i < pairs.length; i++) {
+    const cur = pairs[i];
+
+    // Текущее время раньше начала этой (и всех следующих) пар — дальше не смотрим
+    if (nowMin < cur.startMin) return null;
+
+    // Окончание окна: начало следующей пары, либо +2ч, если пар после нет
+    const endMin = (i + 1 < pairs.length)
+      ? pairs[i + 1].startMin
+      : cur.startMin + 120;
+
+    // Попали в окно — возвращаем сразу, последующие пары не считаются
+    if (nowMin < endMin) return cur.pair;
+  }
+  return null; // позже последней пары + 2ч
+}
+
 function getAllSubjects() {
   const sched = getCurrentWeekSchedule();
   if (!sched) return { today: [], all: [] };
@@ -1476,7 +1515,16 @@ function setupHomeworkModal() {
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
 
-  document.getElementById('addHomeworkBtn').onclick = () => { editingHwId = null; openHwModal(); };
+  document.getElementById('addHomeworkBtn').onclick = () => {
+    editingHwId = null;
+    const cur = getCurrentPair();
+    if (cur) {
+      const sub = cur.subgroup ? cur.subgroup.replace(/\D/g, '') : '';
+      openHwModal(cur.subject, cur.type || '', sub);
+    } else {
+      openHwModal();
+    }
+  };
 
   document.getElementById('closeHomework').onclick = () => { editingHwId = null; modal.classList.add('hidden'); };
   modal.onclick = (e) => { if (e.target === modal) { editingHwId = null; modal.classList.add('hidden'); } };
