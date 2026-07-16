@@ -3,6 +3,7 @@
 const DEFAULT_API = 'https://schedule-worker.campus-schedule-syktyvkar.workers.dev';
 const DEFAULT_GROUP = '131-ИБо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
+const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
@@ -592,6 +593,107 @@ async function fetchScheduleFromCampus(group, weekCode) {
   return data;
 }
 
+// ── Определение занятости аудитории ───────────────────────────
+//
+// Логика: для сегодняшнего/завтрашнего дня запрашиваем расписание
+// конкретной аудитории с campus.syktsu.ru. Смотрим на пару,
+// стоящую непосредственно перед текущей (по времени) в тот же день.
+//  - предыдущая пара есть  → «возможно открыта» + показ текста пары
+//  - предыдущая пара пуста → «закрыта»
+//  - нет данных вовсе       → ничего не показываем
+
+// Кеш результатов на время жизни страницы: room -> Promise<parsed>|parsed
+const classroomCache = {};
+
+// Парсит HTML расписания аудитории, сохраняя сырой текст пары так,
+// как он написан на сайте. Возвращает { days: { [date]: [{num,time,raw}] } }.
+function parseClassroomHTML(html) {
+  const result = { days: {} };
+
+  const tableMatch = html.match(/<table\s[^>]*class="schedule"[^>]*>([\s\S]*?)<\/table>/);
+  if (!tableMatch) return result;
+  const rawTable = tableMatch[1];
+
+  const dayHeaderRegex = /class="dayofweek[^"]*"[^>]*>([^<]*)<br>\((\d{2}\.\d{2}\.\d{4})\)/g;
+  const dayHeaders = [];
+  let dm;
+  while ((dm = dayHeaderRegex.exec(rawTable)) !== null) {
+    dayHeaders.push({ date: dm[2], start: dm.index, end: dm.index + dm[0].length });
+  }
+
+  for (let i = 0; i < dayHeaders.length; i++) {
+    const dayDate = dayHeaders[i].date;
+    const contentStart = dayHeaders[i].end;
+    const contentEnd = (i + 1 < dayHeaders.length) ? dayHeaders[i + 1].start : rawTable.length;
+    const dayContent = rawTable.slice(contentStart, contentEnd);
+
+    const slots = [];
+    const pairRegex = /<td>(\d)<\/td><td>(\d{2}:\d{2})<\/td>([\s\S]*?)(?=<td>\d<\/td>|<\/tr>)/g;
+    let pm;
+    while ((pm = pairRegex.exec(dayContent)) !== null) {
+      const num = parseInt(pm[1]);
+      const time = pm[2];
+      const cellMatch = pm[3].match(/<td[^>]*>([\s\S]*?)<\/td>/);
+      const raw = cellMatch ? cleanHtml(cellMatch[1]).replace(/\n/g, ', ').replace(/,\s*,/g, ',').trim() : '';
+      slots.push({ num, time, raw });
+    }
+    result.days[dayDate] = slots;
+  }
+  return result;
+}
+
+async function fetchClassroomFromCampus(room) {
+  if (classroomCache[room] !== undefined) return classroomCache[room];
+
+  const promise = (async () => {
+    const formData = new URLSearchParams();
+    formData.set('num_aud', room);
+    formData.set('searchdata', 'ИСКАТЬ');
+    const resp = await fetch(CAMPUS_CLASSROOM_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: formData.toString(),
+    });
+    if (!resp.ok) throw new Error('Campus classroom: ' + resp.status);
+    const html = await resp.text();
+    return parseClassroomHTML(html);
+  })();
+
+  classroomCache[room] = promise;
+  try {
+    const data = await promise;
+    classroomCache[room] = data;
+    return data;
+  } catch (e) {
+    delete classroomCache[room];
+    throw e;
+  }
+}
+
+// Возвращает статус аудитории для конкретной пары указанного дня:
+//  { status: 'open', prev: 'текст пары' } — предыдущая пара есть
+//  { status: 'closed' }                   — предыдущая пара пуста
+//  null                                   — нет данных
+async function getRoomStatus(room, dayDate, pairTime) {
+  let data;
+  try {
+    data = await fetchClassroomFromCampus(room);
+  } catch (e) {
+    return null;
+  }
+  const slots = data && data.days ? data.days[dayDate] : null;
+  if (!slots || !slots.length) return null;
+
+  const idx = slots.findIndex(s => s.time === pairTime);
+  if (idx <= 0) return null; // текущая не найдена или это первая пара дня
+
+  const prev = slots[idx - 1];
+  if (prev && prev.raw) {
+    return { status: 'open', prev: prev.raw };
+  }
+  return { status: 'closed' };
+}
+
 // ── HTML Parser ───────────────────────────────────────────────
 
 function cleanHtml(text) {
@@ -599,6 +701,7 @@ function cleanHtml(text) {
     .replace(/<br\s*\/?>/g, '\n')
     .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/g, ' ')
+    .replace(/[\t ]+/g, ' ')
     .replace(/\n\s*\n/g, '\n')
     .trim();
 }
@@ -1163,7 +1266,7 @@ function renderDaySchedule(day) {
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
           ${p.teacher ? `<div class="pair-teacher">${escHtml(p.teacher)}</div>` : ''}
-          ${p.room ? `<div class="pair-room">${escHtml(p.room)}</div>` : ''}
+          ${p.room ? `<div class="pair-room" data-room="${escHtml(p.room)}" data-time="${escHtml(p.time)}">${escHtml(p.room)}<span class="room-status"></span></div>` : ''}
           ${hwHtml}
         </div>`;
     }
@@ -1186,6 +1289,54 @@ function renderDaySchedule(day) {
       openHwModal(btn.dataset.subj, btn.dataset.type, btn.dataset.subgroup);
     };
   });
+
+  loadRoomStatuses(day, dayData);
+}
+
+// Загружает статусы аудиторий (открыта/закрыта) для сегодняшнего и
+// завтрашнего календарного дня. Работает только при включённой
+// синхронизации с кампусом. Данные нигде не сохраняются.
+function loadRoomStatuses(day, dayData) {
+  if (!state.campusEnabled) return;
+  if (!dayData || !dayData.date) return;
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+  const dayDate = parseDate(dayData.date); dayDate.setHours(0, 0, 0, 0);
+
+  const isToday = dayDate.getTime() === today.getTime();
+  const isTomorrow = dayDate.getTime() === tomorrow.getTime();
+  if (!isToday && !isTomorrow) return;
+
+  const content = document.getElementById('scheduleContent');
+  const els = Array.from(content.querySelectorAll('.pair-room[data-room]'));
+
+  els.forEach(el => {
+    const room = el.dataset.room;
+    const time = el.dataset.time;
+    const badge = el.querySelector('.room-status');
+    if (!room || !badge) return;
+
+    getRoomStatus(room, dayData.date, time).then(res => {
+      if (!res) return; // нет данных — ничего не пишем
+      if (res.status === 'open') {
+        badge.className = 'room-status open';
+        badge.textContent = 'возможно открыта';
+        badge.title = 'Показать предыдущую пару в аудитории';
+        badge.onclick = (e) => {
+          e.stopPropagation();
+          showRoomPrevPair(room, res.prev);
+        };
+      } else if (res.status === 'closed') {
+        badge.className = 'room-status closed';
+        badge.textContent = 'закрыта';
+      }
+    }).catch(() => {});
+  });
+}
+
+function showRoomPrevPair(room, prevText) {
+  alert('Аудитория ' + room + '\n\nПредыдущая пара:\n' + prevText);
 }
 
 // ── Sync UI ───────────────────────────────────────────────────

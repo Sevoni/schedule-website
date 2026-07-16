@@ -309,6 +309,26 @@ header {
   content: '🚪 ';
 }
 
+.room-status {
+  margin-left: 8px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.room-status:empty {
+  display: none;
+}
+
+.room-status.open {
+  color: var(--green, #4caf50);
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.room-status.closed {
+  color: var(--text-dim);
+}
+
 /* Inline HW in pair cards */
 .pair-hw {
   margin-top: 8px;
