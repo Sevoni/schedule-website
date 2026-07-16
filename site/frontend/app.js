@@ -16,6 +16,8 @@ let state = {
   campusEnabled: localStorage.getItem('campusEnabled') !== '0',
   // subgroupFilter: 'any' — показывать обе подгруппы; '1'/'2' — только свою.
   subgroupFilter: localStorage.getItem('subgroupFilter') || 'any',
+  lastSyncAt: localStorage.getItem('lastSyncAt') || '',
+  campusUpdatedAt: localStorage.getItem('campusUpdatedAt') || '',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -344,6 +346,16 @@ function applyScheduleHeader() {
   }
 }
 
+// ── Sync Meta (для блока в настройках) ────────────────────────
+
+function saveSyncMeta(campusUpdatedAt) {
+  const now = new Date();
+  state.lastSyncAt = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+  if (campusUpdatedAt) state.campusUpdatedAt = campusUpdatedAt;
+  localStorage.setItem('lastSyncAt', state.lastSyncAt);
+  localStorage.setItem('campusUpdatedAt', state.campusUpdatedAt);
+}
+
 // ── Sync (кнопка обновления) ──────────────────────────────────
 //
 // Новый поток (логика перенесена на бэкенд-проверку):
@@ -419,6 +431,7 @@ async function syncAll(anchorIdxOverride = null) {
         applyScheduleHeader();
         renderDayTabs();
       }
+      saveSyncMeta(campusUpdatedAt);
       updateSyncUI('ok');
       return;
     }
@@ -479,6 +492,7 @@ async function syncAll(anchorIdxOverride = null) {
     // Финальная авторитетная версия ДЗ и предметов из БД
     await loadHomework();
     loadSubjects();
+    saveSyncMeta(campusUpdatedAt);
   } catch (e) {
     updateSyncUI('error', e.message);
     if (!state.schedule) {
@@ -2179,6 +2193,8 @@ function setupSettingsModal() {
     document.getElementById('apiUrlInput').value = state.apiBase;
     document.getElementById('campusToggle').checked = state.campusEnabled;
     document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
+    document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
+    document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
     modal.classList.remove('hidden');
   };
 
@@ -2241,4 +2257,12 @@ function escHtml(str) {
   const d = document.createElement('div');
   d.textContent = str || '';
   return d.innerHTML;
+}
+
+function formatDateTime(iso) {
+  if (!iso) return '—';
+  const m = iso.match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return iso;
+  const [_, y, mo, d, h, mi, s] = m;
+  return `${d}.${mo}.${y} ${h}:${mi}:${s}`;
 }

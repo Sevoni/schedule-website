@@ -677,6 +677,20 @@ header {
   border-color: var(--accent);
 }
 
+.sync-info {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  background: var(--bg);
+  padding: 12px;
+  border-radius: 8px;
+  line-height: 1.6;
+  margin-bottom: 4px;
+}
+
+.sync-info span {
+  color: var(--text);
+}
+
 .settings-note {
   font-size: 0.8rem;
   color: var(--text-dim);
