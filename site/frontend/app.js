@@ -1761,8 +1761,7 @@ function setupHomeworkModal() {
     }
   };
 
-  document.getElementById('closeHomework').onclick = () => { editingHwId = null; modal.classList.add('hidden'); };
-  modal.onclick = (e) => { if (e.target === modal) { editingHwId = null; modal.classList.add('hidden'); } };
+  // Кнопка закрытия и клик по фону переопределены ниже (со сбросом состояния удаления).
 
   // Предмет → управление custom / pairType / subgroup / dueMode
   sel.onchange = () => {
@@ -1830,6 +1829,20 @@ function setupHomeworkModal() {
   };
 
   // Save
+  const deleteBtn = document.getElementById('deleteHomework');
+  const deleteConfirm = document.getElementById('deleteConfirm');
+  let deleteTimer = null;
+
+  function resetDeleteState() {
+    if (deleteTimer) {
+      clearInterval(deleteTimer);
+      deleteTimer = null;
+    }
+    deleteConfirm.classList.add('hidden');
+    deleteBtn.textContent = 'Удалить';
+    deleteBtn.disabled = false;
+  }
+
   document.getElementById('saveHomework').onclick = async () => {
     const isCustom = sel.value === '__custom__';
     const subject = isCustom
@@ -1900,13 +1913,81 @@ function setupHomeworkModal() {
       editingHwId = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
+      resetDeleteState();
       modal.classList.add('hidden');
     } catch (e) {
       console.warn('HW save failed:', e.message);
       showToast('Не удалось сохранить ДЗ: ' + (e.message || 'ошибка сети'), 'error');
       saveBtn.disabled = false;
       saveBtn.textContent = originalLabel;
+    } finally {
+      saveBtn.disabled = false;
+      if (saveBtn.querySelector('.spinner')) {
+        saveBtn.textContent = editingHwId ? 'Сохранить' : 'Добавить';
+      }
     }
+  };
+
+  // Delete (только в режиме редактирования)
+  deleteBtn.onclick = () => {
+    if (deleteBtn.textContent === 'Удалить') {
+      deleteConfirm.classList.remove('hidden');
+      deleteBtn.disabled = true;
+      let remaining = 5;
+      deleteBtn.textContent = 'Подтвердить удаление (' + remaining + ')';
+      deleteTimer = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          clearInterval(deleteTimer);
+          deleteTimer = null;
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = 'Подтвердить удаление';
+        } else {
+          deleteBtn.textContent = 'Подтвердить удаление (' + remaining + ')';
+        }
+      }, 1000);
+    } else if (deleteBtn.textContent === 'Подтвердить удаление') {
+      doDelete();
+    } else {
+      resetDeleteState();
+    }
+  };
+
+  async function doDelete() {
+    if (!editingHwId) return;
+    const id = editingHwId;
+    deleteBtn.disabled = true;
+    const originalLabel = deleteBtn.textContent;
+    deleteBtn.innerHTML = '<span class="spinner"></span>Удаление…';
+    try {
+      await apiDelete('/api/hw', { id, group: state.group });
+      state.homework = state.homework.filter(h => h.id !== id);
+      editingHwId = null;
+      renderHomework();
+      if (state.schedule) renderDayTabs();
+      modal.classList.add('hidden');
+    } catch (e) {
+      console.warn('HW delete failed:', e.message);
+      showToast('Не удалось удалить ДЗ: ' + (e.message || 'ошибка сети'), 'error');
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = originalLabel;
+    }
+  }
+
+  // Сбрасываем состояние удаления при любом закрытии модалки
+  document.getElementById('closeHomework').onclick = () => {
+    editingHwId = null;
+    resetDeleteState();
+    modal.classList.add('hidden');
+  };
+  const prevModalClick = modal.onclick;
+  modal.onclick = (e) => {
+    if (e.target === modal) {
+      editingHwId = null;
+      resetDeleteState();
+      modal.classList.add('hidden');
+    }
+    if (prevModalClick) prevModalClick(e);
   };
 }
 
@@ -1972,7 +2053,19 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
 
   editingHwId = existingHw ? existingHw.id : null;
   titleEl.textContent = existingHw ? 'Редактировать задание' : 'Новое задание';
-  document.getElementById('saveHomework').textContent = existingHw ? 'Сохранить' : 'Добавить';
+  const saveBtn = document.getElementById('saveHomework');
+  saveBtn.disabled = false;
+  saveBtn.textContent = existingHw ? 'Сохранить' : 'Добавить';
+  const deleteBtn = document.getElementById('deleteHomework');
+  const deleteConfirm = document.getElementById('deleteConfirm');
+  if (existingHw) {
+    deleteBtn.classList.remove('hidden');
+  } else {
+    deleteBtn.classList.add('hidden');
+    deleteConfirm.classList.add('hidden');
+    deleteBtn.textContent = 'Удалить';
+    deleteBtn.disabled = false;
+  }
 
   // Build subject list from loadedSubjects + today + current schedule
   sel.innerHTML = '';
@@ -2317,7 +2410,6 @@ function renderHomework() {
          </div>
         <div class="hw-actions">
           <button class="hw-edit" data-id="${hw.id}" title="Редактировать">✎</button>
-          <button class="hw-delete" data-id="${hw.id}" title="Удалить">✕</button>
         </div>
       </div>`;
   }).join('');
@@ -2328,19 +2420,6 @@ function renderHomework() {
     btn.onclick = () => {
       const hw = state.homework.find(h => h.id === btn.dataset.id);
       if (hw) openHwModal(null, null, null, hw);
-    };
-  });
-
-  list.querySelectorAll('.hw-delete').forEach(btn => {
-    btn.onclick = async () => {
-      try {
-        await apiDelete('/api/hw', { id: btn.dataset.id, group: state.group });
-        state.homework = state.homework.filter(h => h.id !== btn.dataset.id);
-        renderHomework();
-        if (state.schedule) renderDayTabs();
-      } catch (e) {
-        console.warn('HW delete failed:', e.message);
-      }
     };
   });
 }

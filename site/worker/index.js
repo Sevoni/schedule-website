@@ -1457,9 +1457,10 @@ function formatHwMessage(action, group, hw, prevHw) {
     const changed = [];
     if (prevHw) {
       if ((prevHw.subject || '') !== (hw.subject || '')) changed.push(`предмет: ${escTg(prevHw.subject)} → ${subject}`);
-      if ((prevHw.task || '') !== (hw.task || '')) changed.push(`задание изменено`);
       if ((prevHw.dueDate || '') !== (hw.dueDate || '')) changed.push(`срок: ${escTg(prevHw.dueDate || 'след. пара')} → ${due}`);
       if ((prevHw.pairType || 'any') !== (hw.pairType || 'any')) changed.push(`тип: ${escTg(pairTypeLabel(prevHw.pairType))} → ${escTg(pairTypeLabel(hw.pairType))}`);
+      // Изменение только текста задания не выносим отдельной строкой —
+      // сам новый текст уже выводится ниже целиком.
     }
     const changeLine = changed.length ? `\n\nИзменения: ${changed.join('; ')}` : '';
     return [
@@ -1472,5 +1473,10 @@ function formatHwMessage(action, group, hw, prevHw) {
     ].join('\n');
   }
   // delete
-  return `🗑 <b>ДЗ удалено</b> · ${escTg(group)}\n<b>${subject}${tp}${sub}</b>`;
+  const delTask = escTg(hw.task || '');
+  return [
+    `🗑 <b>ДЗ удалено</b> · ${escTg(group)}`,
+    `<b>${subject}${tp}${sub}</b>`,
+    delTask,
+  ].filter(Boolean).join('\n');
 }

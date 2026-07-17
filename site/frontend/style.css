@@ -13,6 +13,7 @@
   --text-dim: #8b8fa3;
   --accent: #6c8cff;
   --accent-dim: #4a65cc;
+  --danger: #e5484d;
   --green: #4ade80;
   --red: #f87171;
   --orange: #fbbf24;
@@ -740,6 +741,39 @@ header {
   opacity: 0.85;
 }
 
+.delete-btn {
+  padding: 10px;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 600;
+  transition: background 0.2s, color 0.2s;
+  margin-top: 8px;
+}
+
+.delete-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.delete-confirm {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: rgba(229, 72, 77, 0.08);
+}
+
+.delete-warning {
+  margin: 0 0 10px;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.4;
+}
+
 /* ── Homework modal additions ───────────────────────────────── */
 
 .hw-due-mode {
@@ -947,6 +981,14 @@ header {
   cursor: default;
 }
 .save-btn .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: hw-spin 0.7s linear infinite;
+}
+.delete-btn .spinner {
   width: 14px;
   height: 14px;
   border: 2px solid rgba(255,255,255,0.35);
