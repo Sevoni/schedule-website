@@ -2338,6 +2338,7 @@ function renderHomework() {
 
 function setupSettingsModal() {
   const modal = document.getElementById('settingsModal');
+  let syncMetaLoaded = false;
 
   document.getElementById('settingsBtn').onclick = () => {
     document.getElementById('groupInput').value = state.group;
@@ -2347,6 +2348,22 @@ function setupSettingsModal() {
     document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
     document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
     modal.classList.remove('hidden');
+
+    if (!syncMetaLoaded) {
+      syncMetaLoaded = true;
+      apiFetch('/api/status', { group: state.group }).then(res => {
+        if (res.lastSync) {
+          state.lastSyncAt = res.lastSync;
+          localStorage.setItem('lastSyncAt', state.lastSyncAt);
+          document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
+        }
+        if (res.campusUpdatedAt) {
+          state.campusUpdatedAt = res.campusUpdatedAt;
+          localStorage.setItem('campusUpdatedAt', state.campusUpdatedAt);
+          document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
+        }
+      }).catch(() => {});
+    }
   };
 
   document.getElementById('closeSettings').onclick = () => modal.classList.add('hidden');
@@ -2415,5 +2432,11 @@ function formatDateTime(iso) {
   const m = iso.match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
   if (!m) return iso;
   const [_, y, mo, d, h, mi, s] = m;
+  // lastSync хранится в UTC (с Z), campusUpdatedAt — локальное время кампуса (без Z).
+  // Конвертируем в локальное время браузера, если строка заканчивается на Z или содержит T...Z
+  if (iso.endsWith('Z') || /T\d{2}:\d{2}:\d{2}\.\d+Z$/.test(iso)) {
+    const dt = new Date(iso);
+    return `${String(dt.getDate()).padStart(2,'0')}.${String(dt.getMonth()+1).padStart(2,'0')}.${dt.getFullYear()} ${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}:${String(dt.getSeconds()).padStart(2,'0')}`;
+  }
   return `${d}.${mo}.${y} ${h}:${mi}:${s}`;
 }

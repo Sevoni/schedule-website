@@ -17,7 +17,7 @@ export default {
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
-        return await handleStatus(env, corsHeaders);
+        return await handleStatus(request, env, corsHeaders);
       }
       if (path === '/api/schedule' && method === 'GET') {
         return await handleGetSchedule(request, env, corsHeaders);
@@ -339,6 +339,15 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
 
   const stored = await env.SCHEDULE.get(`campus-updated:${group}`);
   const needUpdate = !stored || stored !== (campusUpdatedAt || '');
+
+  // Обновляем lastSync при каждом вызове 🔄, даже если изменений нет
+  const meta = await env.SCHEDULE.get('sync:meta', { type: 'json' });
+  await env.SCHEDULE.put('sync:meta', JSON.stringify({
+    lastSync: new Date().toISOString(),
+    lastGroup: group,
+    lastWeek: meta?.lastWeek || 'check',
+    campusUpdatedAt: meta?.campusUpdatedAt || null,
+  }), { expirationTtl: 604800 });
 
   return jsonResponse({ needUpdate, stored: stored || null }, corsHeaders);
 }
@@ -906,17 +915,27 @@ async function computeNextPairDate(env, group, subject, pairType, fromDate = new
 // "Математика (л)" -> { base: "Математика", type: "л" }
 
 
-async function handleStatus(env, corsHeaders) {
+async function handleStatus(request, env, corsHeaders) {
   if (!env.SCHEDULE) {
     return jsonResponse({ kv: false }, corsHeaders);
   }
 
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group');
+
   const meta = await env.SCHEDULE.get('sync:meta', { type: 'json' });
+
+  let campusUpdatedAt = meta?.campusUpdatedAt || null;
+  if (group && !campusUpdatedAt) {
+    campusUpdatedAt = await env.SCHEDULE.get(`campus-updated:${group}`);
+  }
+
   return jsonResponse({
     kv: true,
     lastSync: meta?.lastSync || null,
     lastGroup: meta?.lastGroup || null,
     lastWeek: meta?.lastWeek || null,
+    campusUpdatedAt: campusUpdatedAt || null,
   }, corsHeaders);
 }
 
