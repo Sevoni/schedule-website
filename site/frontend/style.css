@@ -863,3 +863,123 @@ header {
   .container { padding: 10px; }
   .day-tab { padding: 6px 10px; font-size: 0.8rem; }
 }
+
+/* ── Telegram settings section ─────────────────────────────── */
+.settings-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 18px 0;
+}
+
+.tg-section h3 {
+  font-size: 1rem;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+
+.tg-status {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+.tg-status.tg-ok { color: var(--green); }
+.tg-status.tg-warn { color: var(--orange); }
+
+.tg-instructions {
+  margin: 0 0 12px 18px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.tg-instructions code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--text);
+}
+.tg-instructions a {
+  color: var(--accent);
+}
+
+.tg-msg {
+  font-size: 0.82rem;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.tg-msg.tg-ok { color: var(--green); border-color: var(--green); }
+.tg-msg.tg-warn { color: var(--orange); border-color: var(--orange); }
+
+.tg-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.btn-secondary {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-secondary:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.btn-secondary:disabled { opacity: 0.5; cursor: default; }
+
+/* ── Save button spinner ────────────────────────────────── */
+.save-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.save-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+.save-btn .spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: hw-spin 0.7s linear infinite;
+}
+@keyframes hw-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Toast notification ─────────────────────────────────── */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%) translateY(20px);
+  max-width: 90vw;
+  padding: 12px 18px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--orange);
+  color: var(--text);
+  font-size: 0.92rem;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+  opacity: 0;
+  transition: opacity 0.25s, transform 0.25s;
+  z-index: 1000;
+  pointer-events: none;
+}
+.toast.toast-show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.toast.toast-error { border-color: var(--orange); }
+.toast.toast-ok { border-color: var(--green); }

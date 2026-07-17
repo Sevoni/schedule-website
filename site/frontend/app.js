@@ -19,6 +19,8 @@ let state = {
   subgroupFilter: localStorage.getItem('subgroupFilter') || 'any',
   lastSyncAt: localStorage.getItem('lastSyncAt') || '',
   campusUpdatedAt: localStorage.getItem('campusUpdatedAt') || '',
+  tgChatId: localStorage.getItem('tgChatId') || '',
+  tgBotUsername: localStorage.getItem('tgBotUsername') || '',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -50,6 +52,7 @@ function getCurrentWeekSchedule() {
 document.addEventListener('DOMContentLoaded', () => {
   setupSettingsModal();
   setupHomeworkModal();
+  setupTgSection();
 
   document.getElementById('syncBtn').onclick = () => syncAll();
   loadData();
@@ -1860,6 +1863,11 @@ function setupHomeworkModal() {
 
     if (author) localStorage.setItem('hwAuthor', author);
 
+    const saveBtn = document.getElementById('saveHomework');
+    const originalLabel = saveBtn.textContent;
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="spinner"></span>Сохранение…';
+
     try {
       let result;
       if (editingHwId) {
@@ -1895,6 +1903,9 @@ function setupHomeworkModal() {
       modal.classList.add('hidden');
     } catch (e) {
       console.warn('HW save failed:', e.message);
+      showToast('Не удалось сохранить ДЗ: ' + (e.message || 'ошибка сети'), 'error');
+      saveBtn.disabled = false;
+      saveBtn.textContent = originalLabel;
     }
   };
 }
@@ -2336,6 +2347,84 @@ function renderHomework() {
 
 // ── Settings Modal ────────────────────────────────────────────
 
+// ── Telegram notifications UI ──────────────────────────────────
+
+function setupTgSection() {
+  const statusEl = document.getElementById('tgStatus');
+  const linkEl = document.getElementById('tgBotLink');
+  const chatInput = document.getElementById('tgChatIdInput');
+  const msgEl = document.getElementById('tgMsg');
+  const subBtn = document.getElementById('tgSubscribe');
+  const unsubBtn = document.getElementById('tgUnsubscribe');
+
+  // Загружаем актуальный username бота + статус привязки.
+  apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
+    state.tgBotUsername = res.botUsername || state.tgBotUsername || '';
+    if (state.tgBotUsername) {
+      localStorage.setItem('tgBotUsername', state.tgBotUsername);
+      linkEl.href = 'https://t.me/' + state.tgBotUsername;
+      linkEl.textContent = '@' + state.tgBotUsername;
+    } else {
+      linkEl.textContent = '(бот не настроен)';
+    }
+    if (res.subscribed) {
+      state.tgChatId = res.chatId || state.tgChatId;
+      localStorage.setItem('tgChatId', state.tgChatId);
+      chatInput.value = state.tgChatId;
+      statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
+      statusEl.className = 'tg-status tg-ok';
+    } else {
+      statusEl.textContent = 'ℹ️ Уведомления не настроены';
+      statusEl.className = 'tg-status';
+    }
+  }).catch(() => {
+    statusEl.textContent = '⚠️ Не удалось проверить статус бота';
+    statusEl.className = 'tg-status tg-warn';
+  });
+
+  function showMsg(text, kind) {
+    msgEl.textContent = text;
+    msgEl.className = 'tg-msg' + (kind ? ' tg-' + kind : '');
+  }
+
+  subBtn.onclick = async () => {
+    const chatId = chatInput.value.trim();
+    if (!chatId) { showMsg('Введите chat_id из сообщения бота', 'warn'); return; }
+    subBtn.disabled = true;
+    showMsg('Проверяем…', '');
+    try {
+      await apiPost('/api/tg/subscribe', { group: state.group, chatId });
+      state.tgChatId = chatId;
+      localStorage.setItem('tgChatId', chatId);
+      statusEl.textContent = '✅ Уведомления включены (chat_id: ' + chatId + ')';
+      statusEl.className = 'tg-status tg-ok';
+      showMsg('Готово! Теперь уведомления будут приходить в Telegram.', 'ok');
+    } catch (e) {
+      showMsg('Ошибка: ' + (e.message || 'не удалось привязать'), 'warn');
+    } finally {
+      subBtn.disabled = false;
+    }
+  };
+
+  unsubBtn.onclick = async () => {
+    if (!state.tgChatId) { showMsg('Привязка отсутствует', 'warn'); return; }
+    unsubBtn.disabled = true;
+    try {
+      await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
+      state.tgChatId = '';
+      localStorage.removeItem('tgChatId');
+      chatInput.value = '';
+      statusEl.textContent = 'ℹ️ Уведомления не настроены';
+      statusEl.className = 'tg-status';
+      showMsg('Отвязано. Уведомления приходить не будут.', 'ok');
+    } catch (e) {
+      showMsg('Ошибка: ' + (e.message || 'не удалось отвязать'), 'warn');
+    } finally {
+      unsubBtn.disabled = false;
+    }
+  };
+}
+
 function setupSettingsModal() {
   const modal = document.getElementById('settingsModal');
   let syncMetaLoaded = false;
@@ -2347,7 +2436,30 @@ function setupSettingsModal() {
     document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
     document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
     document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
+    document.getElementById('tgChatIdInput').value = state.tgChatId || '';
     modal.classList.remove('hidden');
+
+    // Обновляем статус привязки под текущую группу.
+    const statusEl = document.getElementById('tgStatus');
+    const linkEl = document.getElementById('tgBotLink');
+    apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
+      state.tgBotUsername = res.botUsername || state.tgBotUsername || '';
+      if (state.tgBotUsername) {
+        localStorage.setItem('tgBotUsername', state.tgBotUsername);
+        linkEl.href = 'https://t.me/' + state.tgBotUsername;
+        linkEl.textContent = '@' + state.tgBotUsername;
+      }
+      if (res.subscribed) {
+        state.tgChatId = res.chatId || state.tgChatId;
+        localStorage.setItem('tgChatId', state.tgChatId);
+        document.getElementById('tgChatIdInput').value = state.tgChatId;
+        statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
+        statusEl.className = 'tg-status tg-ok';
+      } else {
+        statusEl.textContent = 'ℹ️ Уведомления не настроены';
+        statusEl.className = 'tg-status';
+      }
+    }).catch(() => {});
 
     if (!syncMetaLoaded) {
       syncMetaLoaded = true;
@@ -2399,6 +2511,20 @@ function setupSettingsModal() {
       state.selectedDay = null;
       loadData();
     }
+
+    // Привязка Telegram относится к конкретной группе — при смене группы
+    // обновляем сохранённый chat_id и статус (он может отличаться).
+    if (groupChanged) {
+      apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
+        if (res.subscribed) {
+          state.tgChatId = res.chatId || '';
+          localStorage.setItem('tgChatId', state.tgChatId);
+        } else {
+          state.tgChatId = '';
+          localStorage.removeItem('tgChatId');
+        }
+      }).catch(() => {});
+    }
   };
 }
 
@@ -2414,6 +2540,19 @@ function showError(msg, retryFn) {
   if (retryFn) {
     document.getElementById('retryBtn').onclick = retryFn;
   }
+}
+
+let toastTimer = null;
+function showToast(msg, kind) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'toast' + (kind ? ' toast-' + kind : '');
+  // force reflow so transition runs on repeated calls
+  void el.offsetWidth;
+  el.classList.add('toast-show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('toast-show'), 4000);
 }
 
 function parseDate(str) {

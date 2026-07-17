@@ -66,6 +66,23 @@ export default {
         return await handleGroupRegister(request, env, corsHeaders);
       }
 
+      // ── Telegram bot endpoints ──────────────────────────
+      if (path === '/api/tg/webhook' && method === 'POST') {
+        return await handleTgWebhook(request, env);
+      }
+      if (path === '/api/tg/set-webhook' && method === 'POST') {
+        return await handleTgSetWebhook(request, env, corsHeaders);
+      }
+      if (path === '/api/tg/subscribe' && method === 'POST') {
+        return await handleTgSubscribe(request, env, corsHeaders);
+      }
+      if (path === '/api/tg/unsubscribe' && method === 'POST') {
+        return await handleTgUnsubscribe(request, env, corsHeaders);
+      }
+      if (path === '/api/tg/status' && method === 'GET') {
+        return await handleTgStatus(request, env, corsHeaders);
+      }
+
       return jsonResponse({ error: 'Not Found' }, corsHeaders, 404);
     } catch (e) {
       return jsonResponse({ error: e.message }, corsHeaders, 500);
@@ -373,6 +390,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   }
 
   const updated = [];
+  const diffs = []; // накопленные diff расписания для уведомления
 
   for (const { weekCode, data } of schedules) {
     if (!weekCode || !data) continue;
@@ -382,6 +400,20 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     const newStr = JSON.stringify(stripComparable(data));
 
     if (existingStr !== newStr) {
+      const isNewWeek = !existing;
+
+      // Diff и уведомление собираем ТОЛЬКО для уже существовавших недель.
+      // Появление новой недели в расписании (её раньше не было в KV) не
+      // считаем «изменением» и не шлём про неё уведомление.
+      if (!isNewWeek) {
+        try {
+          const d = diffScheduleWeek(stripComparable(existing), stripComparable(data));
+          if (d) diffs.push(d);
+        } catch (e) {
+          console.log('diffScheduleWeek skipped:', e.message);
+        }
+      }
+
       await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
       updated.push(weekCode);
 
@@ -430,6 +462,16 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     lastWeek: 'batch',
     campusUpdatedAt: campusUpdatedAt || null,
   }), { expirationTtl: 604800 });
+
+  // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
+  if (diffs.length > 0) {
+    try {
+      const text = formatScheduleDiffBroadcast(group, diffs);
+      await notifyGroup(env, group, text);
+    } catch (e) {
+      console.log('schedule notify skipped:', e.message);
+    }
+  }
 
   return jsonResponse({
     ok: true,
@@ -498,6 +540,8 @@ async function handleAddHw(request, env, corsHeaders) {
   existing.push(item);
   await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
+  await notifyGroup(env, group, formatHwMessage('add', group, item, null));
+
   return jsonResponse({ ok: true, item }, corsHeaders);
 }
 
@@ -544,6 +588,8 @@ async function handleUpdateHw(request, env, corsHeaders) {
   existing[idx] = item;
   await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
+  await notifyGroup(env, group, formatHwMessage('update', group, item, prev));
+
   return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
 }
 
@@ -564,9 +610,14 @@ async function handleDeleteHw(request, env, corsHeaders) {
 
   const key = `hw:${group}`;
   const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const removed = existing.find(h => h.id === id);
   const filtered = existing.filter(h => h.id !== id);
 
   await env.SCHEDULE.put(key, JSON.stringify(filtered), { expirationTtl: 2592000 });
+
+  if (removed) {
+    await notifyGroup(env, group, formatHwMessage('delete', group, removed, null));
+  }
 
   return jsonResponse({ ok: true, count: filtered.length }, corsHeaders);
 }
@@ -946,4 +997,480 @@ function jsonResponse(data, corsHeaders, status = 200) {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
+}
+
+// ════════════════════════════════════════════════════════════════
+// ── Telegram notifications ─────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+//
+// KV keys:
+//   tg:chat:{group}            -> chatId (строка) — текущая привязка группы
+//   tg:groups:{chatId}         -> JSON [group,...] — индекс для рассылки по chat
+//   tg:pending:{chatId}        -> timestamp последней выданной команды /start
+//                                (используется только лог-вспомогательно)
+//
+// Лимиты Telegram: text до 4096 символов, messages не чаще ~30/сек.
+// Используем sendMessage с disable_web_page_preview=true.
+
+const TG_API_BASE = 'https://api.telegram.org';
+
+async function tgApi(env, method, payload) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (!token) return { ok: false, skipped: true, reason: 'no-token' };
+  try {
+    const resp = await fetch(`${TG_API_BASE}/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) {
+      console.log('tgApi', method, 'failed:', JSON.stringify(data).slice(0, 200));
+      return { ok: false, error: data };
+    }
+    return { ok: true, result: data.result };
+  } catch (e) {
+    console.log('tgApi', method, 'exception:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Отправка текста всем подписчикам группы (обычно один chat_id).
+// Читает список подписчиков группы (много chat_id на одну группу).
+// Поддерживает миграцию старого ключа tg:chat:{group} (один chat_id) →
+// превращаем в список из одного элемента.
+async function getGroupSubscribers(env, group) {
+  const raw = await env.SCHEDULE.get(`tg:subs:${group}`, { type: 'json' });
+  if (Array.isArray(raw)) return raw;
+
+  // Миграция: старый одиночный ключ.
+  const old = await env.SCHEDULE.get(`tg:chat:${group}`);
+  if (old) {
+    const list = [old];
+    await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(list));
+    await env.SCHEDULE.delete(`tg:chat:${group}`);
+    return list;
+  }
+  return [];
+}
+
+async function addGroupSubscriber(env, group, chatId) {
+  const list = await getGroupSubscribers(env, group);
+  if (!list.includes(chatId)) {
+    list.push(chatId);
+    await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(list));
+  }
+}
+
+async function removeGroupSubscriber(env, group, chatId) {
+  const list = await getGroupSubscribers(env, group);
+  const filtered = list.filter(c => String(c) !== String(chatId));
+  if (filtered.length) await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(filtered));
+  else await env.SCHEDULE.delete(`tg:subs:${group}`);
+}
+
+// Рассылает сообщение всем подписчикам группы (chat_id изолированы друг от друга).
+async function notifyGroup(env, group, text, opts = {}) {
+  if (!env.SCHEDULE || !env.TELEGRAM_BOT_TOKEN) return;
+  const subs = await getGroupSubscribers(env, group);
+  if (!subs.length) return;
+
+  // Длинные сообщения (> 4096) дробим по переводам.
+  const chunks = splitForTg(text, 4000);
+  for (const chatId of subs) {
+    for (const c of chunks) {
+      await tgApi(env, 'sendMessage', {
+        chat_id: chatId,
+        text: c,
+        parse_mode: opts.parseMode || 'HTML',
+        disable_web_page_preview: true,
+      });
+    }
+  }
+}
+
+function splitForTg(text, maxLen) {
+  if (!text) return [];
+  if (text.length <= maxLen) return [text];
+  const out = [];
+  const paragraphs = text.split('\n\n');
+  let buf = '';
+  for (const p of paragraphs) {
+    if (p.length > maxLen) {
+      if (buf) { out.push(buf); buf = ''; }
+      for (let i = 0; i < p.length; i += maxLen) out.push(p.slice(i, i + maxLen));
+      continue;
+    }
+    if ((buf + '\n\n' + p).length > maxLen) { out.push(buf); buf = p; }
+    else { buf = buf ? buf + '\n\n' + p : p; }
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
+// ── POST /api/tg/webhook ────────────────────────────────────────
+// Telegram шлёт обновления бота на этот путь (setWebhook).
+// Поддерживаемые команды:
+//   /start            — приветствие + выдаёт chat_id
+//   /chat_id          — повторно выдаёт chat_id
+//   /stop             — отвязывает chat_id от всех групп
+
+// ── POST /api/tg/set-webhook ──────────────────────────────────
+// Ставит webhook Telegram на этот же Worker, вызывая Telegram API
+// ИЗНУТРИ Cloudflare (там api.telegram.org доступен, в отличие от
+// локальной машины в РФ). Токен берётся из секрета env.TELEGRAM_BOT_TOKEN.
+// Можно защитить переменной окружения TG_WEBHOOK_KEY (передаётся в body.key
+// или заголовке x-webhook-key); если не задана — эндпоинт открыт (webhook
+// URL публичен по природе, вреда от вызова нет — просто переставит на тот же путь).
+
+async function handleTgSetWebhook(request, env, corsHeaders) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    return jsonResponse({ error: 'TELEGRAM_BOT_TOKEN not set' }, corsHeaders, 500);
+  }
+
+  const key = env.TG_WEBHOOK_KEY;
+  if (key) {
+    const body = await request.json().catch(() => ({}));
+    const provided = body.key || request.headers.get('x-webhook-key') || '';
+    if (provided !== key) {
+      return jsonResponse({ error: 'Forbidden' }, corsHeaders, 403);
+    }
+  }
+
+  // Строим URL webhook на основе origin текущего запроса.
+  const origin = new URL(request.url).origin;
+  const webhookUrl = `${origin}/api/tg/webhook`;
+
+  const res = await tgApi(env, 'setWebhook', {
+    url: webhookUrl,
+    drop_pending_updates: true,
+  });
+
+  let info = null;
+  if (res.ok) {
+    const infoResp = await tgApi(env, 'getWebhookInfo', {});
+    info = infoResp.result || null;
+  }
+
+  return jsonResponse({
+    ok: res.ok,
+    setWebhook: res.result || res.error || null,
+    webhookUrl,
+    info,
+  }, corsHeaders);
+}
+
+async function handleTgWebhook(request, env) {
+  if (!env.SCHEDULE) return new Response('ok', { status: 200 });
+  let update;
+  try { update = await request.json(); } catch { return new Response('ok', { status: 200 }); }
+
+  const msg = update.message || update.edited_message;
+  if (!msg || !msg.chat) return new Response('ok', { status: 200 });
+
+  const chatId = String(msg.chat.id);
+  const text = (msg.text || '').trim();
+  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+
+  // В групповых чатах отвечаем ТОЛЬКО на команды, чтобы не засорять чат.
+  const isCommand = /^\/(start|chat_id|stop)(@\w+)?$/i.test(text);
+  if (isGroup && !isCommand) return new Response('ok', { status: 200 });
+
+  try {
+    if (/^\/start(@\w+)?$/i.test(text) || /^\/chat_id(@\w+)?$/i.test(text)) {
+      const scopeNote = isGroup
+        ? 'Это <b>групповой чат</b>. Все участники этого чата получат уведомления, если привязать этот chat_id к группе расписания.'
+        : 'Это личный чат. Уведомления будут приходить только тебе.';
+      const lines = [
+        '👋 Привет! Это бот расписания СыктГУ.',
+        '',
+        scopeNote,
+        '',
+        'Чтобы получать уведомления об изменениях расписания и новых ДЗ:',
+        '',
+        '<b>1.</b> Скопируй этот chat_id:',
+        '',
+        `<code>${chatId}</code>`,
+        '',
+        '<b>2.</b> Открой сайт расписания → ⚙️ Настройки → раздел Telegram, вставь chat_id и нажми «Привязать».',
+        '',
+        'После этого сюда будут приходить уведомления о новых и изменённых ДЗ, а также об изменениях в расписании твоей группы.',
+      ];
+      await tgApi(env, 'sendMessage', {
+        chat_id: chatId,
+        text: lines.join('\n'),
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
+    } else if (/^\/stop(@\w+)?$/i.test(text)) {
+      await unbindChat(env, chatId);
+      await tgApi(env, 'sendMessage', {
+        chat_id: chatId,
+        text: '❌ Этот чат отписан от всех уведомлений. Чтобы снова получать — нажми /start.',
+      });
+    } else if (text && !isGroup) {
+      // В личке подсказываем команды на любой прочий текст.
+      await tgApi(env, 'sendMessage', {
+        chat_id: chatId,
+        text: 'Доступные команды: /start (получить chat_id), /stop (отписаться).',
+      });
+    }
+  } catch (e) {
+    console.log('handleTgWebhook error:', e.message);
+  }
+  return new Response('ok', { status: 200 });
+}
+
+async function unbindChat(env, chatId) {
+  const groupsRaw = await env.SCHEDULE.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+  for (const g of groupsRaw) {
+    // Чистим старый одиночный ключ, если он указывал на этот chat.
+    const cur = await env.SCHEDULE.get(`tg:chat:${g}`);
+    if (String(cur) === String(chatId)) await env.SCHEDULE.delete(`tg:chat:${g}`);
+    // И удаляем chat из списка подписчиков группы.
+    await removeGroupSubscriber(env, g, chatId);
+  }
+  await env.SCHEDULE.delete(`tg:groups:${chatId}`);
+}
+
+// ── POST /api/tg/subscribe ─────────────────────────────────────
+// Body: { group, chatId }  — привязывает chat_id к группе текущего пользователя.
+
+async function handleTgSubscribe(request, env, corsHeaders) {
+  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const body = await request.json().catch(() => ({}));
+  const { group, chatId } = body;
+  if (!group || !chatId) return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
+  const chatIdStr = String(chatId).replace(/[^\d-]/g, '');
+  if (!chatIdStr) return jsonResponse({ error: 'Invalid chatId' }, corsHeaders, 400);
+
+  // Проверим, что chat_id реально существует у бота: отправим тихий probe.
+  // Если токена нет — пропускаем проверку (dev-режим).
+  if (env.TELEGRAM_BOT_TOKEN) {
+    const probe = await tgApi(env, 'sendMessage', {
+      chat_id: chatIdStr,
+      text: '✅chat_id привязан к группе ' + group + '. Теперь тут будут уведомления!',
+      disable_web_page_preview: true,
+    });
+    if (!probe.ok) {
+      return jsonResponse({
+        error: 'Не удалось отправить сообщение в этот chat_id. Убедись, что ты написал боту /start.',
+      }, corsHeaders, 400);
+    }
+  }
+
+  await addGroupSubscriber(env, group, chatIdStr);
+  const groupsRaw = await env.SCHEDULE.get(`tg:groups:${chatIdStr}`, { type: 'json' }) || [];
+  if (!groupsRaw.includes(group)) {
+    groupsRaw.push(group);
+    await env.SCHEDULE.put(`tg:groups:${chatIdStr}`, JSON.stringify(groupsRaw));
+  }
+  return jsonResponse({ ok: true, group, chatId: chatIdStr }, corsHeaders);
+}
+
+// ── POST /api/tg/unsubscribe ───────────────────────────────────
+// Body: { group } | { chatId } | { group, chatId }
+
+async function handleTgUnsubscribe(request, env, corsHeaders) {
+  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const body = await request.json().catch(() => ({}));
+  const { group, chatId } = body;
+
+  if (group && chatId) {
+    await removeGroupSubscriber(env, group, chatId);
+    const groupsRaw = await env.SCHEDULE.get(`tg:groups:${String(chatId)}`, { type: 'json' }) || [];
+    const filtered = groupsRaw.filter(g => g !== group);
+    if (filtered.length) await env.SCHEDULE.put(`tg:groups:${String(chatId)}`, JSON.stringify(filtered));
+    else await env.SCHEDULE.delete(`tg:groups:${String(chatId)}`);
+  } else if (group) {
+    // Отвязываем все чаты от группы (удаляем весь список подписчиков).
+    const subs = await getGroupSubscribers(env, group);
+    await env.SCHEDULE.delete(`tg:subs:${group}`);
+    await env.SCHEDULE.delete(`tg:chat:${group}`); // на случай старого ключа
+    for (const c of subs) {
+      const groupsRaw = await env.SCHEDULE.get(`tg:groups:${String(c)}`, { type: 'json' }) || [];
+      const filtered = groupsRaw.filter(g => g !== group);
+      if (filtered.length) await env.SCHEDULE.put(`tg:groups:${String(c)}`, JSON.stringify(filtered));
+      else await env.SCHEDULE.delete(`tg:groups:${String(c)}`);
+    }
+  } else if (chatId) {
+    await unbindChat(env, String(chatId));
+  } else {
+    return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
+  }
+  return jsonResponse({ ok: true }, corsHeaders);
+}
+
+// ── GET /api/tg/status?group=...&chatId=... ─────────────────────
+// Возвращает { subscribed, chatId } — подписан ли ПЕРЕДАННЫЙ chatId
+// к этой группе (изоляция: каждый пользователь видит только свой статус).
+
+async function handleTgStatus(request, env, corsHeaders) {
+  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const chatId = url.searchParams.get('chatId') || '';
+  const subs = await getGroupSubscribers(env, group);
+  const isSub = chatId ? subs.some(c => String(c) === String(chatId)) : false;
+  return jsonResponse({
+    subscribed: isSub,
+    chatId: isSub ? chatId : null,
+    subscribersCount: subs.length,
+    botUsername: env.TG_BOT_USERNAME || '',
+  }, corsHeaders);
+}
+
+// ════════════════════════════════════════════════════════════════
+// ── Форматирование ДЗ и расписания для Telegram ─────────────────
+// ════════════════════════════════════════════════════════════════
+
+function escTg(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&')
+    .replace(/</g, '<')
+    .replace(/>/g, '>');
+}
+
+const TG_PAIR_TYPES = {
+  'л': 'лекция',
+  'пр': 'практика',
+  'пз': 'практ. занятие',
+  'лаб': 'лабораторная',
+  'с': 'семинар',
+  'зчО': 'зачёт с оценкой',
+  'зач': 'зачёт',
+  'экз': 'экзамен',
+};
+
+function pairTypeLabel(t) {
+  return TG_PAIR_TYPES[t] || (t ? t : '');
+}
+
+// Краткая human строка одной пары для diff.
+function pairBrief(p) {
+  const subject = escTg(p.subject || '(без названия)');
+  const tp = p.type ? ` <i>[${escTg(pairTypeLabel(p.type))}]</i>` : '';
+  const sub = p.subgroup ? ` · ${escTg(p.subgroup)}` : '';
+  const room = p.room ? ` · ${escTg(p.room)}` : '';
+  const teacher = p.teacher ? ` · ${escTg(p.teacher)}` : '';
+  const time = p.time ? `${escTg(p.time)} ` : '';
+  return `${time}${subject}${tp}${sub}${room}${teacher}`;
+}
+
+// JSON-подобный «сигнатурный» ключ пары (без parsedAt/campusUpdatedAt у недели).
+function pairKey(p) {
+  return [p.time || '', p.subject || '', p.type || '', p.subgroup || '', p.room || '', p.teacher || ''].join('␟');
+}
+
+// Сравнивает старую и новую неделю, возвращает массив строк-изменений по дням.
+// Возвращает null, если изменений нет, либо структуру { weekLabel, lines: [...] }.
+function diffScheduleWeek(oldWeek, newWeek) {
+  const oldDays = (oldWeek && oldWeek.days) || {};
+  const newDays = (newWeek && newWeek.days) || {};
+
+  // Заголовок недели (для контекста сообщения).
+  const ws = (newWeek && newWeek.weekStart) || (oldWeek && oldWeek.weekStart) || '';
+  const we = (newWeek && newWeek.weekEnd) || (oldWeek && oldWeek.weekEnd) || '';
+  const weekLabel = (ws && we) ? `с ${escTg(ws)} по ${escTg(we)}` : 'неделя';
+
+  const lines = [];
+
+  // Собираем все имена дней из обеих версий.
+  const dayNames = new Set([...Object.keys(oldDays), ...Object.keys(newDays)]);
+
+  // Сортировка дней по дате (если есть), иначе по имени.
+  const sorted = [...dayNames].sort((a, b) => {
+    const da = oldDays[a]?.date || newDays[a]?.date || '';
+    const db = oldDays[b]?.date || newDays[b]?.date || '';
+    return da.localeCompare(db);
+  });
+
+  for (const dn of sorted) {
+    const oldPairs = (oldDays[dn] && oldDays[dn].pairs) || [];
+    const newPairs = (newDays[dn] && newDays[dn].pairs) || [];
+    const dateStr = (newDays[dn] && newDays[dn].date) || (oldDays[dn] && oldDays[dn].date) || '';
+    const dayHeader = dateStr ? `${escTg(dn)} (${escTg(dateStr)})` : escTg(dn);
+
+    const oldMap = new Map(oldPairs.map(p => [pairKey(p), p]));
+    const newMap = new Map(newPairs.map(p => [pairKey(p), p]));
+
+    const removed = oldPairs.filter(p => !newMap.has(pairKey(p)));
+    const added = newPairs.filter(p => !oldMap.has(pairKey(p)));
+
+    if (removed.length === 0 && added.length === 0) continue;
+
+    const dayLines = [];
+    dayLines.push(`<b>${dayHeader}</b>:`);
+    for (const p of removed) dayLines.push(`  ➖ ${pairBrief(p)}`);
+    for (const p of added) dayLines.push(`  ➕ ${pairBrief(p)}`);
+
+    // Если day целиком «новая» — весь блок пойдёт в added.
+    // Если day целиком «пропала» — весь блок в removed. Это уже покрыто выше.
+    lines.push(dayLines.join('\n'));
+  }
+
+  if (lines.length === 0) return null;
+  return { weekLabel, lines };
+}
+
+// Формирует итоговое сообщение об изменениях расписания.
+function formatScheduleDiffBroadcast(group, changedWeeks) {
+  // changedWeeks: [{ weekLabel, lines: [...] }, ...]
+  const parts = [];
+  parts.push(`🔔 <b>Расписание группы ${escTg(group)} изменилось</b>`);
+  parts.push('');
+  for (const w of changedWeeks) {
+    if (parts.length + w.lines.length + 2 > 3500) {
+      parts.push('… (часть изменений опущена, см. на сайте)');
+      break;
+    }
+    parts.push(`📅 <b>Неделя ${w.weekLabel}</b>`);
+    for (const l of w.lines) {
+      parts.push(l);
+    }
+    parts.push('');
+  }
+  return parts.join('\n');
+}
+
+// Формирует сообщение по ДЗ (полный текст — по решению пользователя).
+function formatHwMessage(action, group, hw, prevHw) {
+  const subject = escTg(hw.subject || '');
+  const tp = hw.pairType && hw.pairType !== 'any'
+    ? ` <i>[${escTg(pairTypeLabel(hw.pairType))}]</i>` : '';
+  const sub = hw.subgroup && hw.subgroup !== 'any'
+    ? ` · подгруппа ${escTg(hw.subgroup)}` : '';
+  const task = escTg(hw.task || '(пусто)');
+  const due = hw.dueDate ? escTg(hw.dueDate) : 'следующая пара';
+  const author = hw.author ? ` · ${escTg(hw.author)}` : '';
+
+  if (action === 'add') {
+    return [
+      `📝 <b>Новое ДЗ</b> · ${escTg(group)}${author}`,
+      `<b>${subject}${tp}${sub}</b>`,
+      `Срок: ${due}`,
+      '',
+      task,
+    ].join('\n');
+  }
+  if (action === 'update') {
+    const changed = [];
+    if (prevHw) {
+      if ((prevHw.subject || '') !== (hw.subject || '')) changed.push(`предмет: ${escTg(prevHw.subject)} → ${subject}`);
+      if ((prevHw.task || '') !== (hw.task || '')) changed.push(`задание изменено`);
+      if ((prevHw.dueDate || '') !== (hw.dueDate || '')) changed.push(`срок: ${escTg(prevHw.dueDate || 'след. пара')} → ${due}`);
+      if ((prevHw.pairType || 'any') !== (hw.pairType || 'any')) changed.push(`тип: ${escTg(pairTypeLabel(prevHw.pairType))} → ${escTg(pairTypeLabel(hw.pairType))}`);
+    }
+    const changeLine = changed.length ? `\n\nИзменения: ${changed.join('; ')}` : '';
+    return [
+      `✏️ <b>ДЗ изменено</b> · ${escTg(group)}${author}`,
+      `<b>${subject}${tp}${sub}</b>`,
+      `Срок: ${due}`,
+      '',
+      task,
+      changeLine,
+    ].join('\n');
+  }
+  // delete
+  return `🗑 <b>ДЗ удалено</b> · ${escTg(group)}\n<b>${subject}${tp}${sub}</b>`;
 }

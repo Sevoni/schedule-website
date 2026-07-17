@@ -5,6 +5,13 @@ compatibility_date = "2024-01-01"
 [vars]
 CAMPUS_URL = "https://campus.syktsu.ru/schedule/group/"
 DEFAULT_GROUP = "131-ИБо"
+# Username бота без @ — нужен для формирования t.me ссылки в настройках сайта.
+# Установите своего бота через @BotFather и впишите его username сюда.
+TG_BOT_USERNAME = "kampussgubot"
+
+# Telegram bot token — НЕ хранится в репозитории. Устанавливается через:
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN
+# Используется env.TELEGRAM_BOT_TOKEN.
 
 [[kv_namespaces]]
 binding = "SCHEDULE"

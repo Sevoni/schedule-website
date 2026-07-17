@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy && wrangler pages deploy frontend --project-name=schedule-worker",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "set-webhook": "node scripts/set-webhook.js"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"

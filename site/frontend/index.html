@@ -79,6 +79,28 @@
           Если загрузка из кампуса отключена, расписание берётся только из БД.
           Нажмите 🔄 для принудительной синхронизации (только когда нагрузка с кампуса включена).
         </div>
+
+        <hr class="settings-divider">
+
+        <div class="tg-section">
+          <h3>📲 Telegram-уведомления</h3>
+          <div id="tgStatus" class="tg-status">Проверка…</div>
+          <ol class="tg-instructions">
+            <li>Открой бота: <a id="tgBotLink" href="#" target="_blank" rel="noopener">ссылка</a></li>
+            <li>Напиши ему <code>/start</code> и скопируй присланный <b>chat_id</b></li>
+            <li>Вставь chat_id ниже и нажми «Привязать»</li>
+          </ol>
+          <label>
+            Chat ID
+            <input type="text" id="tgChatIdInput" placeholder="например 123456789">
+          </label>
+          <div id="tgMsg" class="tg-msg hidden"></div>
+          <div class="tg-actions">
+            <button id="tgSubscribe" class="save-btn">Привязать</button>
+            <button id="tgUnsubscribe" class="btn-secondary">Отвязать</button>
+          </div>
+        </div>
+
         <button id="saveSettings" class="save-btn">Сохранить</button>
       </div>
     </div>
@@ -159,6 +181,8 @@
       </div>
     </div>
   </div>
+
+  <div id="toast" class="toast hidden"></div>
 
   <script src="app.js"></script>
 </body>
