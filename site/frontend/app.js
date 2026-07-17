@@ -32,6 +32,29 @@ let state = {
 
 let editingHwId = null;
 
+// Множество id ДЗ, отмеченных пользователем как выполненные (локально, per-группа).
+// Хранится в localStorage — при очистке браузера отметки сбрасываются.
+let doneHwIds = loadDoneHw();
+
+function doneHwKey() {
+  return 'doneHw:' + state.group;
+}
+
+function loadDoneHw() {
+  try {
+    const raw = localStorage.getItem(doneHwKey());
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function saveDoneHw() {
+  try {
+    localStorage.setItem(doneHwKey(), JSON.stringify([...doneHwIds]));
+  } catch (e) { /* квота/недоступность — игнорируем */ }
+}
+
 // ── Init ──────────────────────────────────────────────────────
 
 // Возвращает расписание недели, которая календарно содержит сегодняшнюю дату
@@ -1245,8 +1268,9 @@ function renderDaySchedule(day) {
             if (df < 0) dc = ' overdue';
             else if (df <= 2) dc = ' due-soon';
           }
+          const done = doneHwIds.has(hw.id);
           const dueText = (hw.author ? escHtml(hw.author) : '');
-          return `<div class="pair-hw-item${dc}"><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
+          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным">✓</span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
 
@@ -1290,6 +1314,21 @@ function renderDaySchedule(day) {
     btn.onclick = (e) => {
       e.stopPropagation();
       openHwModal(btn.dataset.subj, btn.dataset.type, btn.dataset.subgroup);
+    };
+  });
+
+  content.querySelectorAll('.pair-hw-done').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (doneHwIds.has(id)) {
+        doneHwIds.delete(id);
+      } else {
+        doneHwIds.add(id);
+      }
+      saveDoneHw();
+      renderDaySchedule(day);
+      renderHomework();
     };
   });
 
@@ -2345,6 +2384,8 @@ function renderHomework() {
    // на дне сдачи — при переходе на прошедший день через расписание.
    const f = state.subgroupFilter || 'any';
    const visible = sorted.filter(hw => {
+     // Выполненное ДЗ скрываем из нижнего списка (но оно остаётся в меню дней).
+     if (doneHwIds.has(hw.id)) return false;
      if (!hw.dueDate) return true;
       const due = new Date(hw.dueDate);
       due.setHours(0, 0, 0, 0);
@@ -2409,19 +2450,28 @@ function renderHomework() {
            ${authorHtml}
          </div>
         <div class="hw-actions">
+          <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным">✓</button>
           <button class="hw-edit" data-id="${hw.id}" title="Редактировать">✎</button>
         </div>
       </div>`;
-  }).join('');
+   }).join('');
 
-  attachShowMore(list);
+   attachShowMore(list);
 
-  list.querySelectorAll('.hw-edit').forEach(btn => {
-    btn.onclick = () => {
-      const hw = state.homework.find(h => h.id === btn.dataset.id);
-      if (hw) openHwModal(null, null, null, hw);
-    };
-  });
+   list.querySelectorAll('.hw-done').forEach(btn => {
+     btn.onclick = () => {
+       doneHwIds.add(btn.dataset.id);
+       saveDoneHw();
+       renderHomework();
+     };
+   });
+
+   list.querySelectorAll('.hw-edit').forEach(btn => {
+     btn.onclick = () => {
+       const hw = state.homework.find(h => h.id === btn.dataset.id);
+       if (hw) openHwModal(null, null, null, hw);
+     };
+   });
 }
 
 // ── Settings Modal ────────────────────────────────────────────
@@ -2582,6 +2632,9 @@ function setupSettingsModal() {
 
     // Если сменилась только подгруппа — перерисовываем локально,
     // без лишних запросов к сети/кампусу. Иначе — полная перезагрузка.
+    if (groupChanged) {
+      doneHwIds = loadDoneHw();
+    }
     if (!groupChanged && !apiChanged && !campusChanged) {
       state.selectedDay = null;
       renderHomework();

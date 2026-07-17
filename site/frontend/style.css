@@ -357,6 +357,36 @@ header {
   color: var(--orange);
 }
 
+.pair-hw-done {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.pair-hw-done:hover {
+  color: var(--green, #4ade80);
+  background: rgba(74, 222, 128, 0.12);
+}
+
+.pair-hw-item.done {
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.pair-hw-item.done .pair-hw-task {
+  text-decoration: line-through;
+}
+
+.pair-hw-item.done .pair-hw-done {
+  color: var(--green, #4ade80);
+  background: rgba(74, 222, 128, 0.12);
+}
+
 .pair-hw-task {
   flex: 1;
   min-width: 0;
@@ -596,6 +626,23 @@ header {
 .hw-edit:hover {
   color: var(--text);
   background: rgba(148, 163, 184, 0.12);
+}
+
+.hw-done {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 4px;
+  border-radius: 6px;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.hw-done:hover {
+  color: var(--green, #4ade80);
+  background: rgba(74, 222, 128, 0.1);
 }
 
 .hw-author {
