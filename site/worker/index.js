@@ -1,3 +1,5 @@
+import { createStore } from './store.js';
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -127,6 +129,18 @@ export default {
       return jsonResponse({ error: e.message }, corsHeaders, 500);
     }
   },
+
+  // Cron-триггер (см. wrangler.toml [triggers]): ежедневная очистка
+  // протухших записей, которые в KV удалялись сами по expirationTtl.
+  async scheduled(event, env) {
+    try {
+      const store = createStore(env);
+      const res = await store.cleanupExpired();
+      console.log('D1 cleanupExpired done:', JSON.stringify(res?.meta || res));
+    } catch (e) {
+      console.log('D1 cleanupExpired failed:', e.message);
+    }
+  },
 };
 
 // ── Auth: role-based resolution ─────────────────────────────────
@@ -148,7 +162,8 @@ const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
 //     * иначе null
 //   - без заголовка → null (аноним = reader)
 async function resolveAuth(request, env) {
-  if (!env.SCHEDULE) return null;
+  const store = createStore(env);
+  if (!env.DB) return null;
 
   const authHeader = request.headers.get('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
@@ -164,7 +179,7 @@ async function resolveAuth(request, env) {
 
   // Writer: ищем inv:{token} в KV.
   try {
-    const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+    const inv = await store.get(`inv:${token}`, { type: 'json' });
     if (inv && inv.group) {
       return { role: 'writer', token, group: inv.group };
     }
@@ -214,8 +229,9 @@ async function requireWriter(request, env, corsHeaders) {
 // Returns: { token, group }
 
 async function handleAuth(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const { group, password } = await request.json();
@@ -224,7 +240,7 @@ async function handleAuth(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
   }
 
-  const stored = await env.SCHEDULE.get(`group-pwd:${group}`);
+  const stored = await store.get(`group-pwd:${group}`);
   if (!stored) {
     return jsonResponse({ error: 'Group not registered' }, corsHeaders, 404);
   }
@@ -246,8 +262,9 @@ async function handleAuth(request, env, corsHeaders) {
 // If group already exists, requires the old password to change it.
 
 async function handleGroupRegister(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const { group, password } = await request.json();
@@ -260,13 +277,13 @@ async function handleGroupRegister(request, env, corsHeaders) {
     return jsonResponse({ error: 'Password must be at least 4 characters' }, corsHeaders, 400);
   }
 
-  const existing = await env.SCHEDULE.get(`group-pwd:${group}`);
+  const existing = await store.get(`group-pwd:${group}`);
   if (existing) {
     return jsonResponse({ error: 'Group already registered' }, corsHeaders, 409);
   }
 
   const hash = await sha256(password);
-  await env.SCHEDULE.put(`group-pwd:${group}`, hash);
+  await store.put(`group-pwd:${group}`, hash);
 
   // Auto-login: return token
   const token = btoa(JSON.stringify({ group, ts: Date.now() }));
@@ -286,8 +303,9 @@ async function handleGroupRegister(request, env, corsHeaders) {
 // Body: { group, label? }. Требует writer/owner. Для owner — group из body.
 // Возвращает { link, id, token }.
 async function handleInviteCreate(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const auth = await resolveAuth(request, env);
@@ -312,14 +330,14 @@ async function handleInviteCreate(request, env, corsHeaders) {
 
   const invRecord = { group, createdAt };
   if (label) invRecord.label = label;
-  await env.SCHEDULE.put(`inv:${token}`, JSON.stringify(invRecord), {
+  await store.put(`inv:${token}`, JSON.stringify(invRecord), {
     expirationTtl: INVITE_TTL,
   });
 
   // Добавляем в inv-by-group:{group}
-  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
   listRaw.push({ id, token, createdAt, label: label || undefined });
-  await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+  await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
     expirationTtl: INVITE_TTL,
   });
 
@@ -334,8 +352,9 @@ async function handleInviteCreate(request, env, corsHeaders) {
 // POST /api/invite/verify
 // Body: { token }. Публичный (без auth). Возвращает { ok, group, token } либо 404.
 async function handleInviteVerify(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json().catch(() => ({}));
@@ -344,7 +363,7 @@ async function handleInviteVerify(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing token' }, corsHeaders, 400);
   }
 
-  const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+  const inv = await store.get(`inv:${token}`, { type: 'json' });
   if (!inv || !inv.group) {
     return jsonResponse({ error: 'Invite not found or revoked' }, corsHeaders, 404);
   }
@@ -355,8 +374,9 @@ async function handleInviteVerify(request, env, corsHeaders) {
 // GET /api/invite?group=...
 // Только owner. Writer не имеет доступа к управлению ссылками.
 async function handleInviteList(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const auth = await resolveAuth(request, env);
@@ -370,7 +390,7 @@ async function handleInviteList(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
-  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
   // Не светим токены наружу — только id/created/label.
   const items = listRaw.map(({ id, createdAt, label }) => ({
     id,
@@ -384,8 +404,9 @@ async function handleInviteList(request, env, corsHeaders) {
 // Только owner. Удаляет inv:{token} (поиск по id в inv-by-group) и
 // чистит список. Id = первые 8 символов token.
 async function handleInviteDelete(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const auth = await resolveAuth(request, env);
@@ -400,23 +421,23 @@ async function handleInviteDelete(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
-  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
   const item = listRaw.find(it => it.id === id);
   if (!item) {
     return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
   }
 
   // Удаляем токен
-  await env.SCHEDULE.delete(`inv:${item.token}`);
+  await store.delete(`inv:${item.token}`);
 
   // Чистим список
   const filtered = listRaw.filter(it => it.id !== id);
   if (filtered.length) {
-    await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(filtered), {
+    await store.put(`inv-by-group:${group}`, JSON.stringify(filtered), {
       expirationTtl: INVITE_TTL,
     });
   } else {
-    await env.SCHEDULE.delete(`inv-by-group:${group}`);
+    await store.delete(`inv-by-group:${group}`);
   }
 
   return jsonResponse({ ok: true }, corsHeaders);
@@ -427,8 +448,9 @@ async function handleInviteDelete(request, env, corsHeaders) {
 // (label) ссылки: в inv-by-group:{group} и в inv:{token}. Пустая строка
 // label = сброс названия.
 async function handleInviteRename(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const auth = await resolveAuth(request, env);
@@ -443,7 +465,7 @@ async function handleInviteRename(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
-  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
   const idx = listRaw.findIndex(it => it.id === id);
   if (idx === -1) {
     return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
@@ -451,18 +473,18 @@ async function handleInviteRename(request, env, corsHeaders) {
 
   const newLabel = (body.label || '').toString().slice(0, 100).trim();
   listRaw[idx].label = newLabel || undefined;
-  await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+  await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
     expirationTtl: INVITE_TTL,
   });
 
   // Синхронизируем label в inv:{token} (для консистентности).
   const token = listRaw[idx].token;
   if (token) {
-    const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+    const inv = await store.get(`inv:${token}`, { type: 'json' });
     if (inv) {
       if (newLabel) inv.label = newLabel;
       else delete inv.label;
-      await env.SCHEDULE.put(`inv:${token}`, JSON.stringify(inv), {
+      await store.put(`inv:${token}`, JSON.stringify(inv), {
         expirationTtl: INVITE_TTL,
       });
     }
@@ -487,12 +509,13 @@ async function handleGetSchedule(request, env, corsHeaders) {
   const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
   const weekCode = url.searchParams.get('week');
 
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   if (weekCode) {
-    const data = await env.SCHEDULE.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+    const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
     if (data) return jsonResponse(data, corsHeaders);
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
@@ -506,11 +529,12 @@ async function handleGetWeeks(request, env, corsHeaders) {
   const url = new URL(request.url);
   const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
 
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const data = await env.SCHEDULE.get(`weeks:${group}`, { type: 'json' });
+  const data = await store.get(`weeks:${group}`, { type: 'json' });
   if (data) return jsonResponse(data, corsHeaders);
   return jsonResponse({ error: 'No weeks data' }, corsHeaders, 404);
 }
@@ -519,8 +543,9 @@ async function handleGetWeeks(request, env, corsHeaders) {
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
 async function handleUpload(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json();
@@ -531,7 +556,7 @@ async function handleUpload(request, env, corsHeaders) {
     if (!group || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
-    await env.SCHEDULE.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 604800 });
+    await store.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 604800 });
     return jsonResponse({ ok: true, type: 'weeks', count: weeks.length }, corsHeaders);
   }
 
@@ -542,9 +567,9 @@ async function handleUpload(request, env, corsHeaders) {
     }
 
     const key = weekCode ? `schedule:${group}:${weekCode}` : `schedule:${group}:current`;
-    await env.SCHEDULE.put(key, JSON.stringify(data), { expirationTtl: 604800 });
+    await store.put(key, JSON.stringify(data), { expirationTtl: 604800 });
 
-    await env.SCHEDULE.put('sync:meta', JSON.stringify({
+    await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
       lastGroup: group,
       lastWeek: weekCode || 'current',
@@ -572,12 +597,12 @@ async function handleUpload(request, env, corsHeaders) {
       if (!weekCode || !data) continue;
       validWeekCodes.push(weekCode);
 
-      const existing = await env.SCHEDULE.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+      const existing = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
       const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
       const newStr = JSON.stringify(stripComparable(data));
 
       if (existingStr !== newStr) {
-        await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+        await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
         updated.push(weekCode);
 
           // Инкрементально обновим список предметов этой недели
@@ -596,7 +621,7 @@ async function handleUpload(request, env, corsHeaders) {
       console.log('reaggregateSubjects skipped:', e.message);
     }
 
-    await env.SCHEDULE.put('sync:meta', JSON.stringify({
+    await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
       lastGroup: group,
       lastWeek: 'batch',
@@ -625,8 +650,9 @@ function stripComparable(data) {
 // needUpdate=false, если сохранённая в KV дата совпадает с присланной.
 
 async function handleCheckCampusUpdate(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json().catch(() => ({}));
@@ -636,12 +662,12 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
-  const stored = await env.SCHEDULE.get(`campus-updated:${group}`);
+  const stored = await store.get(`campus-updated:${group}`);
   const needUpdate = !stored || stored !== (campusUpdatedAt || '');
 
   // Обновляем lastSync при каждом вызове 🔄, даже если изменений нет
-  const meta = await env.SCHEDULE.get('sync:meta', { type: 'json' });
-  await env.SCHEDULE.put('sync:meta', JSON.stringify({
+  const meta = await store.get('sync:meta', { type: 'json' });
+  await store.put('sync:meta', JSON.stringify({
     lastSync: new Date().toISOString(),
     lastGroup: group,
     lastWeek: meta?.lastWeek || 'check',
@@ -660,8 +686,9 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
 // Body: { group, campusUpdatedAt, schedules: [{ weekCode, data }, ...] }
 
 async function handleSyncFromCampus(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json().catch(() => ({}));
@@ -677,7 +704,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   for (const { weekCode, data } of schedules) {
     if (!weekCode || !data) continue;
 
-    const existing = await env.SCHEDULE.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+    const existing = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
     const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
     const newStr = JSON.stringify(stripComparable(data));
 
@@ -696,7 +723,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
         }
       }
 
-      await env.SCHEDULE.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+      await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
       updated.push(weekCode);
 
       // Инкрементально обновляем список предметов этой недели
@@ -717,7 +744,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
     // Записываем дату обновления кампуса (если прислали)
   if (campusUpdatedAt) {
-    await env.SCHEDULE.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 604800 });
+    await store.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 604800 });
   }
 
   // Пересчёт ДЗ с dueMode='nextPair' — расписание могло измениться
@@ -733,12 +760,12 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   let subjects = [];
   try {
     const semester = currentSemesterKey();
-    subjects = (await env.SCHEDULE.get(`subjects:${group}:${semester}`, { type: 'json' })) || [];
+    subjects = (await store.get(`subjects:${group}:${semester}`, { type: 'json' })) || [];
   } catch (e) {
     console.log('subjects read skipped:', e.message);
   }
 
-  await env.SCHEDULE.put('sync:meta', JSON.stringify({
+  await store.put('sync:meta', JSON.stringify({
     lastSync: new Date().toISOString(),
     lastGroup: group,
     lastWeek: 'batch',
@@ -769,22 +796,24 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 // ── GET /api/hw?group=... ──────────────────────────────────────
 
 async function handleGetHw(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const url = new URL(request.url);
   const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
 
-  const data = await env.SCHEDULE.get(`hw:${group}`, { type: 'json' });
+  const data = await store.get(`hw:${group}`, { type: 'json' });
   return jsonResponse(data || [], corsHeaders);
 }
 
 // ── POST /api/hw ───────────────────────────────────────────────
 
 async function handleAddHw(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json();
@@ -818,9 +847,9 @@ async function handleAddHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const existing = await store.get(key, { type: 'json' }) || [];
   existing.push(item);
-  await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   await notifyGroup(env, group, formatHwMessage('add', group, item, null));
 
@@ -832,8 +861,9 @@ async function handleAddHw(request, env, corsHeaders) {
 // — обновляет все поля конкретного ДЗ.
 
 async function handleUpdateHw(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json();
@@ -844,7 +874,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const existing = await store.get(key, { type: 'json' }) || [];
   const idx = existing.findIndex(h => h.id === id);
   if (idx === -1) {
     return jsonResponse({ error: 'Homework not found' }, corsHeaders, 404);
@@ -868,7 +898,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   existing[idx] = item;
-  await env.SCHEDULE.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   await notifyGroup(env, group, formatHwMessage('update', group, item, prev));
 
@@ -878,8 +908,9 @@ async function handleUpdateHw(request, env, corsHeaders) {
 // ── DELETE /api/hw?id=...&group=... ────────────────────────────
 
 async function handleDeleteHw(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const url = new URL(request.url);
@@ -891,11 +922,11 @@ async function handleDeleteHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const existing = await store.get(key, { type: 'json' }) || [];
   const removed = existing.find(h => h.id === id);
   const filtered = existing.filter(h => h.id !== id);
 
-  await env.SCHEDULE.put(key, JSON.stringify(filtered), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(filtered), { expirationTtl: 2592000 });
 
   if (removed) {
     await notifyGroup(env, group, formatHwMessage('delete', group, removed, null));
@@ -908,8 +939,9 @@ async function handleDeleteHw(request, env, corsHeaders) {
 // Возвращает { semester, subjects: [{subject, pairTypes: ['л','пр',...]}] }
 
 async function handleGetSubjects(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const url = new URL(request.url);
@@ -917,12 +949,12 @@ async function handleGetSubjects(request, env, corsHeaders) {
   const semester = currentSemesterKey();
 
   const key = `subjects:${group}:${semester}`;
-  let data = await env.SCHEDULE.get(key, { type: 'json' });
+  let data = await store.get(key, { type: 'json' });
 
   if (!data || data.length === 0 || (data[0] && !('subgroups' in data[0]))) {
     try {
       await updateSubjectsForCurrentSemester(env, group);
-      data = await env.SCHEDULE.get(key, { type: 'json' });
+      data = await store.get(key, { type: 'json' });
     } catch (e) {
       console.log('subjects auto-recompute failed:', e.message);
     }
@@ -935,8 +967,9 @@ async function handleGetSubjects(request, env, corsHeaders) {
 // Body: { group, semester?, subjects } — пересохраняет список предметов.
 
 async function handlePutSubjects(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json();
@@ -946,7 +979,7 @@ async function handlePutSubjects(request, env, corsHeaders) {
   }
 
   const sem = semester || currentSemesterKey();
-  await env.SCHEDULE.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
+  await store.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
   return jsonResponse({ ok: true, semester: sem, count: subjects.length }, corsHeaders);
@@ -957,8 +990,9 @@ async function handlePutSubjects(request, env, corsHeaders) {
 // на основе всех расписаний в БД. Возвращает обновлённые items.
 
 async function handleRecalcHw(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
   const body = await request.json().catch(() => ({}));
@@ -1059,12 +1093,13 @@ function computeWeekSubjects(weekData) {
 
 // Сливает все недельные вклады семестра в агрегат subjects:{group}:{sem}.
 async function reaggregateSubjects(env, group, semester) {
-  const list = await env.SCHEDULE.list({ prefix: `subjects-week:${group}:${semester}:` });
+  const store = createStore(env);
+  const list = await store.list({ prefix: `subjects-week:${group}:${semester}:` });
   const map = new Map();
   for (const k of (list && list.keys) || []) {
     let snap;
     try {
-      snap = await env.SCHEDULE.get(k.name, { type: 'json' });
+      snap = await store.get(k.name, { type: 'json' });
     } catch (e) {
       continue;
     }
@@ -1083,7 +1118,7 @@ async function reaggregateSubjects(env, group, semester) {
     }
   }
   const merged = serializeSubjects(map);
-  await env.SCHEDULE.put(`subjects:${group}:${semester}`, JSON.stringify(merged), {
+  await store.put(`subjects:${group}:${semester}`, JSON.stringify(merged), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
 }
@@ -1092,13 +1127,14 @@ async function reaggregateSubjects(env, group, semester) {
 // вызывающий код делает один раз после цикла (см. reaggregateSubjects),
 // чтобы не делать лишних KV-запросов на каждую изменённую неделю.
 async function addSubjectsFromWeek(env, group, weekCode, weekData) {
+  const store = createStore(env);
   if (!weekCode || !weekData || !weekData.days) return false;
 
   const semester = semesterFromWeekDates(weekData.weekStart, weekData.weekEnd)
     || currentSemesterKey();
 
   const snapshot = computeWeekSubjects(weekData);
-  await env.SCHEDULE.put(`subjects-week:${group}:${semester}:${weekCode}`, JSON.stringify(snapshot), {
+  await store.put(`subjects-week:${group}:${semester}:${weekCode}`, JSON.stringify(snapshot), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
   return true;
@@ -1110,8 +1146,9 @@ async function addSubjectsFromWeek(env, group, weekCode, weekData) {
 // и пересобирает агрегат. Горячий путь синхронизации им не пользуется.
 
 async function updateSubjectsForCurrentSemester(env, group) {
+  const store = createStore(env);
   const semester = currentSemesterKey();
-  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  const list = await store.list({ prefix: `schedule:${group}:` });
   if (!list || list.keys.length === 0) return false;
 
   for (const k of list.keys) {
@@ -1119,7 +1156,7 @@ async function updateSubjectsForCurrentSemester(env, group) {
     if (!weekValue || weekValue === 'current') continue;
     let data;
     try {
-      data = await env.SCHEDULE.get(k.name, { type: 'json' });
+      data = await store.get(k.name, { type: 'json' });
     } catch (e) {
       continue;
     }
@@ -1127,7 +1164,7 @@ async function updateSubjectsForCurrentSemester(env, group) {
     if (semesterFromWeekDates(data.weekStart, data.weekEnd) !== semester) continue;
 
     const snapshot = computeWeekSubjects(data);
-    await env.SCHEDULE.put(`subjects-week:${group}:${semester}:${weekValue}`, JSON.stringify(snapshot), {
+    await store.put(`subjects-week:${group}:${semester}:${weekValue}`, JSON.stringify(snapshot), {
       expirationTtl: 365 * 24 * 60 * 60,
     });
   }
@@ -1139,17 +1176,18 @@ async function updateSubjectsForCurrentSemester(env, group) {
 // ── Пересчёт dueDate для ДЗ с dueMode='nextPair' ────────────────────
 
 async function recalcHomeworkForGroup(env, group) {
+  const store = createStore(env);
   const key = `hw:${group}`;
-  const homework = await env.SCHEDULE.get(key, { type: 'json' }) || [];
+  const homework = await store.get(key, { type: 'json' }) || [];
   if (homework.length === 0) return { updated: 0, items: [] };
 
   // Загружаем все расписания группы
-  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  const list = await store.list({ prefix: `schedule:${group}:` });
   const weekData = [];
   for (const k of list.keys) {
     const weekValue = k.name.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    const data = await store.get(k.name, { type: 'json' });
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1185,7 +1223,7 @@ async function recalcHomeworkForGroup(env, group) {
   }
 
   if (changed) {
-    await env.SCHEDULE.put(key, JSON.stringify(updatedItems), { expirationTtl: 2592000 });
+    await store.put(key, JSON.stringify(updatedItems), { expirationTtl: 2592000 });
   }
   return { updated: changed ? updatedItems.length : 0, items: updatedItems, changed };
 }
@@ -1229,12 +1267,13 @@ function findNextPairDate(weekData, subject, pairType, fromDate, subgroup = 'any
 // ── Вычислить дату следующей пары для одного ДЗ ─────────────────────
 
 async function computeNextPairDate(env, group, subject, pairType, fromDate = new Date(), subgroup = 'any') {
-  const list = await env.SCHEDULE.list({ prefix: `schedule:${group}:` });
+  const store = createStore(env);
+  const list = await store.list({ prefix: `schedule:${group}:` });
   const weekData = [];
   for (const k of list.keys) {
     const weekValue = k.name.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    const data = await env.SCHEDULE.get(k.name, { type: 'json' });
+    const data = await store.get(k.name, { type: 'json' });
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1249,22 +1288,23 @@ async function computeNextPairDate(env, group, subject, pairType, fromDate = new
 
 
 async function handleStatus(request, env, corsHeaders) {
-  if (!env.SCHEDULE) {
-    return jsonResponse({ kv: false }, corsHeaders);
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ db: false }, corsHeaders);
   }
 
   const url = new URL(request.url);
   const group = url.searchParams.get('group');
 
-  const meta = await env.SCHEDULE.get('sync:meta', { type: 'json' });
+  const meta = await store.get('sync:meta', { type: 'json' });
 
   let campusUpdatedAt = meta?.campusUpdatedAt || null;
   if (group && !campusUpdatedAt) {
-    campusUpdatedAt = await env.SCHEDULE.get(`campus-updated:${group}`);
+    campusUpdatedAt = await store.get(`campus-updated:${group}`);
   }
 
   return jsonResponse({
-    kv: true,
+    db: true,
     lastSync: meta?.lastSync || null,
     lastGroup: meta?.lastGroup || null,
     lastWeek: meta?.lastWeek || null,
@@ -1322,38 +1362,42 @@ async function tgApi(env, method, payload) {
 // Поддерживает миграцию старого ключа tg:chat:{group} (один chat_id) →
 // превращаем в список из одного элемента.
 async function getGroupSubscribers(env, group) {
-  const raw = await env.SCHEDULE.get(`tg:subs:${group}`, { type: 'json' });
+  const store = createStore(env);
+  const raw = await store.get(`tg:subs:${group}`, { type: 'json' });
   if (Array.isArray(raw)) return raw;
 
   // Миграция: старый одиночный ключ.
-  const old = await env.SCHEDULE.get(`tg:chat:${group}`);
+  const old = await store.get(`tg:chat:${group}`);
   if (old) {
     const list = [old];
-    await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(list));
-    await env.SCHEDULE.delete(`tg:chat:${group}`);
+    await store.put(`tg:subs:${group}`, JSON.stringify(list));
+    await store.delete(`tg:chat:${group}`);
     return list;
   }
   return [];
 }
 
 async function addGroupSubscriber(env, group, chatId) {
+  const store = createStore(env);
   const list = await getGroupSubscribers(env, group);
   if (!list.includes(chatId)) {
     list.push(chatId);
-    await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(list));
+    await store.put(`tg:subs:${group}`, JSON.stringify(list));
   }
 }
 
 async function removeGroupSubscriber(env, group, chatId) {
+  const store = createStore(env);
   const list = await getGroupSubscribers(env, group);
   const filtered = list.filter(c => String(c) !== String(chatId));
-  if (filtered.length) await env.SCHEDULE.put(`tg:subs:${group}`, JSON.stringify(filtered));
-  else await env.SCHEDULE.delete(`tg:subs:${group}`);
+  if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered));
+  else await store.delete(`tg:subs:${group}`);
 }
 
 // Рассылает сообщение всем подписчикам группы (chat_id изолированы друг от друга).
 async function notifyGroup(env, group, text, opts = {}) {
-  if (!env.SCHEDULE || !env.TELEGRAM_BOT_TOKEN) return;
+  const store = createStore(env);
+  if (!env.DB || !env.TELEGRAM_BOT_TOKEN) return;
   const subs = await getGroupSubscribers(env, group);
   if (!subs.length) return;
 
@@ -1443,7 +1487,8 @@ async function handleTgSetWebhook(request, env, corsHeaders) {
 }
 
 async function handleTgWebhook(request, env) {
-  if (!env.SCHEDULE) return new Response('ok', { status: 200 });
+  const store = createStore(env);
+  if (!env.DB) return new Response('ok', { status: 200 });
   let update;
   try { update = await request.json(); } catch { return new Response('ok', { status: 200 }); }
 
@@ -1504,22 +1549,24 @@ async function handleTgWebhook(request, env) {
 }
 
 async function unbindChat(env, chatId) {
-  const groupsRaw = await env.SCHEDULE.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+  const store = createStore(env);
+  const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
   for (const g of groupsRaw) {
     // Чистим старый одиночный ключ, если он указывал на этот chat.
-    const cur = await env.SCHEDULE.get(`tg:chat:${g}`);
-    if (String(cur) === String(chatId)) await env.SCHEDULE.delete(`tg:chat:${g}`);
+    const cur = await store.get(`tg:chat:${g}`);
+    if (String(cur) === String(chatId)) await store.delete(`tg:chat:${g}`);
     // И удаляем chat из списка подписчиков группы.
     await removeGroupSubscriber(env, g, chatId);
   }
-  await env.SCHEDULE.delete(`tg:groups:${chatId}`);
+  await store.delete(`tg:groups:${chatId}`);
 }
 
 // ── POST /api/tg/subscribe ─────────────────────────────────────
 // Body: { group, chatId }  — привязывает chat_id к группе текущего пользователя.
 
 async function handleTgSubscribe(request, env, corsHeaders) {
-  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const body = await request.json().catch(() => ({}));
   const { group, chatId } = body;
   if (!group || !chatId) return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
@@ -1542,10 +1589,10 @@ async function handleTgSubscribe(request, env, corsHeaders) {
   }
 
   await addGroupSubscriber(env, group, chatIdStr);
-  const groupsRaw = await env.SCHEDULE.get(`tg:groups:${chatIdStr}`, { type: 'json' }) || [];
+  const groupsRaw = await store.get(`tg:groups:${chatIdStr}`, { type: 'json' }) || [];
   if (!groupsRaw.includes(group)) {
     groupsRaw.push(group);
-    await env.SCHEDULE.put(`tg:groups:${chatIdStr}`, JSON.stringify(groupsRaw));
+    await store.put(`tg:groups:${chatIdStr}`, JSON.stringify(groupsRaw));
   }
   return jsonResponse({ ok: true, group, chatId: chatIdStr }, corsHeaders);
 }
@@ -1554,26 +1601,27 @@ async function handleTgSubscribe(request, env, corsHeaders) {
 // Body: { group } | { chatId } | { group, chatId }
 
 async function handleTgUnsubscribe(request, env, corsHeaders) {
-  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const body = await request.json().catch(() => ({}));
   const { group, chatId } = body;
 
   if (group && chatId) {
     await removeGroupSubscriber(env, group, chatId);
-    const groupsRaw = await env.SCHEDULE.get(`tg:groups:${String(chatId)}`, { type: 'json' }) || [];
+    const groupsRaw = await store.get(`tg:groups:${String(chatId)}`, { type: 'json' }) || [];
     const filtered = groupsRaw.filter(g => g !== group);
-    if (filtered.length) await env.SCHEDULE.put(`tg:groups:${String(chatId)}`, JSON.stringify(filtered));
-    else await env.SCHEDULE.delete(`tg:groups:${String(chatId)}`);
+    if (filtered.length) await store.put(`tg:groups:${String(chatId)}`, JSON.stringify(filtered));
+    else await store.delete(`tg:groups:${String(chatId)}`);
   } else if (group) {
     // Отвязываем все чаты от группы (удаляем весь список подписчиков).
     const subs = await getGroupSubscribers(env, group);
-    await env.SCHEDULE.delete(`tg:subs:${group}`);
-    await env.SCHEDULE.delete(`tg:chat:${group}`); // на случай старого ключа
+    await store.delete(`tg:subs:${group}`);
+    await store.delete(`tg:chat:${group}`); // на случай старого ключа
     for (const c of subs) {
-      const groupsRaw = await env.SCHEDULE.get(`tg:groups:${String(c)}`, { type: 'json' }) || [];
+      const groupsRaw = await store.get(`tg:groups:${String(c)}`, { type: 'json' }) || [];
       const filtered = groupsRaw.filter(g => g !== group);
-      if (filtered.length) await env.SCHEDULE.put(`tg:groups:${String(c)}`, JSON.stringify(filtered));
-      else await env.SCHEDULE.delete(`tg:groups:${String(c)}`);
+      if (filtered.length) await store.put(`tg:groups:${String(c)}`, JSON.stringify(filtered));
+      else await store.delete(`tg:groups:${String(c)}`);
     }
   } else if (chatId) {
     await unbindChat(env, String(chatId));
@@ -1588,7 +1636,8 @@ async function handleTgUnsubscribe(request, env, corsHeaders) {
 // к этой группе (изоляция: каждый пользователь видит только свой статус).
 
 async function handleTgStatus(request, env, corsHeaders) {
-  if (!env.SCHEDULE) return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  const store = createStore(env);
+  if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const url = new URL(request.url);
   const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
   const chatId = url.searchParams.get('chatId') || '';

@@ -27,3 +27,20 @@ INVITE_ORIGIN = "https://schedule-worker.pages.dev"
 [[kv_namespaces]]
 binding = "SCHEDULE"
 id = "d4bf1890a6e94b5285f1c5195aed419a"
+
+# D1 — основное хранилище (миграция с KV). Биндинг SCHEDULE оставлен
+# для возможности отката; он не используется кодом после миграции.
+#
+# Создать базу и применить схему (один раз):
+#   npx wrangler d1 create schedule-db
+#   npx wrangler d1 execute schedule-db --remote --file=./migrations/0001_init.sql
+#   npx wrangler d1 execute schedule-db --local  --file=./migrations/0001_init.sql
+# Затем вписать database_id из вывода create в поле ниже.
+[[d1_databases]]
+binding = "DB"
+database_name = "schedule-db"
+database_id = "REPLACE_WITH_D1_ID"
+
+# Ежедневная очистка протухших записей (в KV TTL работал сам).
+[triggers]
+crons = ["23 4 * * *"]
