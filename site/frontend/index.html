@@ -12,6 +12,7 @@
       <div class="header-top">
         <h1>📅 Расписание</h1>
         <div style="display:flex;align-items:center;gap:8px;">
+          <span id="readerBadge" class="only-read-badge" style="display:none;">🔒 только чтение</span>
           <button id="syncBtn" class="icon-btn" title="Синхронизировать">🔄</button>
           <button id="settingsBtn" class="icon-btn" title="Настройки">⚙️</button>
         </div>
@@ -98,6 +99,28 @@
           <div class="tg-actions">
             <button id="tgSubscribe" class="save-btn">Привязать</button>
             <button id="tgUnsubscribe" class="btn-secondary">Отвязать</button>
+          </div>
+        </div>
+
+        <hr class="settings-divider">
+
+        <div id="inviteSection" class="invite-section" style="display:none;">
+          <h3>🔗 Ссылки-приглашения</h3>
+          <p class="invite-note">Ссылка даёт право редактировать расписание и ДЗ вашей группы. Чтобы стать владельцем (создавать и отзывать ссылки), откройте ссылку вида <code>…/?owner=&lt;код&gt;</code>, которую выдал администратор.</p>
+
+          <div id="inviteCreateBlock" class="invite-create-block">
+            <label>
+              Название ссылки (необязательно)
+              <input type="text" id="inviteLabelInput" placeholder="например: Группа 131-ИБо">
+            </label>
+            <button id="inviteCreateBtn" class="save-btn">Создать ссылку-приглашение</button>
+            <div id="inviteMsg" class="invite-msg hidden"></div>
+          </div>
+          <p id="inviteOwnerOnlyNote" class="invite-note" style="display:none;">Создавать ссылки может только владелец. Откройте ссылку вида <code>…/?owner=&lt;код&gt;</code>, чтобы получить права владельца.</p>
+
+          <div class="invite-list-wrap">
+            <h4>Активные ссылки</h4>
+            <div id="inviteList" class="invite-list"></div>
           </div>
         </div>
 

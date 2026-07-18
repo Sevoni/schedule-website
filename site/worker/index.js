@@ -26,27 +26,39 @@ export default {
         return await handleGetWeeks(request, env, corsHeaders);
       }
       if (path === '/api/upload' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleUpload(request, env, corsHeaders);
       }
       if (path === '/api/subjects' && method === 'GET') {
         return await handleGetSubjects(request, env, corsHeaders);
       }
       if (path === '/api/subjects' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handlePutSubjects(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'GET') {
         return await handleGetHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleAddHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'PUT') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleUpdateHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'DELETE') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleDeleteHw(request, env, corsHeaders);
       }
       if (path === '/api/hw/recalc' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleRecalcHw(request, env, corsHeaders);
       }
 
@@ -55,6 +67,8 @@ export default {
         return await handleCheckCampusUpdate(request, env, corsHeaders);
       }
       if (path === '/api/sync-from-campus' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleSyncFromCampus(request, env, corsHeaders);
       }
 
@@ -64,6 +78,31 @@ export default {
       }
       if (path === '/api/group/register' && method === 'POST') {
         return await handleGroupRegister(request, env, corsHeaders);
+      }
+
+      // ── Invite endpoints (writer/owner only) ────────────
+      if (path === '/api/invite/create' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
+        return await handleInviteCreate(request, env, corsHeaders);
+      }
+      if (path === '/api/invite/verify' && method === 'POST') {
+        return await handleInviteVerify(request, env, corsHeaders);
+      }
+      if (path === '/api/invite' && method === 'GET') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
+        return await handleInviteList(request, env, corsHeaders);
+      }
+      if (path === '/api/invite' && method === 'DELETE') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
+        return await handleInviteDelete(request, env, corsHeaders);
+      }
+      if (path === '/api/invite' && method === 'PUT') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
+        return await handleInviteRename(request, env, corsHeaders);
       }
 
       // ── Telegram bot endpoints ──────────────────────────
@@ -90,39 +129,84 @@ export default {
   },
 };
 
-// ── Auth: verify token ─────────────────────────────────────────
-// Token format: base64(JSON.stringify({group, ts})).sha256hex
-// We store passwords in KV as group-pwd:{group}
+// ── Auth: role-based resolution ─────────────────────────────────
+// Модель доступа:
+//   reader  — аноним, группа из query/body. Только GET.
+//   writer  — есть валидный token (inv:{token} в KV). POST/PUT/DELETE.
+//   owner   — token === env.OWNER_CODE. writer + управление приглашениями.
+//
+// Token'ы приглашений — случайные 32-символьные строки (crypto.randomUUID
+// без дефисов). Хранятся в KV: inv:{token} -> { group, createdAt, label? }.
+// Код владельца — секрет env.OWNER_CODE (через `wrangler secret put`).
 
-async function verifyAuth(request, env) {
-  if (!env.SCHEDULE) return 'KV not configured';
+const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
+
+// Возвращает { group, role: 'owner'|'writer' } или null.
+//   - Authorization: Bearer <token>:
+//     * token === env.OWNER_CODE → owner (group из query/body)
+//     * inv:{token} в KV → writer (group из записи)
+//     * иначе null
+//   - без заголовка → null (аноним = reader)
+async function resolveAuth(request, env) {
+  if (!env.SCHEDULE) return null;
 
   const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return 'Authorization required';
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+
+  const token = authHeader.slice(7).trim();
+  if (!token) return null;
+
+  // Owner: секретный код из env. Группу берём из query/body — за это
+  // отвечает вызывающий код.
+  if (env.OWNER_CODE && token === env.OWNER_CODE) {
+    return { role: 'owner', token };
   }
 
-  const token = authHeader.slice(7);
+  // Writer: ищем inv:{token} в KV.
   try {
-    const decoded = JSON.parse(atob(token));
-    const { group, ts } = decoded;
-
-    if (!group) return 'Invalid token';
-
-    // Token expires after 30 days
-    const age = Date.now() - ts;
-    if (age > 30 * 24 * 60 * 60 * 1000) {
-      return 'Token expired';
+    const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+    if (inv && inv.group) {
+      return { role: 'writer', token, group: inv.group };
     }
-
-    // Verify the group exists (has a password set)
-    const pwd = await env.SCHEDULE.get(`group-pwd:${group}`);
-    if (!pwd) return 'Group not registered';
-
-    return null; // OK
-  } catch {
-    return 'Invalid token';
+  } catch (e) {
+    console.log('resolveAuth inv-read failed:', e.message);
   }
+
+  return null;
+}
+
+// Извлекает группу для owner из query (GET/DELETE) или body (POST/PUT).
+// Для writer группа уже известна из resolveAuth.
+function groupFromAuth(auth, request) {
+  if (auth && auth.role === 'writer' && auth.group) return auth.group;
+  // owner / reader без группы в auth — берём из запроса
+  return null;
+}
+
+async function groupFromBodyOrQuery(request) {
+  try {
+    if (request.method === 'GET' || request.method === 'DELETE') {
+      const url = new URL(request.url);
+      return url.searchParams.get('group');
+    }
+    // clone, чтобы обработчик ниже тоже мог звать .json()
+    const clone = request.clone();
+    const body = await clone.json().catch(() => ({}));
+    return body.group || null;
+  } catch {
+    return null;
+  }
+}
+
+// Возвращает Response 403, если у запрошенного нет прав writer.
+// Иначе возвращает null + значение не используется. Группа берётся из auth
+// (writer) или из query/body (owner). Для reader — 403.
+async function requireWriter(request, env, corsHeaders) {
+  const auth = await resolveAuth(request, env);
+  if (!auth || (auth.role !== 'writer' && auth.role !== 'owner')) {
+    return jsonResponse({ error: 'Forbidden: writer access required' }, corsHeaders, 403);
+  }
+  return null; // ок
 }
 
 // ── POST /api/auth ─────────────────────────────────────────────
@@ -187,6 +271,204 @@ async function handleGroupRegister(request, env, corsHeaders) {
   // Auto-login: return token
   const token = btoa(JSON.stringify({ group, ts: Date.now() }));
   return jsonResponse({ ok: true, token, group }, corsHeaders);
+}
+
+// ── Приглашения ────────────────────────────────────────────────
+//
+// KV-ключи:
+//   inv:{token}         -> { group, createdAt, label? }, TTL 365d
+//   inv-by-group:{group} -> JSON [ { id, token, createdAt, label? }, ... ]
+//
+// id = первые 8 символов token (показываем пользователю как короткий id,
+// сам token для отзыва через UI не светим, но хранится внутри inv-by-group).
+
+// POST /api/invite/create
+// Body: { group, label? }. Требует writer/owner. Для owner — group из body.
+// Возвращает { link, id, token }.
+async function handleInviteCreate(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const auth = await resolveAuth(request, env);
+  // Создавать ссылки-приглашения может ТОЛЬКО владелец (owner).
+  // Writer (по ссылке-приглашению) создавать ссылки не может.
+  if (!auth || auth.role !== 'owner') {
+    return jsonResponse({ error: 'Forbidden: only owner can create invites' }, corsHeaders, 403);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  let group = body.group;
+
+  // owner может создавать приглашения для любой группы.
+  if (!group) {
+    return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
+  }
+
+  const label = (body.label || '').toString().slice(0, 100);
+  const token = crypto.randomUUID().replace(/-/g, '');
+  const id = token.slice(0, 8);
+  const createdAt = new Date().toISOString();
+
+  const invRecord = { group, createdAt };
+  if (label) invRecord.label = label;
+  await env.SCHEDULE.put(`inv:${token}`, JSON.stringify(invRecord), {
+    expirationTtl: INVITE_TTL,
+  });
+
+  // Добавляем в inv-by-group:{group}
+  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  listRaw.push({ id, token, createdAt, label: label || undefined });
+  await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+    expirationTtl: INVITE_TTL,
+  });
+
+  // Формируем ссылку. ORIGIN — origin текущего запроса (та же Workers-домена).
+  // При желании можно задать env.INVITE_ORIGIN для канонической ссылки.
+  const origin = env.INVITE_ORIGIN || new URL(request.url).origin;
+  const link = `${origin}/?token=${token}`;
+
+  return jsonResponse({ ok: true, link, id, token }, corsHeaders);
+}
+
+// POST /api/invite/verify
+// Body: { token }. Публичный (без auth). Возвращает { ok, group, token } либо 404.
+async function handleInviteVerify(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const token = (body.token || '').toString().trim();
+  if (!token) {
+    return jsonResponse({ error: 'Missing token' }, corsHeaders, 400);
+  }
+
+  const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+  if (!inv || !inv.group) {
+    return jsonResponse({ error: 'Invite not found or revoked' }, corsHeaders, 404);
+  }
+
+  return jsonResponse({ ok: true, group: inv.group, token }, corsHeaders);
+}
+
+// GET /api/invite?group=...
+// Только owner. Writer не имеет доступа к управлению ссылками.
+async function handleInviteList(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const auth = await resolveAuth(request, env);
+  if (!auth || auth.role !== 'owner') {
+    return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
+  }
+
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group');
+  if (!group) {
+    return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
+  }
+
+  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  // Не светим токены наружу — только id/created/label.
+  const items = listRaw.map(({ id, createdAt, label }) => ({
+    id,
+    createdAt,
+    ...(label ? { label } : {},
+  )}));
+  return jsonResponse({ ok: true, items }, corsHeaders);
+}
+
+// DELETE /api/invite?id=...&group=...
+// Только owner. Удаляет inv:{token} (поиск по id в inv-by-group) и
+// чистит список. Id = первые 8 символов token.
+async function handleInviteDelete(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const auth = await resolveAuth(request, env);
+  if (!auth || auth.role !== 'owner') {
+    return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
+  }
+
+  const url = new URL(request.url);
+  const id = (url.searchParams.get('id') || '').toString().trim();
+  const group = url.searchParams.get('group');
+  if (!id || !group) {
+    return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
+  }
+
+  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const item = listRaw.find(it => it.id === id);
+  if (!item) {
+    return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
+  }
+
+  // Удаляем токен
+  await env.SCHEDULE.delete(`inv:${item.token}`);
+
+  // Чистим список
+  const filtered = listRaw.filter(it => it.id !== id);
+  if (filtered.length) {
+    await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(filtered), {
+      expirationTtl: INVITE_TTL,
+    });
+  } else {
+    await env.SCHEDULE.delete(`inv-by-group:${group}`);
+  }
+
+  return jsonResponse({ ok: true }, corsHeaders);
+}
+
+// PUT /api/invite
+// Body: { id, group, label }. Требует writer/owner. Обновляет название
+// (label) ссылки: в inv-by-group:{group} и в inv:{token}. Пустая строка
+// label = сброс названия.
+async function handleInviteRename(request, env, corsHeaders) {
+  if (!env.SCHEDULE) {
+    return jsonResponse({ error: 'KV not configured' }, corsHeaders, 500);
+  }
+
+  const auth = await resolveAuth(request, env);
+  if (!auth || auth.role !== 'owner') {
+    return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const id = (body.id || '').toString().trim();
+  const group = body.group;
+  if (!id || !group) {
+    return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
+  }
+
+  const listRaw = await env.SCHEDULE.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+  const idx = listRaw.findIndex(it => it.id === id);
+  if (idx === -1) {
+    return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
+  }
+
+  const newLabel = (body.label || '').toString().slice(0, 100).trim();
+  listRaw[idx].label = newLabel || undefined;
+  await env.SCHEDULE.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+    expirationTtl: INVITE_TTL,
+  });
+
+  // Синхронизируем label в inv:{token} (для консистентности).
+  const token = listRaw[idx].token;
+  if (token) {
+    const inv = await env.SCHEDULE.get(`inv:${token}`, { type: 'json' });
+    if (inv) {
+      if (newLabel) inv.label = newLabel;
+      else delete inv.label;
+      await env.SCHEDULE.put(`inv:${token}`, JSON.stringify(inv), {
+        expirationTtl: INVITE_TTL,
+      });
+    }
+  }
+
+  return jsonResponse({ ok: true, id, label: newLabel || '' }, corsHeaders);
 }
 
 // ── SHA-256 hash helper ────────────────────────────────────────

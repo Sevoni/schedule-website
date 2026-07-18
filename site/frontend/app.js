@@ -21,6 +21,13 @@ let state = {
   campusUpdatedAt: localStorage.getItem('campusUpdatedAt') || '',
   tgChatId: localStorage.getItem('tgChatId') || '',
   tgBotUsername: localStorage.getItem('tgBotUsername') || '',
+  // writerToken — токен ссылки-приглашения (writer) или OWNER_CODE (owner).
+  // Сохраняется в localStorage, чтобы не вводить ссылку каждый раз.
+  // isWriter = !!writerToken.
+  writerToken: localStorage.getItem('writerToken') || '',
+  // ownerCode — вводится в настройках. Если совпадает с env.OWNER_CODE, пользователь owner.
+  // Хранится отдельно, чтобы можно было «стать владельцем» без перезаписи writerToken.
+  ownerRole: localStorage.getItem('ownerRole') === '1',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -29,6 +36,16 @@ let state = {
   homework: [],
   syncing: false,
 };
+
+// isWriter — true, если у пользователя есть token для записи (writer/owner).
+// Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
+// всё равно проверяет бэкенд (requireWriter) — фронтенд здесь не критичен.
+function isWriter() {
+  return !!state.writerToken;
+}
+function isOwner() {
+  return isWriter() && state.ownerRole;
+}
 
 let editingHwId = null;
 
@@ -72,14 +89,164 @@ function getCurrentWeekSchedule() {
   return null;
 }
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   setupSettingsModal();
   setupHomeworkModal();
   setupTgSection();
+  setupInviteSection();
 
-  document.getElementById('syncBtn').onclick = () => syncAll();
+  // Если в URL есть ?token=... — это переход по ссылке-приглашению.
+  // Валидируем через бэкенд, при успехе сохраняем токен как writerToken.
+  await consumeInviteTokenFromUrl();
+
+  // Если в URL есть ?owner=<code> — сразу пробуем стать владельцем
+  // (альтернатива ручному вводу кода в настройках).
+  await consumeOwnerCodeFromUrl();
+
+  document.getElementById('syncBtn').onclick = () => {
+    if (!isWriter()) {
+      showToast('Только просмотр. Введите ссылку-приглашение в настройках, чтобы редактировать.', 'warn');
+      return;
+    }
+    syncAll();
+  };
+
   loadData();
+  refreshEditVisibility();
 });
+
+// Проверяет ?token= в URL, валидирует, сохраняет writerToken, чистит URL.
+async function consumeInviteTokenFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token');
+  if (!token) return;
+
+  try {
+    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    const data = await resp.json();
+    if (resp.ok && data.ok && data.group) {
+      // Сохраняем токен writer'а (он же используется как Bearer).
+      state.writerToken = data.token;
+      state.ownerRole = false;
+      localStorage.setItem('writerToken', data.token);
+      localStorage.setItem('ownerRole', '0');
+
+      // Подставляем группу из приглашения. Так пользователь сразу попадёт
+      // на ту группу, к которой его пригласили.
+      state.group = data.group;
+      localStorage.setItem('group', data.group);
+
+      showToast('Доступ на редактирование получен (' + data.group + ')', 'ok');
+    } else {
+      showToast('Ссылка-приглашение недействительна или отозвана', 'warn');
+    }
+  } catch (e) {
+    showToast('Не удалось проверить ссылку: ' + e.message, 'warn');
+  }
+
+  // Чистим URL, чтобы токен не висел в地址ной строке и не шарился.
+  history.replaceState(null, '', location.pathname);
+}
+
+// Проверяет ?owner=<code> в URL, валидирует через бэкенд, сохраняет как
+// owner-токен. Чистит URL. Возвращает true, если успешно стали owner.
+async function consumeOwnerCodeFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const code = (params.get('owner') || '').trim();
+  if (!code) return false;
+
+  const ok = await becomeOwner(code, { silent: false });
+  // Чистим URL в любом случае (успех или нет — код не должен висеть в строке).
+  history.replaceState(null, '', location.pathname);
+  return ok;
+}
+
+// Стать владельцем: пробует создать ссылку с Bearer = code. Бэкенд вернёт
+// ok, если code === env.OWNER_CODE (owner), иначе 403. При успехе сохраняем
+// code как writerToken + ownerRole=true. Возвращает Promise<boolean>.
+// Опционально показывает toast (silent=false) — для авто-claim из ссылки.
+async function becomeOwner(code, opts = {}) {
+  const silent = opts.silent !== false; // по умолчанию показываем toast
+  if (!code) return false;
+  try {
+    const resp = await fetch(state.apiBase + '/api/invite/create', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + code,
+      },
+      body: JSON.stringify({ group: state.group }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.ok) {
+      state.writerToken = code;
+      state.ownerRole = true;
+      localStorage.setItem('writerToken', code);
+      localStorage.setItem('ownerRole', '1');
+      const section = document.getElementById('inviteSection');
+      if (section) section.classList.add('is-owner');
+      // Ссылку owner создаёт сам через кнопку «Создать ссылку-приглашение» —
+      // здесь только сохраняем права, авто-создания не делаем.
+      showToast('Права владельца активированы', 'ok');
+      refreshEditVisibility();
+      if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
+      return true;
+    } else {
+      if (!silent) showToast('Неверный код владельца', 'warn');
+      return false;
+    }
+  } catch (e) {
+    if (!silent) showToast('Ошибка активации владельца: ' + e.message, 'warn');
+    return false;
+  }
+}
+
+// UI-гейтинг: показываем/прятаем элементы редактирования в зависимости от isWriter.
+// Вызывается после загрузки и при изменении writerToken.
+function refreshEditVisibility() {
+  const writer = isWriter();
+  // Кнопка «+ Добавить» в разделе ДЗ.
+  const addBtn = document.getElementById('addHomeworkBtn');
+  if (addBtn) addBtn.style.display = writer ? '' : 'none';
+
+  // Кнопка 🔄 синхронизации: для reader — прячем, вместо неё бейдж «только чтение».
+  const syncBtn = document.getElementById('syncBtn');
+  const readBadge = document.getElementById('readerBadge');
+  if (syncBtn) syncBtn.style.display = writer ? '' : 'none';
+  if (readBadge) readBadge.style.display = writer ? 'none' : '';
+
+  // Подпись «(только чтение)» в шапке.
+  updateGroupHeaderBadge();
+
+  // Перерисовка списка ДЗ (там есть кнопки ✓/✎) — скроются через render.
+  if (state.homework && state.homework.length) renderHomework();
+}
+
+// Дописывает к имени группы бейдж «(только чтение)» или «(редактирование)».
+function updateGroupHeaderBadge() {
+  const nameEl = document.getElementById('groupName');
+  if (!nameEl) return;
+  // Имя оставляем как есть — applyScheduleHeader его перезаписывает. Поэтому
+  // бейдж держим отдельным span и управляем только им.
+  let badge = document.getElementById('groupAccessBadge');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.id = 'groupAccessBadge';
+    badge.className = 'group-access-badge';
+    nameEl.parentNode.insertBefore(badge, nameEl.nextSibling);
+  }
+  if (isWriter()) {
+    badge.textContent = isOwner() ? '· владелец' : '· редактор';
+    badge.className = 'group-access-badge badge-writer';
+  } else {
+    badge.textContent = '· только чтение';
+    badge.className = 'group-access-badge badge-reader';
+  }
+}
 
 // ── Main data loading ─────────────────────────────────────────
 //
@@ -877,24 +1044,49 @@ function parseScheduleHTML(html) {
 
 // ── API helpers ───────────────────────────────────────────────
 
+// Если сервер вернул 403 при наличии writer-токена — токен стал
+// невалиден (ссылка отозвана / неверный). Сбрасываем права и
+// переключаем UI в режим «только чтение».
+function invalidateWriterAccess(reason) {
+  if (!state.writerToken) return;
+  state.writerToken = '';
+  state.ownerRole = false;
+  localStorage.removeItem('writerToken');
+  localStorage.removeItem('ownerRole');
+  refreshEditVisibility();
+  const section = document.getElementById('inviteSection');
+  if (section) section.style.display = 'none';
+  showToast(reason || 'Права на редактирование отозваны', 'warn');
+}
+
 async function apiFetch(path, params = {}) {
   const url = new URL(state.apiBase + path);
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
   }
-  const resp = await fetch(url.toString());
-  if (!resp.ok) throw new Error('API ' + resp.status);
+  const headers = {};
+  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const resp = await fetch(url.toString(), { headers });
+  if (!resp.ok) {
+    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    throw new Error('API ' + resp.status);
+  }
   return resp.json();
 }
 
 async function apiPost(path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
   const resp = await fetch(state.apiBase + path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
   const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || 'API ' + resp.status);
+  if (!resp.ok) {
+    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    throw new Error(data.error || 'API ' + resp.status);
+  }
   return data;
 }
 
@@ -903,20 +1095,30 @@ async function apiDelete(path, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
   }
-  const resp = await fetch(url.toString(), { method: 'DELETE' });
+  const headers = {};
+  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const resp = await fetch(url.toString(), { method: 'DELETE', headers });
   const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || 'API ' + resp.status);
+  if (!resp.ok) {
+    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    throw new Error(data.error || 'API ' + resp.status);
+  }
   return data;
 }
 
 async function apiPut(path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
   const resp = await fetch(state.apiBase + path, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
   const data = await resp.json();
-  if (!resp.ok) throw new Error(data.error || 'API ' + resp.status);
+  if (!resp.ok) {
+    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    throw new Error(data.error || 'API ' + resp.status);
+  }
   return data;
 }
 
@@ -2449,10 +2651,10 @@ function renderHomework() {
            ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
            ${authorHtml}
          </div>
-        <div class="hw-actions">
+        ${isWriter() ? `<div class="hw-actions">
           <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным">✓</button>
           <button class="hw-edit" data-id="${hw.id}" title="Редактировать">✎</button>
-        </div>
+        </div>` : ''}
       </div>`;
    }).join('');
 
@@ -2554,6 +2756,179 @@ function setupTgSection() {
   };
 }
 
+// ── Invite links UI (writer/owner) ────────────────────────────
+// Видно только когда isWriter(). Содержит:
+//  - кнопку «Создать ссылку-приглашение» (writer и owner)
+//  - список активных ссылок с кнопками «Отозвать»
+// Права владельца (owner) получают ТОЛЬКО через ссылку ?owner=<code>
+// (см. becomeOwner / consumeOwnerCodeFromUrl), ручного ввода в настройках нет.
+
+function setupInviteSection() {
+  const section = document.getElementById('inviteSection');
+  if (!section) return;
+
+  const createBtn = document.getElementById('inviteCreateBtn');
+  const inviteLabelInput = document.getElementById('inviteLabelInput');
+  const inviteMsg = document.getElementById('inviteMsg');
+  const listEl = document.getElementById('inviteList');
+
+  // ── Создать ссылку-приглашение ──
+  function showInviteLink(link) {
+    inviteMsg.innerHTML = '✅ Ссылка готова: <a href="' + escHtml(link) + '" target="_blank" rel="noopener">' + escHtml(link) + '</a> ' +
+      '<button id="copyInviteBtn" class="btn-secondary">Копировать</button>';
+    inviteMsg.className = 'invite-msg tg-ok';
+    const cp = document.getElementById('copyInviteBtn');
+    if (cp) cp.onclick = () => copyToClipboard(link, 'Ссылка скопирована');
+  }
+
+  if (createBtn) createBtn.onclick = async () => {
+    if (!isOwner()) {
+      showToast('Создавать ссылки может только владелец', 'warn');
+      return;
+    }
+    createBtn.disabled = true;
+    try {
+      const label = (inviteLabelInput.value || '').trim();
+      const resp = await apiPost('/api/invite/create', { group: state.group, label });
+      showInviteLink(resp.link);
+      inviteLabelInput.value = '';
+      if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
+    } catch (e) {
+      inviteMsg.textContent = 'Ошибка: ' + (e.message || 'не удалось создать ссылку');
+      inviteMsg.className = 'invite-msg tg-warn';
+    } finally {
+      createBtn.disabled = false;
+    }
+  };
+
+  // ── Загрузить список ссылок ──
+  async function loadInvites() {
+    if (!isWriter()) { listEl.innerHTML = '<div class="no-homework">Нет доступа</div>'; return; }
+    try {
+      const data = await apiFetch('/api/invite', { group: state.group });
+      if (!data.items || data.items.length === 0) {
+        listEl.innerHTML = '<div class="no-homework">Нет активных ссылок</div>';
+        return;
+      }
+      listEl.innerHTML = data.items.map(it => {
+        const created = it.createdAt ? formatDateTime(it.createdAt) : '';
+        const label = it.label ? escHtml(it.label) : '';
+        return `
+          <div class="invite-item" data-id="${escHtml(it.id)}">
+            <div class="invite-meta">
+              <span class="invite-id">#${escHtml(it.id)}</span>
+              <span class="invite-label-text">${label || '<i>без названия</i>'}</span>
+              <span class="invite-date">${created}</span>
+            </div>
+            <div class="invite-actions">
+              <button class="rename-btn" data-id="${escHtml(it.id)}" title="Переименовать">✎</button>
+              <button class="revoke-btn" data-id="${escHtml(it.id)}" title="Отозвать">Отозвать</button>
+            </div>
+            <div class="rename-wrap hidden" data-id="${escHtml(it.id)}">
+              <input type="text" class="rename-input" placeholder="Новое название" value="${label}">
+              <button class="save-rename-btn btn-secondary" data-id="${escHtml(it.id)}">Сохранить</button>
+              <button class="cancel-rename-btn btn-secondary" data-id="${escHtml(it.id)}">Отмена</button>
+            </div>
+          </div>`;
+      }).join('');
+
+      // Отозвать
+      listEl.querySelectorAll('.revoke-btn').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.id;
+          btn.disabled = true;
+          try {
+            await apiDelete('/api/invite', { id, group: state.group });
+            showToast('Ссылка отозвана', 'ok');
+            if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
+          } catch (e) {
+            inviteMsg.textContent = 'Ошибка отзыва: ' + (e.message || 'не удалось отозвать');
+            inviteMsg.className = 'invite-msg tg-warn';
+            btn.disabled = false;
+          }
+        };
+      });
+
+      // Переименовать — показать inline-поле
+      listEl.querySelectorAll('.rename-btn').forEach(btn => {
+        btn.onclick = () => {
+          const id = btn.dataset.id;
+          const row = listEl.querySelector(`.invite-item[data-id="${cssEscape(id)}"]`);
+          if (!row) return;
+          row.querySelector('.invite-meta').style.display = 'none';
+          row.querySelector('.invite-actions').style.display = 'none';
+          const wrap = row.querySelector(`.rename-wrap[data-id="${cssEscape(id)}"]`);
+          wrap.classList.remove('hidden');
+          wrap.querySelector('.rename-input').focus();
+        };
+      });
+
+      // Отмена переименования
+      listEl.querySelectorAll('.cancel-rename-btn').forEach(btn => {
+        btn.onclick = () => {
+          const id = btn.dataset.id;
+          const row = listEl.querySelector(`.invite-item[data-id="${cssEscape(id)}"]`);
+          if (!row) return;
+          row.querySelector('.invite-meta').style.display = '';
+          row.querySelector('.invite-actions').style.display = '';
+          row.querySelector(`.rename-wrap[data-id="${cssEscape(id)}"]`).classList.add('hidden');
+        };
+      });
+
+      // Сохранить переименование
+      listEl.querySelectorAll('.save-rename-btn').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.id;
+          const row = listEl.querySelector(`.invite-item[data-id="${cssEscape(id)}"]`);
+          if (!row) return;
+          const newLabel = row.querySelector('.rename-input').value.trim();
+          btn.disabled = true;
+          try {
+            await apiPut('/api/invite', { id, group: state.group, label: newLabel });
+            showToast('Название обновлено', 'ok');
+            if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
+          } catch (e) {
+            inviteMsg.textContent = 'Ошибка переименования: ' + (e.message || 'не удалось переименовать');
+            inviteMsg.className = 'invite-msg tg-warn';
+            btn.disabled = false;
+          }
+        };
+      });
+    } catch (e) {
+      listEl.innerHTML = '<div class="no-homework">Ошибка загрузки: ' + escHtml(e.message) + '</div>';
+    }
+  }
+
+  // Экспортируем для вызова извне (refresh при открытии настроек).
+  setupInviteSection._loadInvites = loadInvites;
+  setupInviteSection._refresh = () => {
+    // Секция приглашений доступна ТОЛЬКО владельцу (owner).
+    // Writer вообще не взаимодействует со ссылками — только редактирует
+    // расписание и ДЗ. Поэтому для writer/reader секция скрыта.
+    section.style.display = isOwner() ? '' : 'none';
+    section.classList.toggle('is-owner', isOwner());
+    if (isOwner()) loadInvites();
+  };
+}
+
+// ── Копирование в буфер обмена (с fallback) ───────────────────
+function copyToClipboard(text, okMsg) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => { if (okMsg) showToast(okMsg, 'ok'); },
+      () => showToast('Не удалось скопировать: ' + text, 'warn')
+    );
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); if (okMsg) showToast(okMsg, 'ok'); }
+    catch (e) { showToast('Не удалось скопировать', 'warn'); }
+    document.body.removeChild(ta);
+  }
+}
+
 function setupSettingsModal() {
   const modal = document.getElementById('settingsModal');
   let syncMetaLoaded = false;
@@ -2567,6 +2942,9 @@ function setupSettingsModal() {
     document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
     document.getElementById('tgChatIdInput').value = state.tgChatId || '';
     modal.classList.remove('hidden');
+
+    // Обновляем видимость секции приглашений под текущего пользователя.
+    if (setupInviteSection._refresh) setupInviteSection._refresh();
 
     // Обновляем статус привязки под текущую группу.
     const statusEl = document.getElementById('tgStatus');
@@ -2629,6 +3007,19 @@ function setupSettingsModal() {
     localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
     localStorage.setItem('subgroupFilter', state.subgroupFilter);
     modal.classList.add('hidden');
+
+    // Смена группы должна перепроверить права: приглашение привязано к
+    // конкретной группе, поэтому writerToken может перестать быть валидным.
+    // Сбрасываем writer-статус при смене группы — пользователь переходит по
+    // ссылке заново (или вводит owner-код). Это безопаснее, чем оставлять
+    // токен чужой группы.
+    if (groupChanged) {
+      state.writerToken = '';
+      state.ownerRole = false;
+      localStorage.removeItem('writerToken');
+      localStorage.removeItem('ownerRole');
+      refreshEditVisibility();
+    }
 
     // Если сменилась только подгруппа — перерисовываем локально,
     // без лишних запросов к сети/кампусу. Иначе — полная перезагрузка.
@@ -2696,6 +3087,12 @@ function escHtml(str) {
   const d = document.createElement('div');
   d.textContent = str || '';
   return d.innerHTML;
+}
+
+// Экранирует строку для безопасного использования в CSS-селекторе [data-id="..."].
+// id ссылок — hex (первые 8 символов uuid), но на всякий случай экранируем.
+function cssEscape(str) {
+  return String(str).replace(/["\\]/g, '\\$&');
 }
 
 function formatDateTime(iso) {

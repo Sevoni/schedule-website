@@ -1072,3 +1072,151 @@ header {
 }
 .toast.toast-error { border-color: var(--orange); }
 .toast.toast-ok { border-color: var(--green); }
+
+/* ── Access badges ──────────────────────────────────────── */
+.only-read-badge {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+
+.group-access-badge {
+  font-size: 0.78rem;
+  margin-left: 8px;
+  font-weight: 500;
+}
+.group-access-badge.badge-reader { color: var(--text-dim); }
+.group-access-badge.badge-writer { color: var(--green); }
+
+/* ── Invite section (settings modal) ───────────────────── */
+.invite-section h3 {
+  font-size: 1rem;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.invite-section h4 {
+  font-size: 0.88rem;
+  margin: 14px 0 8px;
+  color: var(--text-dim);
+}
+.invite-note {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+.owner-block {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.invite-create-block {
+  margin-bottom: 8px;
+}
+.invite-msg {
+  font-size: 0.82rem;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  word-break: break-all;
+}
+.invite-msg.tg-ok { color: var(--green); border-color: var(--green); }
+.invite-msg.tg-warn { color: var(--orange); border-color: var(--orange); }
+.invite-msg a { color: var(--accent); }
+
+.invite-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.invite-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.invite-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  min-width: 0;
+}
+.invite-id {
+  font-family: monospace;
+  color: var(--accent);
+  font-weight: 600;
+}
+.invite-label {
+  color: var(--text);
+}
+.invite-date {
+  color: var(--text-dim);
+  font-size: 0.76rem;
+}
+.revoke-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--danger);
+  background: none;
+  color: var(--danger);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.revoke-btn:hover {
+  background: var(--danger);
+  color: #fff;
+}
+.revoke-btn:disabled { opacity: 0.5; cursor: default; }
+
+.invite-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.rename-btn {
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.rename-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.invite-label-text {
+  color: var(--text);
+}
+.invite-label-text i { color: var(--text-dim); }
+.rename-wrap {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.rename-wrap.hidden { display: none; }
+.rename-wrap .rename-input {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.rename-wrap .btn-secondary {
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}

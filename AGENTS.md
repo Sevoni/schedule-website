@@ -31,10 +31,19 @@ No install step needed — only `wrangler` is a devDependency.
 
 ## Architecture
 
+- **Architecture**
 - **Worker** (`site/worker/index.js`): single-file Cloudflare Worker, ~930 lines. Handles schedule CRUD, homework CRUD, subjects aggregation, KV storage.
-- **KV namespace** `SCHEDULE`: stores schedule data, weeks, homework, subjects, group passwords.
+- **KV namespace** `SCHEDULE`: stores schedule data, weeks, homework, subjects, group passwords, invite tokens.
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
-- **Auth**: token scheme defined (`btoa(JSON.stringify({group, ts}))`, SHA-256 passwords) but **NOT enforced** — `verifyAuth()` exists but is never called. All endpoints are public.
+- **Auth (role-based access)**: `resolveAuth(request, env)` reads `Authorization: Bearer <token>`:
+  - no header → **reader** (anonymous; group from query/body). GET only.
+  - token ∈ KV `inv:{token}` → **writer** (group from the invite record). POST/PUT/DELETE.
+  - token === `env.OWNER_CODE` → **owner** (writer + invite management for any group).
+  - All write endpoints (`/api/upload`, `/api/subjects`, `/api/hw`, `/api/hw/recalc`, `/api/sync-from-campus`, `/api/invite/create`, `DELETE /api/invite`) are wrapped with `requireWriter()` → 403 for reader.
+  - `INVITE_ORIGIN` (var, optional) — canonical origin for invite links.
+  - **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` on load (`consumeOwnerCodeFromUrl` → `becomeOwner()`), auto-claims owner role. Manual entry field (`ownerCodeInput` in settings) also supported.
+  - **Invite link**: frontend reads `?token=<invToken>` on load (`consumeInviteTokenFromUrl`), validates via `/api/invite/verify`, saves as writer token.
+- **Old token scheme** (`verifyAuth`, `btoa({group,ts})`, `group-pwd`) remains for backwards compat but is unused; first link must be created via OWNER_CODE.
 - **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
 
 ## KV key patterns
@@ -49,6 +58,8 @@ No install step needed — only `wrangler` is a devDependency.
 | `subjects:{group}:{semester}` | 365d | Aggregated subjects for semester |
 | `subjects-week:{group}:{semester}:{weekCode}` | 365d | Per-week subject snapshots |
 | `campus-updated:{group}` | 7d | Campus update timestamp string |
+| `inv:{token}` | 365d | Invite record `{ group, createdAt, label? }` |
+| `inv-by-group:{group}` | 365d | Array of `{ id, token, createdAt, label? }[]` for list/revoke |
 | `schedule:{group}:current` | — | Legacy key, deleted during cleanup (not written) |
 
 ## API endpoints
@@ -70,6 +81,10 @@ No install step needed — only `wrangler` is a devDependency.
 | POST | `/api/sync-from-campus` | Full sync: save + update subjects + recalc HW |
 | POST | `/api/auth` | Login (group + password → token) |
 | POST | `/api/group/register` | Register new group with password |
+| POST | `/api/invite/create` | Create invite link (writer/owner) |
+| POST | `/api/invite/verify` | Verify invite token → group (public) |
+| GET | `/api/invite?group=` | List group invites (writer/owner) |
+| DELETE | `/api/invite?id=&group=` | Revoke invite by id (writer/owner) |
 
 ## Data model
 
