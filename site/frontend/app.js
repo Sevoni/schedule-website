@@ -314,19 +314,18 @@ async function loadInitialSchedules() {
   const content = document.getElementById('scheduleContent');
   content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
 
-  // 1) Из БД параллельно по всем стартовым неделям
-  const dbResults = await Promise.all(
-    indices.map(async (i) => {
-      try {
-        const data = await apiFetch('/api/schedule', { group: state.group, week: state.weeks[i].value });
-        return { idx: i, data };
-      } catch (e) {
-        return { idx: i, data: null };
-      }
-    })
-  );
-
-  for (const r of dbResults) if (r.data) { state.scheduleCache[state.weeks[r.idx].value] = r.data; }
+  // 1) Из БД одним агрегирующим запросом по всем стартовым неделям
+  //    (вместо N параллельных /api/schedule, чтобы сэкономить HTTP-RTT
+  //    при открытии без VPN). Возвращает { [weekCode]: data }.
+  try {
+    const weeksParam = indices.map((i) => state.weeks[i].value).join(',');
+    const dbMap = await apiFetch('/api/schedules', { group: state.group, weeks: weeksParam });
+    for (const w of state.weeks) {
+      if (dbMap[w.value]) state.scheduleCache[w.value] = dbMap[w.value];
+    }
+  } catch (e) {
+    console.warn('[loadInitial] /api/schedules failed:', e.message);
+  }
 
   // 2) Отрисовываем из кэша/БД сразу, НЕ дожидаясь кампуса.
   //    Текущая неделя, иначе любая другая из стартового диапазона.
@@ -452,10 +451,30 @@ async function loadSchedule(targetIdx) {
   state.currentWeekIdx = targetIdx;
 
   const w = state.weeks[targetIdx];
+
+  // 1) Сначала смотрим в кэш (недели, загруженные при открытии / прошлых
+  //    перелистываниях). Если есть — рисуем мгновенно, БЕЗ спиннера и БЕЗ
+  //    лишнего запроса к БД. Фоновая подгрузка вперёд — только если нужно.
+  const cached = state.scheduleCache[w.value];
+  if (cached) {
+    state.schedule = cached;
+    applyScheduleHeader();
+    renderDayTabs();
+
+    const cur = findRealCurrentIdx();
+    const distance = targetIdx - cur;
+
+    // Вперёд дальше +2 от текущей → фоне тянем из кампуса и обновляем БД при изменениях
+    if (distance > 2 && state.campusEnabled) {
+      backgroundSyncSingle(targetIdx, cached);
+    }
+    return;
+  }
+
   const content = document.getElementById('scheduleContent');
   content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
 
-  // 1) Из БД
+  // 2) Нет в кэше → из БД
   let dbData = null;
   try {
     dbData = await apiFetch('/api/schedule', { group: state.group, week: w.value });

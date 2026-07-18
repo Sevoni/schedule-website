@@ -121,14 +121,11 @@ async function del(db, logger, key) {
   });
 }
 
-// list({ prefix }) — возвращает { keys: [{ name, value? }] } как KV.
+// list({ prefix }) — возвращает { keys: [{ name }] } как KV.
 // value не возвращаем (как у KV list), вызывающие делают отдельный get.
-// KV list не поддерживает pagination-токены в этом проекте, поэтому
-// возвращаем все ключи разом.
 async function list(db, logger, opts = {}) {
   const prefix = opts.prefix || '';
   return logger.wrap('list', prefix || '*', async () => {
-    // Экранируем спецсимволы LIKE: % и _ и \.
     const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
     const rows = await db
       .prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key`)
@@ -136,6 +133,60 @@ async function list(db, logger, opts = {}) {
       .all();
     const keys = (rows.results || []).map((r) => ({ name: r.key }));
     return { keys };
+  });
+}
+
+// listValues({ prefix }) — возвращает { entries: [{ key, value }] } сразу
+// с данными. Заменяет паттерн list()+N*get() (N+1 запросов) одним SELECT.
+// value парсится как JSON при opts.type === 'json', иначе строка.
+async function listValues(db, logger, opts = {}) {
+  const prefix = opts.prefix || '';
+  return logger.wrap('list', prefix || '*', async () => {
+    const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const rows = await db
+      .prepare(`SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\' AND (expires_at IS NULL OR expires_at > ?) ORDER BY key`)
+      .bind(escaped + '%', nowMs())
+      .all();
+    const entries = (rows.results || []).map((r) => {
+      let value = r.value;
+      if (opts.type === 'json') {
+        try { value = JSON.parse(r.value); } catch { value = null; }
+      }
+      return { key: r.key, value };
+    });
+    return { entries };
+  });
+}
+
+// getMany(keys, { type }) — читает сразу несколько ключей одним
+// SELECT ... WHERE key IN (...) запросом. Возвращает { entries: [{ key, value }] }.
+// Используется агрегатором /api/schedules, чтобы убрать N параллельных get().
+async function getMany(db, logger, keys, opts = {}) {
+  if (!keys || keys.length === 0) return { entries: [] };
+  return logger.wrap('get', `many(${keys.length})`, async () => {
+    const placeholders = keys.map(() => '?').join(',');
+    const rows = await db
+      .prepare(`SELECT key, value FROM kv WHERE key IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?)`)
+      .bind(...keys, nowMs())
+      .all();
+    const entries = (rows.results || []).map((r) => {
+      let value = r.value;
+      if (opts.type === 'json') {
+        try { value = JSON.parse(r.value); } catch { value = null; }
+      }
+      return { key: r.key, value };
+    });
+    return { entries };
+  });
+}
+
+// batch(operations) — пакетная запись/чтение через D1 db.batch().
+// operations: массив подготовленных stmt (db.prepare(...).bind(...)).
+// Возвращает результаты. Используется для замены цикла из N put().
+async function batch(db, logger, operations) {
+  if (!operations || operations.length === 0) return [];
+  return logger.wrap('put', `batch(${operations.length})`, async () => {
+    return await db.batch(operations);
   });
 }
 
@@ -167,6 +218,9 @@ function createStore(env) {
     put: (key, value, opts) => put(db, logger, key, value, opts),
     delete: (key) => del(db, logger, key),
     list: (opts) => list(db, logger, opts),
+    listValues: (opts) => listValues(db, logger, opts),
+    getMany: (keys, opts) => getMany(db, logger, keys, opts),
+    batch: (operations) => batch(db, logger, operations),
     cleanupExpired: () => cleanupExpired(db, logger),
   };
 }

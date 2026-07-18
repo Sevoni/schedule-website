@@ -1,7 +1,11 @@
 import { createStore, setRequestLogger } from './store.js';
 
+// Текущий request context (для ctx.waitUntil фоновых уведомлений).
+// Устанавливается в начале fetch и используется в notifyGroupBg.
+let currentCtx = null;
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, context) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -20,6 +24,11 @@ export default {
     const store = createStore(env);
     setRequestLogger(store._logger);
 
+    // context.waitUntil позволяет дать фоновым задачам (Telegram-уведомления)
+    // дойти до конца ПОСЛЕ отправки ответа клиенту — не блокируя его, но и не
+    // убивая висящий fetch при завершении handler'а.
+    currentCtx = context;
+
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
@@ -30,6 +39,9 @@ export default {
       }
       if (path === '/api/weeks' && method === 'GET') {
         return await handleGetWeeks(request, env, corsHeaders);
+      }
+      if (path === '/api/schedules' && method === 'GET') {
+        return await handleGetSchedules(request, env, corsHeaders);
       }
       if (path === '/api/upload' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -133,6 +145,8 @@ export default {
     } catch (e) {
       store._logger.flush(`${method} ${path} (error)`);
       return jsonResponse({ error: e.message }, corsHeaders, 500);
+    } finally {
+      currentCtx = null;
     }
   },
 
@@ -545,6 +559,40 @@ async function handleGetWeeks(request, env, corsHeaders) {
   return jsonResponse({ error: 'No weeks data' }, corsHeaders, 404);
 }
 
+// ── GET /api/schedules?group=...&weeks=w1,w2,w3 ───────────────
+// Агрегатор: возвращает сразу несколько недель одним SELECT ... IN (...).
+// Возвращает { [weekCode]: data }. Заменяет N параллельных /api/schedule
+// (каждый со своим HTTP-RTT) одним запросом — критично для открытия без VPN.
+
+async function handleGetSchedules(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const weeksParam = url.searchParams.get('weeks') || '';
+  const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
+
+  if (weeks.length === 0) {
+    return jsonResponse({ error: 'Missing weeks parameter' }, corsHeaders, 400);
+  }
+
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  const keys = weeks.map((w) => `schedule:${group}:${w}`);
+  const { entries } = await store.getMany(keys, { type: 'json' });
+
+  const result = {};
+  for (const e of entries) {
+    if (e.value == null) continue;
+    // e.key === `schedule:{group}:{week}` → вырезаем weekCode
+    const weekCode = e.key.slice(`schedule:${group}:`.length);
+    result[weekCode] = e.value;
+  }
+
+  return jsonResponse(result, corsHeaders);
+}
+
 // ── POST /api/sync ─────────────────────────────────────────────
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
@@ -598,6 +646,7 @@ async function handleUpload(request, env, corsHeaders) {
 
     const updated = [];
     const validWeekCodes = [];
+    const subjectStmts = [];
 
     for (const { weekCode, data } of schedules) {
       if (!weekCode || !data) continue;
@@ -611,12 +660,23 @@ async function handleUpload(request, env, corsHeaders) {
         await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
         updated.push(weekCode);
 
-          // Инкрементально обновим список предметов этой недели
+          // Инкрементально обновим список предметов этой недели (собираем stmt
+          // для пакетной записи после цикла, вместо N последовательных put).
           try {
-            await addSubjectsFromWeek(env, group, weekCode, data);
+            const stmt = addSubjectsFromWeekStmt(env, group, weekCode, data);
+            if (stmt) subjectStmts.push(stmt);
           } catch (e) {
             console.log('addSubjectsFromWeek skipped:', e.message);
           }
+      }
+    }
+
+    // Пакетная запись вкладов предметов недель (один batch вместо N put).
+    if (subjectStmts.length) {
+      try {
+        await store.batch(subjectStmts);
+      } catch (e) {
+        console.log('subjects batch skipped:', e.message);
       }
     }
 
@@ -706,6 +766,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
   const updated = [];
   const diffs = []; // накопленные diff расписания для уведомления
+  const subjectStmts = [];
 
   for (const { weekCode, data } of schedules) {
     if (!weekCode || !data) continue;
@@ -732,13 +793,24 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
       await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
       updated.push(weekCode);
 
-      // Инкрементально обновляем список предметов этой недели
+      // Инкрементально обновляем список предметов этой недели (собираем stmt
+      // для пакетной записи после цикла, вместо N последовательных put).
       try {
-        await addSubjectsFromWeek(env, group, weekCode, data);
+        const stmt = addSubjectsFromWeekStmt(env, group, weekCode, data);
+        if (stmt) subjectStmts.push(stmt);
       } catch (e) {
         console.log('addSubjectsFromWeek skipped:', e.message);
       }
     }
+    }
+
+    // Пакетная запись вкладов предметов недель (один batch вместо N put).
+    if (subjectStmts.length) {
+      try {
+        await store.batch(subjectStmts);
+      } catch (e) {
+        console.log('subjects batch skipped:', e.message);
+      }
     }
 
     // Пересоберём агрегат предметов один раз, а не на каждую изменённую неделю
@@ -782,7 +854,9 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   if (diffs.length > 0) {
     try {
       const text = formatScheduleDiffBroadcast(group, diffs);
-      await notifyGroup(env, group, text);
+      // Не блокируем ответ клиенту ожиданием Telegram (он может висеть 10-30с
+  // из-за недоступности api.telegram.org из-под CF в РФ). Шлём в фоне.
+  notifyGroupBg(env, group, text);
     } catch (e) {
       console.log('schedule notify skipped:', e.message);
     }
@@ -857,7 +931,7 @@ async function handleAddHw(request, env, corsHeaders) {
   existing.push(item);
   await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
-  await notifyGroup(env, group, formatHwMessage('add', group, item, null));
+  notifyGroupBg(env, group, formatHwMessage('add', group, item, null));
 
   return jsonResponse({ ok: true, item }, corsHeaders);
 }
@@ -906,7 +980,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   existing[idx] = item;
   await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
-  await notifyGroup(env, group, formatHwMessage('update', group, item, prev));
+  notifyGroupBg(env, group, formatHwMessage('update', group, item, prev));
 
   return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
 }
@@ -935,7 +1009,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   await store.put(key, JSON.stringify(filtered), { expirationTtl: 2592000 });
 
   if (removed) {
-    await notifyGroup(env, group, formatHwMessage('delete', group, removed, null));
+    notifyGroupBg(env, group, formatHwMessage('delete', group, removed, null));
   }
 
   return jsonResponse({ ok: true, count: filtered.length }, corsHeaders);
@@ -1100,15 +1174,10 @@ function computeWeekSubjects(weekData) {
 // Сливает все недельные вклады семестра в агрегат subjects:{group}:{sem}.
 async function reaggregateSubjects(env, group, semester) {
   const store = createStore(env);
-  const list = await store.list({ prefix: `subjects-week:${group}:${semester}:` });
+  // Одним запросом забираем key+value всех недельных вкладов (вместо list + N*get).
+  const { entries } = await store.listValues({ prefix: `subjects-week:${group}:${semester}:`, type: 'json' });
   const map = new Map();
-  for (const k of (list && list.keys) || []) {
-    let snap;
-    try {
-      snap = await store.get(k.name, { type: 'json' });
-    } catch (e) {
-      continue;
-    }
+  for (const { value: snap } of entries) {
     if (!Array.isArray(snap)) continue;
     for (const s of snap) {
       if (!s || !s.subject) continue;
@@ -1132,18 +1201,22 @@ async function reaggregateSubjects(env, group, semester) {
 // Записывает вклад одной недели (subjects-week:*). Пересборку агрегата
 // вызывающий код делает один раз после цикла (см. reaggregateSubjects),
 // чтобы не делать лишних KV-запросов на каждую изменённую неделю.
-async function addSubjectsFromWeek(env, group, weekCode, weekData) {
-  const store = createStore(env);
-  if (!weekCode || !weekData || !weekData.days) return false;
+// Возвращает подготовленный stmt для записи вклада недели (subjects-week:*),
+// либо null если данных нет. Запись выполняется вызывающим через store.batch(),
+// чтобы не делать N последовательных put в цикле синхронизации.
+function addSubjectsFromWeekStmt(env, group, weekCode, weekData) {
+  if (!weekCode || !weekData || !weekData.days) return null;
 
   const semester = semesterFromWeekDates(weekData.weekStart, weekData.weekEnd)
     || currentSemesterKey();
 
   const snapshot = computeWeekSubjects(weekData);
-  await store.put(`subjects-week:${group}:${semester}:${weekCode}`, JSON.stringify(snapshot), {
-    expirationTtl: 365 * 24 * 60 * 60,
-  });
-  return true;
+  const str = JSON.stringify(snapshot);
+  const expiresAt = Date.now() + 365 * 24 * 60 * 60 * 1000;
+  return env.DB.prepare(
+    `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at, updated_at=excluded.updated_at`
+  ).bind(`subjects-week:${group}:${semester}:${weekCode}`, str, expiresAt, Date.now());
 }
 
 // ── Полная пересборка предметов текущего семестра ──
@@ -1154,26 +1227,31 @@ async function addSubjectsFromWeek(env, group, weekCode, weekData) {
 async function updateSubjectsForCurrentSemester(env, group) {
   const store = createStore(env);
   const semester = currentSemesterKey();
-  const list = await store.list({ prefix: `schedule:${group}:` });
-  if (!list || list.keys.length === 0) return false;
+  // Одним запросом все расписания группы (key+value) вместо list + N*get.
+  const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
+  if (!entries.length) return false;
 
-  for (const k of list.keys) {
-    const weekValue = k.name.split(`schedule:${group}:`)[1];
+  const ttl = 365 * 24 * 60 * 60;
+  const now = Date.now();
+  const ops = [];
+  for (const { key, value: data } of entries) {
+    const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    let data;
-    try {
-      data = await store.get(k.name, { type: 'json' });
-    } catch (e) {
-      continue;
-    }
     if (!data || !data.days) continue;
     if (semesterFromWeekDates(data.weekStart, data.weekEnd) !== semester) continue;
 
     const snapshot = computeWeekSubjects(data);
-    await store.put(`subjects-week:${group}:${semester}:${weekValue}`, JSON.stringify(snapshot), {
-      expirationTtl: 365 * 24 * 60 * 60,
-    });
+    const str = JSON.stringify(snapshot);
+    const expiresAt = now + ttl * 1000;
+    ops.push(
+      store._db.prepare(
+        `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at, updated_at=excluded.updated_at`
+      ).bind(`subjects-week:${group}:${semester}:${weekValue}`, str, expiresAt, now)
+    );
   }
+
+  if (ops.length) await store.batch(ops);
 
   await reaggregateSubjects(env, group, semester);
   return true;
@@ -1187,13 +1265,12 @@ async function recalcHomeworkForGroup(env, group) {
   const homework = await store.get(key, { type: 'json' }) || [];
   if (homework.length === 0) return { updated: 0, items: [] };
 
-  // Загружаем все расписания группы
-  const list = await store.list({ prefix: `schedule:${group}:` });
+  // Загружаем все расписания группы одним запросом (list + N*get → listValues).
+  const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
   const weekData = [];
-  for (const k of list.keys) {
-    const weekValue = k.name.split(`schedule:${group}:`)[1];
+  for (const { key, value: data } of entries) {
+    const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    const data = await store.get(k.name, { type: 'json' });
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1274,12 +1351,11 @@ function findNextPairDate(weekData, subject, pairType, fromDate, subgroup = 'any
 
 async function computeNextPairDate(env, group, subject, pairType, fromDate = new Date(), subgroup = 'any') {
   const store = createStore(env);
-  const list = await store.list({ prefix: `schedule:${group}:` });
+  const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
   const weekData = [];
-  for (const k of list.keys) {
-    const weekValue = k.name.split(`schedule:${group}:`)[1];
+  for (const { key, value: data } of entries) {
+    const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
-    const data = await store.get(k.name, { type: 'json' });
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1344,21 +1420,29 @@ const TG_API_BASE = 'https://api.telegram.org';
 
 async function tgApi(env, method, payload) {
   const token = env.TELEGRAM_BOT_TOKEN;
-  if (!token) return { ok: false, skipped: true, reason: 'no-token' };
+  if (!token) {
+    console.log('[tg] tgApi skipped: no TELEGRAM_BOT_TOKEN');
+    return { ok: false, skipped: true, reason: 'no-token' };
+  }
   try {
-    const resp = await fetch(`${TG_API_BASE}/bot${token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+    console.log('[tg] tgApi ->', method, 'chat_id=', payload && payload.chat_id, 'textLen=', payload && payload.text ? payload.text.length : 0);
+      // Таймаут 8с: Telegram API из-под CF в РФ часто недоступен/тормозит,
+      // не держим запрос вечно (особенно в фоновом режиме через waitUntil).
+      const resp = await fetch(`${TG_API_BASE}/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000),
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok || !data.ok) {
-      console.log('tgApi', method, 'failed:', JSON.stringify(data).slice(0, 200));
+      console.log('[tg] tgApi', method, 'failed: status=', resp.status, 'body=', JSON.stringify(data).slice(0, 300));
       return { ok: false, error: data };
     }
+    console.log('[tg] tgApi', method, 'ok: chat_id=', payload && payload.chat_id);
     return { ok: true, result: data.result };
   } catch (e) {
-    console.log('tgApi', method, 'exception:', e.message);
+    console.log('[tg] tgApi', method, 'exception:', e.name, e.message);
     return { ok: false, error: e.message };
   }
 }
@@ -1370,6 +1454,7 @@ async function tgApi(env, method, payload) {
 async function getGroupSubscribers(env, group) {
   const store = createStore(env);
   const raw = await store.get(`tg:subs:${group}`, { type: 'json' });
+  console.log('[tg] getGroupSubscribers', group, '=> raw=', JSON.stringify(raw));
   if (Array.isArray(raw)) return raw;
 
   // Миграция: старый одиночный ключ.
@@ -1378,8 +1463,10 @@ async function getGroupSubscribers(env, group) {
     const list = [old];
     await store.put(`tg:subs:${group}`, JSON.stringify(list));
     await store.delete(`tg:chat:${group}`);
+    console.log('[tg] migrated old tg:chat for', group, '=>', JSON.stringify(list));
     return list;
   }
+  console.log('[tg] getGroupSubscribers', group, '=> EMPTY (no subs)');
   return [];
 }
 
@@ -1400,23 +1487,48 @@ async function removeGroupSubscriber(env, group, chatId) {
   else await store.delete(`tg:subs:${group}`);
 }
 
+// Фоновая отправка уведомления: не блокирует ответ клиенту (через
+// context.waitUntil), но гарантирует, что fetch к Telegram дойдёт до конца
+// после отправки ответа — иначе при неблокирующем вызове Worker убивает
+// висящий fetch при завершении handler'а и уведомления теряются.
+function notifyGroupBg(env, group, text, opts = {}) {
+  console.log('[tg] notifyGroupBg called for', group, 'ctx.waitUntil=', !!(currentCtx && typeof currentCtx.waitUntil === 'function'));
+  const p = notifyGroup(env, group, text, opts).catch((e) =>
+    console.log('[tg] notify skipped:', e && e.message)
+  );
+  if (currentCtx && typeof currentCtx.waitUntil === 'function') {
+    currentCtx.waitUntil(p);
+  } else {
+    console.log('[tg] notifyGroupBg: NO ctx.waitUntil — promise may be killed on response end');
+  }
+  return p;
+}
+
 // Рассылает сообщение всем подписчикам группы (chat_id изолированы друг от друга).
 async function notifyGroup(env, group, text, opts = {}) {
   const store = createStore(env);
-  if (!env.DB || !env.TELEGRAM_BOT_TOKEN) return;
+  if (!env.DB || !env.TELEGRAM_BOT_TOKEN) {
+    console.log('[tg] notifyGroup early return: DB=', !!env.DB, 'token=', !!env.TELEGRAM_BOT_TOKEN);
+    return;
+  }
   const subs = await getGroupSubscribers(env, group);
-  if (!subs.length) return;
+  if (!subs.length) {
+    console.log('[tg] notifyGroup: no subscribers for', group);
+    return;
+  }
+  console.log('[tg] notifyGroup: sending to', subs.length, 'subs for', group, 'textLen=', text ? text.length : 0);
 
   // Длинные сообщения (> 4096) дробим по переводам.
   const chunks = splitForTg(text, 4000);
   for (const chatId of subs) {
     for (const c of chunks) {
-      await tgApi(env, 'sendMessage', {
+      const res = await tgApi(env, 'sendMessage', {
         chat_id: chatId,
         text: c,
         parse_mode: opts.parseMode || 'HTML',
         disable_web_page_preview: true,
       });
+      console.log('[tg] notifyGroup: sendMessage to', chatId, '=>', JSON.stringify(res).slice(0, 150));
     }
   }
 }
