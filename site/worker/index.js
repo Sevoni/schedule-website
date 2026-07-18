@@ -1,4 +1,4 @@
-import { createStore } from './store.js';
+import { createStore, setRequestLogger } from './store.js';
 
 export default {
   async fetch(request, env) {
@@ -15,6 +15,10 @@ export default {
     if (method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
     }
+
+    // Логирование производительности D1: привязываем общий logger к запросу.
+    const store = createStore(env);
+    setRequestLogger(store._logger);
 
     try {
       // ── Public endpoints ──────────────────────────────────
@@ -124,8 +128,10 @@ export default {
         return await handleTgStatus(request, env, corsHeaders);
       }
 
+      store._logger.flush(`${method} ${path}`);
       return jsonResponse({ error: 'Not Found' }, corsHeaders, 404);
     } catch (e) {
+      store._logger.flush(`${method} ${path} (error)`);
       return jsonResponse({ error: e.message }, corsHeaders, 500);
     }
   },

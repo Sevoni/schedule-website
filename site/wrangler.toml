@@ -24,6 +24,13 @@ TG_BOT_USERNAME = "kampussgubot"
 # а не на Worker (workers.dev). Укажите свой Pages-URL.
 INVITE_ORIGIN = "https://schedule-worker.pages.dev"
 
+# Логирование производительности D1 (для анализа тормозов):
+#   LOG_DB=0          — отключить всё логирование БД
+#   LOG_DB_VERBOSE=1  — логировать КАЖДЫЙ запрос отдельно ([db] get key 3ms)
+#   по умолчанию — только сводка на действие ([db-summary] ... totalMs=...)
+LOG_DB = "1"
+LOG_DB_VERBOSE = "0"
+
 [[kv_namespaces]]
 binding = "SCHEDULE"
 id = "d4bf1890a6e94b5285f1c5195aed419a"
@@ -39,7 +46,7 @@ id = "d4bf1890a6e94b5285f1c5195aed419a"
 [[d1_databases]]
 binding = "DB"
 database_name = "schedule-db"
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "112c8d69-042c-42a2-8f0e-601c4ebb939c"
 
 # Ежедневная очистка протухших записей (в KV TTL работал сам).
 [triggers]
