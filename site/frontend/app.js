@@ -3007,6 +3007,15 @@ function setupSettingsModal() {
   document.getElementById('closeSettings').onclick = () => modal.classList.add('hidden');
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 
+  document.getElementById('resetDoneHw').onclick = () => {
+    if (!confirm('Сбросить все отметки «выполнено» для группы ' + state.group + '?')) return;
+    doneHwIds.clear();
+    saveDoneHw();
+    renderHomework();
+    if (state.schedule) renderDayTabs();
+    showToast('Отметки выполненных ДЗ сброшены', 'ok');
+  };
+
   document.getElementById('saveSettings').onclick = () => {
     const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
     const newApiBase = document.getElementById('apiUrlInput').value.trim();

@@ -952,6 +952,16 @@ header {
   margin: 18px 0;
 }
 
+.hw-reset-section h3 {
+  font-size: 1rem;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+
+.hw-reset-section .btn-secondary {
+  margin-top: 4px;
+}
+
 .tg-section h3 {
   font-size: 1rem;
   margin-bottom: 10px;
