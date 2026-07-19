@@ -43,6 +43,9 @@ export default {
       if (path === '/api/schedules' && method === 'GET') {
         return await cachedGet(request, corsHeaders, () => handleGetSchedules(request, env, corsHeaders));
       }
+      if (path === '/api/bootstrap' && method === 'GET') {
+        return await cachedGet(request, corsHeaders, () => handleBootstrap(request, env, corsHeaders));
+      }
       if (path === '/api/upload' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
@@ -598,7 +601,79 @@ async function handleGetSchedules(request, env, corsHeaders) {
   return jsonResponse(result, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
 }
 
-// ── POST /api/sync ─────────────────────────────────────────────
+// ── GET /api/bootstrap?group=...&weeks=w1,w2,... ────────────────
+// Агрегирующий эндпоинт холодного старта: одним запросом возвращает
+// weeks + schedules + hw + subjects + campusUpdatedAt. Заменяет 4
+// параллельных вызова (/api/weeks, /api/schedules, /api/hw, /api/subjects)
+// на один HTTP-RTT — критично для холодного старта без VPN.
+//
+// Параметры:
+//   group — обязательный
+//   weeks — список weekCode через запятую (опциональный). Если пусто —
+//          возвращаются только weeks/hw/subjects без расписаний.
+//
+// Ответ:
+//   {
+//     weeks: [...],
+//     schedules: { [weekCode]: data },
+//     hw: [...],
+//     subjects: [...],
+//     campusUpdatedAt: "..."
+//   }
+// Поля, которых нет в БД, заменяются на пустые значения ([] или {} или ""),
+// чтобы фронтенд мог графтировать на старую схему без NPE.
+
+async function handleBootstrap(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const weeksParam = url.searchParams.get('weeks') || '';
+  const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
+
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  // Параллельно читаем weeks, hw, subjects, campusUpdatedAt и расписания.
+  const semester = currentSemesterKey();
+  const parallel = [
+    store.get(`weeks:${group}`, { type: 'json' }),
+    store.get(`hw:${group}`, { type: 'json' }),
+    store.get(`subjects:${group}:${semester}`, { type: 'json' }),
+    store.get(`campus-updated:${group}`),
+  ];
+  if (weeks.length > 0) {
+    const schedKeys = weeks.map((w) => `schedule:${group}:${w}`);
+    parallel.push(store.getMany(schedKeys, { type: 'json' }));
+  } else {
+    parallel.push(Promise.resolve(null));
+  }
+
+  const [weeksData, hwData, subjectsData, campusUpdatedAt, schedResult] = await Promise.all(parallel);
+
+  const schedules = {};
+  if (schedResult && Array.isArray(schedResult.entries)) {
+    const prefix = `schedule:${group}:`;
+    for (const e of schedResult.entries) {
+      if (e.value == null) continue;
+      const weekCode = e.key.slice(prefix.length);
+      schedules[weekCode] = e.value;
+    }
+  }
+
+  // subjects может прийти в трёх видах:
+  //   - null/[]  → в БД пусто
+  //   - старый формат (без поля subgroups) → фронт сам триггерит recomput
+  //   - актуальный формат
+  // Здесь ничего не нормализуем — отдаём как есть, фронтенд сам решает.
+  return jsonResponse({
+    weeks: weeksData || [],
+    schedules,
+    hw: hwData || [],
+    subjects: subjectsData || [],
+    campusUpdatedAt: campusUpdatedAt || '',
+  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+}
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
 async function handleUpload(request, env, corsHeaders) {
@@ -1521,6 +1596,7 @@ async function purgeGroupCdnCache(env, group) {
       `/api/hw?group=${encodeURIComponent(group)}`,
       `/api/subjects?group=${encodeURIComponent(group)}`,
       `/api/status?group=${encodeURIComponent(group)}`,
+      `/api/bootstrap?group=${encodeURIComponent(group)}`,
     ];
     await Promise.all(
       paths.map((p) =>
