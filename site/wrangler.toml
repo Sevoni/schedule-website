@@ -22,7 +22,7 @@ TG_BOT_USERNAME = "kampussgubot"
 # Канонический origin для ссылок-приглашений. Ссылки формируются как
 # ${INVITE_ORIGIN}/?token=<uuid>, то есть открываются на фронтенде (Pages),
 # а не на Worker (workers.dev). Укажите свой Pages-URL.
-INVITE_ORIGIN = "https://schedule-worker.pages.dev"
+INVITE_ORIGIN = "https://kampussgu.dpdns.org"
 
 # Логирование производительности D1 (для анализа тормозов):
 #   LOG_DB=0          — отключить всё логирование БД
@@ -47,6 +47,12 @@ id = "d4bf1890a6e94b5285f1c5195aed419a"
 binding = "DB"
 database_name = "schedule-db"
 database_id = "112c8d69-042c-42a2-8f0e-601c4ebb939c"
+
+# Кастомный домен kampussgu.dpdns.org — это Pages (статика). Чтобы /api/*
+# уходил в Worker, а не в статику, привязываем route к custom domain.
+routes = [
+  { pattern = "kampussgu.dpdns.org/api/*", custom_domain = true }
+]
 
 # Ежедневная очистка протухших записей (в KV TTL работал сам).
 [triggers]

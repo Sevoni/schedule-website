@@ -1,6 +1,6 @@
 // ── Config ────────────────────────────────────────────────────
 
-const DEFAULT_API = 'https://schedule-worker.campus-schedule-syktyvkar.workers.dev';
+const DEFAULT_API = 'https://kampussgu.dpdns.org';
 const DEFAULT_GROUP = '131-ИБо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
 const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
@@ -36,6 +36,61 @@ let state = {
   homework: [],
   syncing: false,
 };
+
+// ── Клиентский кеш недель в localStorage (TTL 1ч) ──────────────
+// Избавляет от /api/weeks при повторных открытиях в течение часа.
+// Кеш хранится per-group: `weeksCache:{group}` = { ts, weeks }.
+const WEEKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 час
+const SCHEDULE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для расписаний
+
+function weeksCacheKey() {
+  return 'weeksCache:' + state.group;
+}
+function loadWeeksFromCache() {
+  try {
+    const raw = localStorage.getItem(weeksCacheKey());
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.weeks)) return null;
+    if (typeof parsed.ts !== 'number') return null;
+    if (Date.now() - parsed.ts > WEEKS_CACHE_TTL_MS) return null;
+    return parsed.weeks;
+  } catch (e) {
+    return null;
+  }
+}
+function saveWeeksToCache(weeks) {
+  try {
+    localStorage.setItem(weeksCacheKey(), JSON.stringify({ ts: Date.now(), weeks }));
+  } catch (e) { /* квота — игнорируем */ }
+}
+
+// Кеш расписаний per-group: `schedCache:{group}` = { ts, data: {weekCode: data} }
+function schedCacheKey() {
+  return 'schedCache:' + state.group;
+}
+function loadSchedFromCache() {
+  try {
+    const raw = localStorage.getItem(schedCacheKey());
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.data || typeof parsed.ts !== 'number') return null;
+    if (Date.now() - parsed.ts > SCHEDULE_CACHE_TTL_MS) return null;
+    return parsed.data;
+  } catch (e) {
+    return null;
+  }
+}
+function saveSchedToCache(map) {
+  try {
+    localStorage.setItem(schedCacheKey(), JSON.stringify({ ts: Date.now(), data: map }));
+  } catch (e) { /* квота — игнорируем */ }
+}
+function invalidateSchedCache() {
+  try {
+    localStorage.removeItem(schedCacheKey());
+  } catch (e) { /* ignore */ }
+}
 
 // isWriter — true, если у пользователя есть token для записи (writer/owner).
 // Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
@@ -108,7 +163,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast('Только просмотр. Введите ссылку-приглашение в настройках, чтобы редактировать.', 'warn');
       return;
     }
-    syncAll();
+    // Принудительная синхронизация — игнорируем свежесть campusUpdatedAt.
+    syncAll(null, { forceSync: true });
   };
 
   loadData();
@@ -275,7 +331,7 @@ async function loadData() {
       }
     }
     if (state.weeks.length === 0) {
-      showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите 🔄.', () => syncAll());
+      showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите 🔄.', () => syncAll(null, { forceSync: true }));
       return;
     }
     findCurrentWeek();
@@ -285,7 +341,7 @@ async function loadData() {
     recalcNextPairDates();
     loadSubjects();
   } catch (e) {
-    showError('Не удалось загрузить данные: ' + e.message, () => syncAll());
+    showError('Не удалось загрузить данные: ' + e.message, () => syncAll(null, { forceSync: true }));
   }
 }
 
@@ -314,18 +370,38 @@ async function loadInitialSchedules() {
   const content = document.getElementById('scheduleContent');
   content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
 
-  // 1) Из БД одним агрегирующим запросом по всем стартовым неделям
-  //    (вместо N параллельных /api/schedule, чтобы сэкономить HTTP-RTT
-  //    при открытии без VPN). Возвращает { [weekCode]: data }.
-  try {
-    const weeksParam = indices.map((i) => state.weeks[i].value).join(',');
-    const dbMap = await apiFetch('/api/schedules', { group: state.group, weeks: weeksParam });
+  // 0) Сначала пробуем клиентский кеш расписаний (TTL 5 мин) — 0 вызовов
+  //    воркеру при повторных открытиях в окне 5 минут. Кеш охватывает все
+  //    стартовые недели, для которых мы ранее уже получали данные.
+  const cachedSched = loadSchedFromCache();
+  if (cachedSched) {
     for (const w of state.weeks) {
-      if (dbMap[w.value]) state.scheduleCache[w.value] = dbMap[w.value];
+      if (cachedSched[w.value]) state.scheduleCache[w.value] = cachedSched[w.value];
     }
-  } catch (e) {
-    console.warn('[loadInitial] /api/schedules failed:', e.message);
   }
+
+  // 1) Из БД одним агрегирующим запросом по всем стартовым неделям, НО только
+  //    для тех недель, которых нет в клиентском кеше. Если все есть — запрос
+  //    не нужен вовсе, экономия 1 вызова воркера на каждое повторное открытие.
+  const neededIndices = indices.filter(
+    (i) => !state.scheduleCache[state.weeks[i].value]
+  );
+  if (neededIndices.length > 0) {
+    try {
+      const weeksParam = neededIndices.map((i) => state.weeks[i].value).join(',');
+      const dbMap = await apiFetch('/api/schedules', { group: state.group, weeks: weeksParam });
+      for (const w of state.weeks) {
+        if (dbMap[w.value]) state.scheduleCache[w.value] = dbMap[w.value];
+      }
+    } catch (e) {
+      console.warn('[loadInitial] /api/schedules failed:', e.message);
+    }
+  } else {
+    console.log('[loadInitial] all weeks in client cache — skipping /api/schedules');
+  }
+
+  // Сохраняем кеш расписаний (объединяя старое + новое).
+  saveSchedToCache(state.scheduleCache);
 
   // 2) Отрисовываем из кэша/БД сразу, НЕ дожидаясь кампуса.
   //    Текущая неделя, иначе любая другая из стартового диапазона.
@@ -430,14 +506,53 @@ async function backgroundSync(campusIndices, dbMap) {
 }
 
 async function loadWeeks() {
+  // 1) Сначала пробуем клиентский кеш (TTL 1ч). Даже если он есть, в фоне
+  //    тихо обновляем /api/weeks, чтобы отследить возможные изменения —
+  //    но экран рендерим сразу из кеша без HTTP-вызова при повторных
+  //    открытиях страницы.
+  const cached = loadWeeksFromCache();
+  // Игнорируем кеш, если в нём у недель отсутствуют даты (старый/битый формат) —
+  // без дат findRealCurrentIdx не сможет найти текущую неделю и упадёт на индекс 0.
+  const cacheHasDates = cached && cached.length && cached.every((w) => w.dates && w.dates.length >= 2);
+  if (cached && cached.length && cacheHasDates) {
+    state.weeks = cached;
+    findCurrentWeek();
+    renderWeekNav();
+    // Фоновое обновление (не блокирует рендер): если кеш протухнет за час,
+    // мы это всё равно поймаем в фоне и обновим его на следующем шаге.
+    refreshWeeksFromApi().catch(e => console.warn('[weeks] bg refresh failed:', e.message));
+    return;
+  }
+
   try {
     state.weeks = await apiFetch('/api/weeks', { group: state.group });
+    if (state.weeks && state.weeks.length) saveWeeksToCache(state.weeks);
     findCurrentWeek();
     renderWeekNav();
   } catch (e) {
     // Кеш пуст — оставляем недели пустыми, разберёмся дальше
     state.weeks = [];
     state.currentWeekIdx = -1;
+  }
+}
+
+// Тихое обновление списка недель из API для освежения кеша (без перерисовки
+// экрана, если набор/текущая неделя не изменились). Возвращает новое значение
+// `weeks`, либо null если запрос провалился.
+async function refreshWeeksFromApi() {
+  try {
+    const fresh = await apiFetch('/api/weeks', { group: state.group });
+    if (!fresh || !fresh.length) return null;
+    const prevCurrent = state.weeks[state.currentWeekIdx]?.value;
+    state.weeks = fresh;
+    saveWeeksToCache(fresh);
+    // Если текущая неделя исчезла — переходим на «реальную» текущую
+    const idx = fresh.findIndex(w => w.value === prevCurrent);
+    if (idx >= 0) state.currentWeekIdx = idx;
+    else findCurrentWeek();
+    return fresh;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -532,9 +647,10 @@ async function backgroundSyncSingle(idx, dbData) {
     const changed = !dbData || JSON.stringify(stripComparable(dbData)) !== JSON.stringify(stripComparable(data));
     if (changed) {
       await uploadSchedulesToBackend([{ weekCode: w.value, data }]);
-      loadHomework();
+      // loadHomework()/loadSubjects() НЕ нужны: ДЗ и предметы группы не
+      // зависят от конкретной недели, а их списки уже загружены в state.
+      // Экономия 2 вызовов воркера при каждом прокруте вперёд > +2 недель.
       recalcNextPairDates();
-      loadSubjects();
     }
 
     // Если пользователь всё ещё на этой неделе — обновим экран
@@ -585,12 +701,31 @@ function saveSyncMeta(campusUpdatedAt) {
 //     Бэкенд сам сохраняет, обновляет предметы/ДЗ, записывает дату.
 //  Пользователь НЕ перемещается на другую неделю.
 
-async function syncAll(anchorIdxOverride = null) {
+async function syncAll(anchorIdxOverride = null, opts = {}) {
+  // opts.forceSync = true → игнорируем свежесть campusUpdatedAt. Используется
+  // при явном клике на 🔄. При авто-открытии страницы (forceSync=false) —
+  // пропускаем все запросы, если campusUpdatedAt свежее 5 минут (экономия
+  // 2 вызовов воркера: check-campus-update + sync-from-campus).
+  const forceSync = !!opts.forceSync;
   if (state.syncing) return;
   if (!state.campusEnabled) {
     updateSyncUI('error', 'Загрузка из кампуса отключена в настройках');
     return;
   }
+
+  // Ранний выход для авто-синхронизации при свежих данных. campusUpdatedAt
+  // — это timestamp последнего изменения кампуса (см. extractCampusUpdatedAt).
+  // Если он свежее CAMPUS_UPDATED_FRESH_MS —Faculty не имеет смысла дёргать.
+  const CAMPUS_UPDATED_FRESH_MS = 5 * 60 * 1000; // 5 минут
+  if (!forceSync) {
+    const ts = parseCampusUpdatedAtTs(state.campusUpdatedAt);
+    if (ts && (Date.now() - ts) < CAMPUS_UPDATED_FRESH_MS) {
+      console.log('[syncAll] skip — campusUpdatedAt is fresh (', state.campusUpdatedAt, ')');
+      updateSyncUI('ok');
+      return;
+    }
+  }
+
   state.syncing = true;
   updateSyncUI('syncing');
 
@@ -677,12 +812,16 @@ async function syncAll(anchorIdxOverride = null) {
       schedules,
     });
 
-    // Используем обновлённые списки сразу из ответа бэкенда
-    if (Array.isArray(syncRes.hw)) {
+    // Используем обновлённые списки сразу из ответа бэкенда — отдельные
+    // запросы /api/hw и /api/subjects НЕ нужны (экономия 2 вызова воркера
+    // после каждой успешной синхронизации).
+    const hwProvided = Array.isArray(syncRes.hw);
+    const subjectsProvided = Array.isArray(syncRes.subjects);
+    if (hwProvided) {
       state.homework = syncRes.hw;
       renderHomework();
     }
-    if (Array.isArray(syncRes.subjects)) {
+    if (subjectsProvided) {
       loadedSubjects = syncRes.subjects;
     }
 
@@ -702,14 +841,21 @@ async function syncAll(anchorIdxOverride = null) {
     updateSyncUI('ok');
     // Пересчёт nextPair (может догрузить ещё недели и обновить ДЗ на бэкенде)
     await recalcNextPairDates();
-    // Финальная авторитетная версия ДЗ и предметов из БД
-    await loadHomework();
-    loadSubjects();
+    // Если бэкенд НЕ вернул hw/subjects (старая версия воркера или ошибка)
+    // — подтянем финальную авторитетную версию из БД. Иначе пропускаем:
+    // у нас уже есть актуальные данные из ответа sync-from-campus.
+    if (!hwProvided) await loadHomework();
+    if (!subjectsProvided) loadSubjects();
+    // Сохраняем клиентский кеш расписаний после синхронизации (он мог
+    // пополниться новыми неделями из батча). Дополнительно обнулим его,
+    // если была реальная запись в БД, — иначе повторные открытия будут
+    // брать устаревшие данные. Проще: пересохраняем новым состоянием.
+    saveSchedToCache(state.scheduleCache);
     saveSyncMeta(campusUpdatedAt);
   } catch (e) {
     updateSyncUI('error', e.message);
     if (!state.schedule) {
-      showError('Не удалось синхронизировать: ' + e.message, () => syncAll());
+      showError('Не удалось синхронизировать: ' + e.message, () => syncAll(null, { forceSync: true }));
     }
   } finally {
     state.syncing = false;
@@ -739,6 +885,7 @@ async function syncWeeksFromCampus(preserveWeek = false) {
 
   const savedWeekValue = preserveWeek ? state.weeks[state.currentWeekIdx]?.value : null;
   state.weeks = weeks;
+  saveWeeksToCache(weeks);
 
   if (preserveWeek && savedWeekValue) {
     const idx = state.weeks.findIndex(w => w.value === savedWeekValue);
@@ -781,6 +928,23 @@ function extractCampusUpdatedAt(html) {
   const [d, mo, y] = date.split('.');
   const iso = `${y}-${mo}-${d}T${time}`;
   return iso;
+}
+
+// Парсит campusUpdatedAt-строку (формат "yyyy-MM-ddTHH:mm:ss", локальное время
+// кампуса UTC+3) в timestamp UTC. Возвращает null при неудаче. Используется
+// для оценки «свежести» данных и пропуска фоновой синхронизации.
+function parseCampusUpdatedAtTs(iso) {
+  if (!iso) return null;
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) {
+    // Возможно, это ISO с Z (после saveSyncMeta). Пробуем стандартный парсер.
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+  const [_, y, mo, d, h, mi, s] = m;
+  // Считаем кампус локальным временем UTC+3 (Сыктывкар). Переводим в UTC.
+  const utcMs = Date.UTC(+y, +mo - 1, +d, +h - 3, +mi, +s);
+  return isNaN(utcMs) ? null : utcMs;
 }
 
 async function fetchScheduleFromCampus(group, weekCode) {
@@ -1157,18 +1321,25 @@ async function uploadSchedulesToBackend(schedules) {
 
 // ── Weeks ─────────────────────────────────────────────────────
 
-// Индекс «реальной» текущей недели по календарю (или 0, если не нашлось).
+// Индекс «реальной» текущей недели по календарю.
+//  - если сегодня попадает в диапазон недели — её индекс;
+//  - иначе — ближайшая прошедшая неделя (последняя, чей старт <= сегодня),
+//    чтобы при «дырках» в расписании или слегка устаревшем списке недель
+//    мы не проваливались на самую первую недель (индекс 0), а оставались
+//    максимально близко к текущей дате.
+//  - иначе 0.
 function findRealCurrentIdx() {
   const today = new Date();
+  let lastPast = -1;
   for (let i = 0; i < state.weeks.length; i++) {
     const w = state.weeks[i];
-    if (w.dates.length >= 2) {
-      const start = parseDate(w.dates[0]);
-      const end = parseDate(w.dates[1]);
-      if (today >= start && today <= end) return i;
-    }
+    if (!w.dates || w.dates.length < 2) continue;
+    const start = parseDate(w.dates[0]);
+    const end = parseDate(w.dates[1]);
+    if (today >= start && today <= end) return i;
+    if (today >= start) lastPast = i;
   }
-  return 0;
+  return lastPast >= 0 ? lastPast : 0;
 }
 
 function findCurrentWeek() {
@@ -1274,6 +1445,11 @@ async function recalcNextPairDates() {
   const fetchedWeekCodes = new Set(Object.keys(state.scheduleCache));
   console.log('[recalc] cached weeks:', [...fetchedWeekCodes]);
 
+  // Накопитель изменений для батча: { id -> newDueDate }. Все обновления
+  // отправим ОДНИМ запросом PUT /api/hw/batch, а не N запросами PUT /api/hw
+  // (экономия N-1 вызовов воркера на каждом пересчёте).
+  const pendingUpdates = new Map();
+
   let changed = true;
   let iterations = 0;
   const maxIterations = 20; // защита от бесконечного цикла
@@ -1291,15 +1467,10 @@ async function recalcNextPairDates() {
       console.log('[recalc]', hw.subject, hw.pairType, '→ dueDate:', hw.dueDate, '→ found:', found);
       if (found) {
         if (found.date !== hw.dueDate) {
-          // Дата изменилась — обновляем
-          try {
-            await apiPut('/api/hw', { id: hw.id, group: state.group, dueDate: found.date });
-            console.log('[recalc] updated', hw.subject, hw.dueDate, '→', found.date);
-            hw.dueDate = found.date;
-            changed = true;
-          } catch (e) {
-            console.warn('HW update failed:', e.message);
-          }
+          // Дата изменилась — откладываем в батч (не делаем запрос сразу).
+          pendingUpdates.set(hw.id, found.date);
+          hw.dueDate = found.date;
+          changed = true;
         }
         // else: дата совпала, ничего не делаем
       } else {
@@ -1365,16 +1536,38 @@ async function recalcNextPairDates() {
     if (hw.dueDate && hw.dueDate !== null) {
       const found = findNextPairInCache(hw.subject, hw.pairType, hw.createdAt, hw.subgroup);
        if (!found && hw.dueDate !== null) {
-        // Пары больше нет в расписании — обнуляем
+        // Пары больше нет в расписании — обнуляем (тоже добавляем в батч).
+        pendingUpdates.set(hw.id, null);
+        hw.dueDate = null;
+      }
+    }
+  }
+
+  // Отправляем ВСЕ накопленные изменения одним батч-запросом, а не N запросами.
+  if (pendingUpdates.size > 0) {
+    const updates = [...pendingUpdates.entries()].map(([id, dueDate]) => ({ id, dueDate }));
+    console.log('[recalc] sending batch update for', updates.length, 'items');
+    try {
+      const resp = await apiPut('/api/hw/batch', { group: state.group, updates });
+      // Сервер возвращает обновлённый список всех ДЗ группы — берём его как
+      // авторитетный источник (на случай если на бэкенде что-то另行 менялось).
+      if (resp && Array.isArray(resp.items)) {
+        state.homework = resp.items;
+      }
+    } catch (e) {
+      console.warn('HW batch update failed:', e.message);
+      // Fallback на старую схему поодиночных PUT /api/hw — на случай если
+      // воркер ещё не обновлён (старая версия без /api/hw/batch).
+      for (const [id, dueDate] of pendingUpdates.entries()) {
         try {
-          await apiPut('/api/hw', { id: hw.id, group: state.group, dueDate: null });
-          hw.dueDate = null;
-        } catch (e) {
-          console.warn('HW reset failed:', e.message);
+          await apiPut('/api/hw', { id, group: state.group, dueDate });
+        } catch (e2) {
+          console.warn('HW single update fallback failed:', e2.message);
         }
       }
     }
   }
+
 
   // Обновляем стейт
   state.homework = [...state.homework];
@@ -1615,7 +1808,7 @@ function updateSyncUI(status, errorMsg) {
     el.innerHTML = '<span class="sync-icon">✓</span> ' + new Date().toLocaleTimeString('ru');
     el.className = 'sync-status ok';
   } else if (status === 'error') {
-    el.innerHTML = '<span class="sync-icon">✕</span> Ошибка. <button onclick="syncAll()" class="sync-retry">Повторить</button>';
+    el.innerHTML = '<span class="sync-icon">✕</span> Ошибка. <button onclick="syncAll(null,{forceSync:true})" class="sync-retry">Повторить</button>';
     el.className = 'sync-status error';
   }
 }
@@ -2699,6 +2892,9 @@ function renderHomework() {
 
 // ── Telegram notifications UI ──────────────────────────────────
 
+// Загрузка статуса Telegram round-trip-вызов к воркеру, поэтому делаем его
+// только когда пользователь реально открывает настройки (см. setupSettingsModal).
+// Здесь — только статический рендер из уже известного state (без запроса).
 function setupTgSection() {
   const statusEl = document.getElementById('tgStatus');
   const linkEl = document.getElementById('tgBotLink');
@@ -2707,30 +2903,22 @@ function setupTgSection() {
   const subBtn = document.getElementById('tgSubscribe');
   const unsubBtn = document.getElementById('tgUnsubscribe');
 
-  // Загружаем актуальный username бота + статус привязки.
-  apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
-    state.tgBotUsername = res.botUsername || state.tgBotUsername || '';
-    if (state.tgBotUsername) {
-      localStorage.setItem('tgBotUsername', state.tgBotUsername);
-      linkEl.href = 'https://t.me/' + state.tgBotUsername;
-      linkEl.textContent = '@' + state.tgBotUsername;
-    } else {
-      linkEl.textContent = '(бот не настроен)';
-    }
-    if (res.subscribed) {
-      state.tgChatId = res.chatId || state.tgChatId;
-      localStorage.setItem('tgChatId', state.tgChatId);
-      chatInput.value = state.tgChatId;
-      statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
-      statusEl.className = 'tg-status tg-ok';
-    } else {
-      statusEl.textContent = 'ℹ️ Уведомления не настроены';
-      statusEl.className = 'tg-status';
-    }
-  }).catch(() => {
-    statusEl.textContent = '⚠️ Не удалось проверить статус бота';
-    statusEl.className = 'tg-status tg-warn';
-  });
+  // Статический рендер известных данных (без HTTP-запроса). Полные данные
+  // подтянутся при первом открытии модалки настроек (см. setupSettingsModal).
+  if (state.tgBotUsername) {
+    linkEl.href = 'https://t.me/' + state.tgBotUsername;
+    linkEl.textContent = '@' + state.tgBotUsername;
+  } else {
+    linkEl.textContent = '(бот не настроен)';
+  }
+  chatInput.value = state.tgChatId || '';
+  if (state.tgChatId) {
+    statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
+    statusEl.className = 'tg-status tg-ok';
+  } else {
+    statusEl.textContent = 'ℹ️ Уведомления не настроены';
+    statusEl.className = 'tg-status';
+  }
 
   function showMsg(text, kind) {
     msgEl.textContent = text;
@@ -3047,6 +3235,11 @@ function setupSettingsModal() {
       localStorage.removeItem('writerToken');
       localStorage.removeItem('ownerRole');
       refreshEditVisibility();
+      // Кеш расписаний per-group: при смене группы обнуляем, чтобы старые
+      // данные чужой группы не попали в новую (ключ кеша зависит от группы,
+      // но in-memory кеш — нет).
+      state.scheduleCache = {};
+      invalidateSchedCache();
     }
 
     // Если сменилась только подгруппа — перерисовываем локально,

@@ -32,16 +32,16 @@ export default {
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
-        return await handleStatus(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleStatus(request, env, corsHeaders));
       }
       if (path === '/api/schedule' && method === 'GET') {
-        return await handleGetSchedule(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleGetSchedule(request, env, corsHeaders));
       }
       if (path === '/api/weeks' && method === 'GET') {
-        return await handleGetWeeks(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleGetWeeks(request, env, corsHeaders));
       }
       if (path === '/api/schedules' && method === 'GET') {
-        return await handleGetSchedules(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleGetSchedules(request, env, corsHeaders));
       }
       if (path === '/api/upload' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -49,7 +49,7 @@ export default {
         return await handleUpload(request, env, corsHeaders);
       }
       if (path === '/api/subjects' && method === 'GET') {
-        return await handleGetSubjects(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleGetSubjects(request, env, corsHeaders));
       }
       if (path === '/api/subjects' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -57,7 +57,7 @@ export default {
         return await handlePutSubjects(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'GET') {
-        return await handleGetHw(request, env, corsHeaders);
+        return await cachedGet(request, corsHeaders, () => handleGetHw(request, env, corsHeaders));
       }
       if (path === '/api/hw' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -68,6 +68,11 @@ export default {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
         return await handleUpdateHw(request, env, corsHeaders);
+      }
+      if (path === '/api/hw/batch' && method === 'PUT') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
+        return await handleBatchUpdateHw(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'DELETE') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -536,7 +541,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
   if (weekCode) {
     const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
-    if (data) return jsonResponse(data, corsHeaders);
+    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
 
@@ -555,7 +560,7 @@ async function handleGetWeeks(request, env, corsHeaders) {
   }
 
   const data = await store.get(`weeks:${group}`, { type: 'json' });
-  if (data) return jsonResponse(data, corsHeaders);
+  if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
   return jsonResponse({ error: 'No weeks data' }, corsHeaders, 404);
 }
 
@@ -590,7 +595,7 @@ async function handleGetSchedules(request, env, corsHeaders) {
     result[weekCode] = e.value;
   }
 
-  return jsonResponse(result, corsHeaders);
+  return jsonResponse(result, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
 }
 
 // ── POST /api/sync ─────────────────────────────────────────────
@@ -611,6 +616,7 @@ async function handleUpload(request, env, corsHeaders) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
     await store.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 604800 });
+    await purgeGroupCdnCache(env, group);
     return jsonResponse({ ok: true, type: 'weeks', count: weeks.length }, corsHeaders);
   }
 
@@ -692,6 +698,8 @@ async function handleUpload(request, env, corsHeaders) {
       lastGroup: group,
       lastWeek: 'batch',
     }), { expirationTtl: 604800 });
+
+    await purgeGroupCdnCache(env, group);
 
     return jsonResponse({
       ok: true,
@@ -862,6 +870,8 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     }
   }
 
+  await purgeGroupCdnCache(env, group);
+
   return jsonResponse({
     ok: true,
     type: 'sync-from-campus',
@@ -885,7 +895,11 @@ async function handleGetHw(request, env, corsHeaders) {
   const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
 
   const data = await store.get(`hw:${group}`, { type: 'json' });
-  return jsonResponse(data || [], corsHeaders);
+  // hw содержит данные всех студентов группы — кешируем для reader'ов на 30с.
+  // Writer'ы (Authorization) видят актуальное состояние (no-store), чтобы при
+  // только что добавленном ДЗ и сразу же загруженном списке не получить
+  // устаревший кеш из CDN.
+  return jsonResponse(data || [], corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
 }
 
 // ── POST /api/hw ───────────────────────────────────────────────
@@ -932,6 +946,7 @@ async function handleAddHw(request, env, corsHeaders) {
   await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   notifyGroupBg(env, group, formatHwMessage('add', group, item, null));
+  await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item }, corsHeaders);
 }
@@ -981,8 +996,79 @@ async function handleUpdateHw(request, env, corsHeaders) {
   await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
 
   notifyGroupBg(env, group, formatHwMessage('update', group, item, prev));
+  await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
+}
+
+// ── PUT /api/hw/batch ─────────────────────────────────────────
+// Body: { group, updates: [{ id, dueDate? }, ...] }
+// Массовое обновление dueDate для нескольких ДЗ одним запросом — экономия
+// N вызовов воркера при пересчёте nextPair (раньше NPUT /api/hw на каждое
+// ДЗ, теперь один батч).
+// Возвращает { ok: true, updated: [...], notFound: [...] }.
+// Уведомления в Telegram НЕ отправляем — пересчёт фоновый, не от пользователя.
+
+async function handleBatchUpdateHw(request, env, corsHeaders) {
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json();
+  const { group, updates } = body;
+
+  if (!group || !Array.isArray(updates) || updates.length === 0) {
+    return jsonResponse({ error: 'Missing group or updates' }, corsHeaders, 400);
+  }
+
+  const key = `hw:${group}`;
+  const existing = await store.get(key, { type: 'json' }) || [];
+
+  // Индекс для быстрого поиска
+  const indexById = new Map();
+  for (let i = 0; i < existing.length; i++) {
+    indexById.set(existing[i].id, i);
+  }
+
+  const updated = [];
+  const notFound = [];
+  let changed = false;
+
+  for (const upd of updates) {
+    if (!upd || !upd.id) continue;
+    const idx = indexById.get(upd.id);
+    if (idx === undefined) {
+      notFound.push(upd.id);
+      continue;
+    }
+    const prev = existing[idx];
+    // Только dueDate пока поддерживаем — пересчёт nextPair использует только
+    // дату. Если понадобится менять другие поля — расширить здесь.
+    const newDate = upd.dueDate === undefined ? prev.dueDate : upd.dueDate;
+    if (newDate !== prev.dueDate) {
+      existing[idx] = { ...prev, dueDate: newDate };
+      updated.push(existing[idx]);
+      changed = true;
+    } else {
+      // Не изменилось — не пишем в updated, но и в notFound тоже не относим.
+    }
+  }
+
+  if (changed) {
+    await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+  }
+
+  if (changed) {
+    await purgeGroupCdnCache(env, group);
+  }
+
+  return jsonResponse({
+    ok: true,
+    updated: updated.length,
+    notFound,
+    items: existing,
+  }, corsHeaders);
 }
 
 // ── DELETE /api/hw?id=...&group=... ────────────────────────────
@@ -1011,6 +1097,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   if (removed) {
     notifyGroupBg(env, group, formatHwMessage('delete', group, removed, null));
   }
+  await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, count: filtered.length }, corsHeaders);
 }
@@ -1040,7 +1127,7 @@ async function handleGetSubjects(request, env, corsHeaders) {
     }
   }
 
-  return jsonResponse({ semester, subjects: data || [] }, corsHeaders);
+  return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
 }
 
 // ── POST /api/subjects ─────────────────────────────────────────
@@ -1062,6 +1149,7 @@ async function handlePutSubjects(request, env, corsHeaders) {
   await store.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
+  await purgeGroupCdnCache(env, group);
   return jsonResponse({ ok: true, semester: sem, count: subjects.length }, corsHeaders);
 }
 
@@ -1079,6 +1167,9 @@ async function handleRecalcHw(request, env, corsHeaders) {
   const group = body.group || env.DEFAULT_GROUP || '131-ИБо';
 
   const result = await recalcHomeworkForGroup(env, group);
+  if (result && result.changed) {
+    await purgeGroupCdnCache(env, group);
+  }
   return jsonResponse({ ok: true, ...result }, corsHeaders);
 }
 
@@ -1391,16 +1482,130 @@ async function handleStatus(request, env, corsHeaders) {
     lastGroup: meta?.lastGroup || null,
     lastWeek: meta?.lastWeek || null,
     campusUpdatedAt: campusUpdatedAt || null,
-  }, corsHeaders);
+  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
 }
 
 // ── Helper ─────────────────────────────────────────────────────
 
-function jsonResponse(data, corsHeaders, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-  });
+// Кеширование на стороне Cloudflare CDN (Custom Domain — kampussgu.dpdns.org).
+// workers.dev CDN не кеширует, но кастомный домен через Workers Route — да.
+// Стратегия:
+//   - reader (нет Authorization):  public,  s-maxage=300, max-age=60  (CDN 5 мин, браузер 1 мин)
+//   - writer (есть Authorization): private, no-store                  (приватность)
+// Варьируем по Authorization, чтобы CDN не смешивал кеши reader/writer.
+const CC_READER_GET  = 'public, max-age=60, s-maxage=300';
+const CC_WRITER_GET  = 'private, no-store';
+const CC_NO_STORE    = 'no-store';
+
+function cacheControlForGet(request) {
+  const auth = request.headers.get('Authorization');
+  return auth && auth.startsWith('Bearer ') ? CC_WRITER_GET : CC_READER_GET;
+}
+
+// Инвалидация CDN-кеша для группы после записи. Удаляем кешированные GET-
+// ответы для этой группы, чтобы следующий reader сразу увидел свежие данные.
+// Cache API на кастомном домене работает; на workers.dev — нет (игнорируем
+// ошибку). Это НЕ считает дополнительным вызовом воркера — вызывается внутри
+// текущего запроса после успешной записи.
+// Очищаем только ключи без Authorization (reader-кеш); writer-ответы и так
+// private, no-store, не кешируются CDN'ом.
+async function purgeGroupCdnCache(env, group) {
+  try {
+    if (typeof caches === 'undefined' || !caches.default) return;
+    const cache = caches.default;
+    const base = new URL(env.INVITE_ORIGIN || 'https://kampussgu.dpdns.org');
+    const paths = [
+      `/api/weeks?group=${encodeURIComponent(group)}`,
+      `/api/schedules?group=${encodeURIComponent(group)}`,
+      `/api/schedule?group=${encodeURIComponent(group)}`,
+      `/api/hw?group=${encodeURIComponent(group)}`,
+      `/api/subjects?group=${encodeURIComponent(group)}`,
+      `/api/status?group=${encodeURIComponent(group)}`,
+    ];
+    await Promise.all(
+      paths.map((p) =>
+        cache.delete(new URL(p, base).toString(), { ignoreMethod: true }).catch(() => {})
+      )
+    );
+  } catch (e) {
+    console.log('[cache] purge failed (ignored):', e.message);
+  }
+}
+
+// Ручное кеширование GET-ответов в CDN через Cache API (caches.default).
+// Работает НЕЗАВИСИМО от Dashboard Cache Rules — гарантирует HIT для reader'ов
+// даже на кастомном домене Pages, где Cache Rule может не применяться.
+//
+// Для writer/owner (с токеном) кеш НЕ используется (private, no-store) — ответ
+// всегда свежий. Для reader (без токена) проверяем кеш, при промахе — бьём
+// воркер, кешируем ответ на TTL из Cache-Control (s-maxage).
+//
+// Возвращает Response. Если caches API недоступен — просто вызывает builder().
+async function cachedGet(request, corsHeaders, builder) {
+  const auth = (request.headers.get('Authorization') || '').startsWith('Bearer ');
+  if (auth) {
+    // Writer/owner — без кеша.
+    return builder();
+  }
+
+  let cache = null;
+  try {
+    if (typeof caches !== 'undefined' && caches.default) cache = caches.default;
+  } catch (_) {
+    cache = null;
+  }
+
+  const cacheKey = new Request(request.url, { method: 'GET' });
+
+  if (cache) {
+    try {
+      const hit = await cache.match(cacheKey, { ignoreMethod: true });
+      if (hit) {
+        const h = new Headers(hit.headers);
+        h.set('CF-Cache-Status', 'HIT');
+        return new Response(hit.body, { status: hit.status, headers: h });
+      }
+    } catch (_) {
+      /* кеш недоступен — идём в builder */
+    }
+  }
+
+  const resp = await builder();
+
+  // Кешируем только успешные JSON-ответы.
+  if (cache && resp.ok && resp.headers.get('Content-Type') === 'application/json') {
+    try {
+      const h = new Headers(resp.headers);
+      h.set('CF-Cache-Status', 'MISS');
+      const toStore = new Response(resp.body, { status: resp.status, headers: h });
+      // Клонируем для ответа клиенту и для записи в кеш (тело можно прочесть 1 раз).
+      const forClient = toStore.clone();
+      if (typeof currentCtx !== 'undefined' && currentCtx && currentCtx.waitUntil) {
+        currentCtx.waitUntil(cache.put(cacheKey, toStore).catch(() => {}));
+      } else {
+        cache.put(cacheKey, toStore).catch(() => {});
+      }
+      return forClient;
+    } catch (_) {
+      return resp;
+    }
+  }
+
+  return resp;
+}
+
+function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
+  const headers = { ...corsHeaders, 'Content-Type': 'application/json' };
+  if (opts.cacheControl) {
+    headers['Cache-Control'] = opts.cacheControl;
+    // Vary: Authorization ставим ТОЛЬКО для writer/owner-ответов (private),
+    // чтобы CDN не путал их с reader-кешем. Для reader-ответов (public)
+    // Vary НЕ ставим — иначе Cloudflare отказывается кешировать ответ в
+    // CDN (считает ключ кеша зависимым от заголовка, которого у анонимных
+    // запросов нет), и CF-Cache-Status остаётся пустым.
+    if (opts.isPrivate) headers['Vary'] = 'Authorization';
+  }
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 // ════════════════════════════════════════════════════════════════
