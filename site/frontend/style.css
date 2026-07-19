@@ -48,6 +48,7 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
+  overflow-x: hidden;
   transition: background 0.25s ease, color 0.25s ease;
 }
 
@@ -257,6 +258,51 @@ header {
 
 .schedule-content {
   min-height: 200px;
+}
+
+/* Карусель смены недели/дня.
+   Старый слой (.week-leaving) — абсолютно поверх, уезжает в сторону.
+   Новый контент (#scheduleContent) въезжает с противоположной.
+   Оба видны частично в момент пересечения. */
+.schedule-content {
+  position: relative;
+}
+.schedule-content .week-leaving-fixed {
+  position: fixed;
+  z-index: 50;
+  background: var(--bg);
+  border-radius: var(--radius);
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+.schedule-content.anim-next .week-leaving {
+  animation: weekOutLeft 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+.schedule-content.anim-prev .week-leaving {
+  animation: weekOutRight 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+}
+.schedule-content.anim-next {
+  animation: weekInRight 0.34s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.schedule-content.anim-prev {
+  animation: weekInLeft 0.34s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+@keyframes weekOutLeft {
+  from { transform: translate3d(0, 0, 0); opacity: 1; }
+  to   { transform: translate3d(-48%, 0, 0); opacity: 0; }
+}
+@keyframes weekOutRight {
+  from { transform: translate3d(0, 0, 0); opacity: 1; }
+  to   { transform: translate3d(48%, 0, 0); opacity: 0; }
+}
+@keyframes weekInRight {
+  from { transform: translate3d(48%, 0, 0); opacity: 0; }
+  to   { transform: translate3d(0, 0, 0); opacity: 1; }
+}
+@keyframes weekInLeft {
+  from { transform: translate3d(-48%, 0, 0); opacity: 0; }
+  to   { transform: translate3d(0, 0, 0); opacity: 1; }
 }
 
 .loading {
@@ -752,10 +798,23 @@ header {
   justify-content: center;
   z-index: 100;
   padding: 16px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
 }
 
 .modal.hidden {
-  display: none;
+  display: flex;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Явное состояние «открыто» — переключается через JS (double rAF),
+   чтобы transition гарантированно сработал от начального кадра. */
+.modal.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
 }
 
 .modal-content {
@@ -766,6 +825,25 @@ header {
   max-width: 400px;
   max-height: 90vh;
   overflow-y: auto;
+  transform: translateY(12px) scale(0.96);
+  opacity: 0;
+  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.24s ease;
+  will-change: transform, opacity;
+}
+
+.modal.is-open .modal-content {
+  transform: translateY(0) scale(1);
+  opacity: 1;
+}
+
+/* Открытие «из кнопки»: контент вырастает из точки origin. */
+.modal-content.from-origin {
+  transform: translate(var(--from-x, 0), var(--from-y, 0)) scale(0.2);
+  opacity: 0;
+}
+.modal.is-open .modal-content.from-origin {
+  transform: translate(0, 0) scale(1);
+  opacity: 1;
 }
 
 .modal-header {

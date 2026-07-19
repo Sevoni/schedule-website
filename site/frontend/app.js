@@ -495,7 +495,7 @@ async function loadData() {
         }
       }
       if (cachedHw) state.homework = cachedHw;
-      if (cachedSubj) loadedSubjects = cachedSubj;
+      if (cachedSubj) setLoadedSubjects(cachedSubj);
 
       findCurrentWeek();
       renderWeekNav();
@@ -588,7 +588,7 @@ async function bootstrapFromApi(opts = {}) {
       saveHwToCache(data.hw);
     }
     if (Array.isArray(data.subjects)) {
-      loadedSubjects = data.subjects;
+      setLoadedSubjects(data.subjects);
       saveSubjectsToCache(data.subjects);
     }
     if (typeof data.campusUpdatedAt === 'string' && data.campusUpdatedAt) {
@@ -641,7 +641,7 @@ async function bootstrapLegacyFallback(opts = {}) {
 
   try {
     const res = await apiFetch('/api/subjects', { group: state.group });
-    loadedSubjects = res.subjects || [];
+    setLoadedSubjects(res.subjects);
     saveSubjectsToCache(loadedSubjects);
   } catch (e) {
     loadedSubjects = [];
@@ -793,9 +793,11 @@ async function backgroundSync(campusIndices, dbMap) {
 //  - Вперёд, дальше чем на +2 от текущей: из БД, параллельно обновляем из кампуса.
 //  - Вперёд в пределах текущая/+2: эти недели уже должны быть загружены из БД
 //    при открытии; если по какой-то причине нет — берём из кампуса и пишем в БД.
-async function loadSchedule(targetIdx) {
+async function loadSchedule(targetIdx, direction) {
   if (targetIdx < 0 || targetIdx >= state.weeks.length) return;
   state.currentWeekIdx = targetIdx;
+  // Направление для анимации сдвига: 'next' (вправо) / 'prev' (влево).
+  if (direction) animateSchedule(direction);
 
   const w = state.weeks[targetIdx];
 
@@ -1133,8 +1135,8 @@ async function syncAll(anchorIdxOverride = null, opts = {}) {
       saveHwToCache(syncRes.hw); // свежий список ДЗ в клиентский кеш
     }
     if (subjectsProvided) {
-      loadedSubjects = syncRes.subjects;
-      saveSubjectsToCache(syncRes.subjects); // свежий список предметов
+      setLoadedSubjects(syncRes.subjects);
+      saveSubjectsToCache(loadedSubjects); // свежий список предметов
     }
 
     // Обновляем экран той недели, на которой находится пользователь
@@ -1894,17 +1896,91 @@ function renderWeekNav() {
 
   document.getElementById('prevWeek').onclick = () => {
     if (state.currentWeekIdx > 0) {
-      loadSchedule(state.currentWeekIdx - 1);
+      loadSchedule(state.currentWeekIdx - 1, 'prev');
       renderWeekNav();
     }
   };
 
   document.getElementById('nextWeek').onclick = () => {
     if (state.currentWeekIdx < state.weeks.length - 1) {
-      loadSchedule(state.currentWeekIdx + 1);
+      loadSchedule(state.currentWeekIdx + 1, 'next');
       renderWeekNav();
     }
   };
+}
+
+// Карусель смены недели/дня: старый слой уезжает в сторону, новый въезжает
+// Плавное открытие/закрытие модалки (double rAF, чтобы transition сработал
+// от начального кадра, а не мгновенно).
+// originEl — кнопка-источник: модалка «вырастает» из неё (transform-origin).
+function openModal(modal, originEl) {
+  if (!modal) return;
+  modal.classList.remove('hidden');
+
+  const content = modal.querySelector('.modal-content');
+  if (content) content.classList.remove('from-origin');
+
+  // В одном rAF: ставим начальное состояние (из кнопки), делаем reflow,
+  // затем добавляем is-open — transition гарантированно идёт от старта.
+  requestAnimationFrame(() => {
+    if (content && originEl) {
+      const cr = content.getBoundingClientRect();
+      const br = originEl.getBoundingClientRect();
+      const ox = br.left + br.width / 2 - (cr.left + cr.width / 2);
+      const oy = br.top + br.height / 2 - (cr.top + cr.height / 2);
+      content.style.transformOrigin = 'center center';
+      content.style.setProperty('--from-x', ox + 'px');
+      content.style.setProperty('--from-y', oy + 'px');
+      content.classList.add('from-origin');
+    }
+    void (content ? content.offsetWidth : 0); // reflow — зафиксировать старт
+    modal.classList.add('is-open');
+  });
+}
+
+function closeModal(modal) {
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  setTimeout(() => modal.classList.add('hidden'), 240);
+}
+
+// с противоположной. Между ними — момент, когда видны оба частично.
+// direction: 'next' или 'prev'.
+function animateSchedule(direction) {
+  const el = document.getElementById('scheduleContent');
+  if (!el) return;
+
+  // Убираем предыдущий leaving-оверлей, если анимация ещё не завершилась.
+  const prev = document.querySelector('.week-leaving-fixed');
+  if (prev) prev.remove();
+
+  // Клонируем ТЕКУЩЕЕ содержимое в отдельный fixed-оверлей поверх расписания.
+  // Оверлей живёт в <body>, поэтому последующий renderDaySchedule (innerHTML=)
+  // его не стирает — старый день/неделя уезжают в сторону целиком.
+  const rect = el.getBoundingClientRect();
+  const leaving = document.createElement('div');
+  leaving.className = 'week-leaving-fixed';
+  leaving.style.top = rect.top + 'px';
+  leaving.style.left = rect.left + 'px';
+  leaving.style.width = rect.width + 'px';
+  leaving.style.minHeight = rect.height + 'px';
+  leaving.innerHTML = el.innerHTML;
+  document.body.appendChild(leaving);
+
+  const cls = direction === 'prev' ? 'anim-prev' : 'anim-next';
+  el.classList.remove('anim-next', 'anim-prev');
+  void el.offsetWidth; // reflow — перезапуск анимации
+  el.classList.add(cls);
+
+  // Новый контент (добавится renderDaySchedule после этой функции)
+  // анимируется въездом через CSS `.anim-next` / `.anim-prev` на #scheduleContent.
+  // Снимаем класс чуть раньше удаления оверлея, чтобы не было «дёрга».
+  setTimeout(() => {
+    el.classList.remove('anim-next', 'anim-prev');
+  }, 300);
+  setTimeout(() => {
+    if (leaving.parentNode) leaving.remove();
+  }, 380);
 }
 
 // ── Schedule rendering ────────────────────────────────────────
@@ -1939,9 +2015,14 @@ function renderDayTabs() {
     tab.title = day + ' (' + state.schedule.days[day].date + ')';
 
     tab.onclick = () => {
+      const prevDay = state.selectedDay;
       state.selectedDay = day;
       document.querySelectorAll('.day-tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
+      // Направление сдвига зависит от порядка дня в неделе.
+      const dayKeys = Object.keys(state.schedule.days);
+      const dir = dayKeys.indexOf(day) >= dayKeys.indexOf(prevDay) ? 'next' : 'prev';
+      animateSchedule(dir);
       renderDaySchedule(day);
     };
 
@@ -2039,7 +2120,7 @@ function renderDaySchedule(day) {
     content.querySelectorAll('.pair-add-hw').forEach(btn => {
     btn.onclick = (e) => {
       e.stopPropagation();
-      openHwModal(btn.dataset.subj, btn.dataset.type, btn.dataset.subgroup);
+      openHwModal(btn.dataset.subj, btn.dataset.type, btn.dataset.subgroup, null, btn);
     };
   });
 
@@ -2129,16 +2210,21 @@ function updateSyncUI(status, errorMsg) {
 
 let loadedSubjects = [];
 
+// Защита: отбрасываем записи без валидного subject (чтобы не падало .toLowerCase()).
+function setLoadedSubjects(arr) {
+  loadedSubjects = (Array.isArray(arr) ? arr : []).filter(s => s && typeof s.subject === 'string');
+}
+
 async function loadSubjects() {
   // Сначала кеш (TTL 10 мин) — экономия /api/subjects при повторных открытиях.
   const cached = loadSubjectsFromCache();
   if (cached) {
-    loadedSubjects = cached;
+    setLoadedSubjects(cached);
     return;
   }
   try {
     const res = await apiFetch('/api/subjects', { group: state.group });
-    loadedSubjects = res.subjects || [];
+    setLoadedSubjects(res.subjects);
     saveSubjectsToCache(loadedSubjects);
   } catch (e) {
     loadedSubjects = [];
@@ -2522,14 +2608,14 @@ function setupHomeworkModal() {
   const customWrap = document.getElementById('hwSubjectCustomWrap');
   const pairTypeWrap = document.getElementById('hwPairTypeWrap');
 
-  document.getElementById('addHomeworkBtn').onclick = () => {
+  document.getElementById('addHomeworkBtn').onclick = (e) => {
     editingHwId = null;
     const cur = getCurrentPair();
     if (cur) {
       const sub = cur.subgroup ? cur.subgroup.replace(/\D/g, '') : '';
-      openHwModal(cur.subject, cur.type || '', sub);
+      openHwModal(cur.subject, cur.type || '', sub, e.currentTarget);
     } else {
-      openHwModal();
+      openHwModal(undefined, undefined, undefined, e.currentTarget);
     }
   };
 
@@ -2686,7 +2772,7 @@ function setupHomeworkModal() {
       renderHomework();
       if (state.schedule) renderDayTabs();
       resetDeleteState();
-      modal.classList.add('hidden');
+      closeModal(modal);
       invalidateHwCache(); // ДЗ изменилось — сбрасываем клиентский кеш
     } catch (e) {
       console.warn('HW save failed:', e.message);
@@ -2738,7 +2824,7 @@ function setupHomeworkModal() {
       editingHwId = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
-      modal.classList.add('hidden');
+      closeModal(modal);
       invalidateHwCache(); // ДЗ изменилось — сбрасываем клиентский кеш
     } catch (e) {
       console.warn('HW delete failed:', e.message);
@@ -2752,14 +2838,14 @@ function setupHomeworkModal() {
   document.getElementById('closeHomework').onclick = () => {
     editingHwId = null;
     resetDeleteState();
-    modal.classList.add('hidden');
+    closeModal(modal);
   };
   const prevModalClick = modal.onclick;
   modal.onclick = (e) => {
     if (e.target === modal) {
       editingHwId = null;
       resetDeleteState();
-      modal.classList.add('hidden');
+      closeModal(modal);
     }
     if (prevModalClick) prevModalClick(e);
   };
@@ -2818,7 +2904,7 @@ function setPairTypeFromSelected(val) {
   }
 }
 
-function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
+function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl) {
   const modal = document.getElementById('homeworkModal');
   const sel = document.getElementById('hwSubject');
   const customWrap = document.getElementById('hwSubjectCustomWrap');
@@ -2887,7 +2973,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
 
   // Preselect
   if (existingHw) {
-    const match = loadedSubjects.find(s => s.subject.toLowerCase() === existingHw.subject.toLowerCase());
+    const match = loadedSubjects.find(s => s.subject.toLowerCase() === (existingHw.subject || '').toLowerCase());
     const todayMatch = todayPairs.find(p => {
       if (p.subject.toLowerCase() !== existingHw.subject.toLowerCase()) return false;
       if (existingHw.pairType && existingHw.pairType !== 'any' && p.type !== existingHw.pairType) return false;
@@ -3043,7 +3129,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
     updateSubgroupVisibility(preSubgroup);
   }
 
-  modal.classList.remove('hidden');
+  openModal(modal, originEl);
   collapseSelected();
   document.getElementById('hwTask').focus();
 }
@@ -3211,12 +3297,12 @@ function renderHomework() {
      };
    });
 
-   list.querySelectorAll('.hw-edit').forEach(btn => {
-     btn.onclick = () => {
-       const hw = state.homework.find(h => h.id === btn.dataset.id);
-       if (hw) openHwModal(null, null, null, hw);
-     };
-   });
+    list.querySelectorAll('.hw-edit').forEach(btn => {
+      btn.onclick = () => {
+        const hw = state.homework.find(h => h.id === btn.dataset.id);
+        if (hw) openHwModal(null, null, null, hw, btn);
+      };
+    });
 }
 
 // ── Settings Modal ────────────────────────────────────────────
@@ -3523,7 +3609,7 @@ function setupSettingsModal() {
       buildAccentPicker();
       // Роль (вынесена из шапки)
       renderRoleStatus();
-      modal.classList.remove('hidden');
+      openModal(modal, document.getElementById('settingsBtn'));
 
     // Обновляем видимость секции приглашений под текущего пользователя.
     if (setupInviteSection._refresh) setupInviteSection._refresh();
@@ -3567,8 +3653,8 @@ function setupSettingsModal() {
     }
   };
 
-  document.getElementById('closeSettings').onclick = () => modal.classList.add('hidden');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+  document.getElementById('closeSettings').onclick = () => closeModal(modal);
+  modal.onclick = (e) => { if (e.target === modal) closeModal(modal); };
 
   // Переключение темы в реальном времени (без перезагрузки).
   document.querySelectorAll('input[name="theme-mode"]').forEach((r) => {
@@ -3608,7 +3694,7 @@ function setupSettingsModal() {
     localStorage.setItem('apiBase', state.apiBase);
     localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
     localStorage.setItem('subgroupFilter', state.subgroupFilter);
-    modal.classList.add('hidden');
+    closeModal(modal);
 
     // Смена группы должна перепроверить права: приглашение привязано к
     // конкретной группе, поэтому writerToken может перестать быть валидным.
