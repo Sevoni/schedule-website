@@ -1168,6 +1168,13 @@ header {
   color: var(--accent);
   font-weight: 600;
 }
+.invite-copy {
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+.invite-copy:hover {
+  opacity: 0.8;
+}
 .invite-label {
   color: var(--text);
 }

@@ -301,7 +301,7 @@ async function becomeOwner(code, opts = {}) {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + code,
       },
-      body: JSON.stringify({ group: state.group }),
+      body: JSON.stringify({ group: state.group, dryRun: true }),
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.ok) {
@@ -311,8 +311,8 @@ async function becomeOwner(code, opts = {}) {
       localStorage.setItem('ownerRole', '1');
       const section = document.getElementById('inviteSection');
       if (section) section.classList.add('is-owner');
-      // Ссылку owner создаёт сам через кнопку «Создать ссылку-приглашение» —
-      // здесь только сохраняем права, авто-создания не делаем.
+      // Только подтверждаем права owner (dryRun), новую ссылку не создаём.
+      // Ссылку owner создаёт сам через кнопку «Создать ссылку-приглашение».
       showToast('Права владельца активированы', 'ok');
       refreshEditVisibility();
       if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
@@ -3269,9 +3269,9 @@ function setupInviteSection() {
         const created = it.createdAt ? formatDateTime(it.createdAt) : '';
         const label = it.label ? escHtml(it.label) : '';
         return `
-          <div class="invite-item" data-id="${escHtml(it.id)}">
+          <div class="invite-item" data-id="${escHtml(it.id)}" data-token="${escHtml(it.token || '')}">
             <div class="invite-meta">
-              <span class="invite-id">#${escHtml(it.id)}</span>
+              <span class="invite-id invite-copy" title="Нажмите, чтобы скопировать ссылку">#${escHtml(it.id)}</span>
               <span class="invite-label-text">${label || '<i>без названия</i>'}</span>
               <span class="invite-date">${created}</span>
             </div>
@@ -3302,6 +3302,11 @@ function setupInviteSection() {
             btn.disabled = false;
           }
         };
+      });
+
+      // Копировать ссылку по клику на id
+      listEl.querySelectorAll('.invite-copy').forEach(el => {
+        el.onclick = () => copyInviteLink(el);
       });
 
       // Переименовать — показать inline-поле
@@ -3552,6 +3557,68 @@ function showToast(msg, kind) {
 function parseDate(str) {
   const [d, m, y] = str.split('.');
   return new Date(parseInt(y), parseInt(m) - 1, parseInt(d));
+}
+
+// Копирует пригласительную ссылку в буфер обмена несколькими способами
+// (clipboard API → execCommand → contentEditable) и показывает тост о результате.
+function copyInviteLink(el) {
+  const item = el.closest('.invite-item');
+  const token = item ? item.dataset.token : '';
+  if (!token) {
+    showToast('Нет токена для копирования', 'warn');
+    return;
+  }
+  const origin = (state.apiBase || 'https://kampussgu.dpdns.org').replace(/\/api\/?$/, '').replace(/\/+$/, '');
+  const link = origin + '/?token=' + encodeURIComponent(token);
+
+  function done(ok) {
+    if (ok) showToast('Ссылка скопирована', 'ok');
+    else showToast('Не удалось скопировать: ' + link, 'warn');
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+    navigator.clipboard.writeText(link).then(() => done(true), () => fallbackCopy(link, done));
+  } else {
+    fallbackCopy(link, done);
+  }
+}
+
+function fallbackCopy(text, done) {
+  // textarea + execCommand
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) { done(true); return; }
+  } catch (e) { /* fall through */ }
+
+  // contentEditable + execCommand (более надёжно в некоторых браузерах)
+  try {
+    const range = document.createRange();
+    const span = document.createElement('span');
+    span.textContent = text;
+    span.style.position = 'fixed';
+    span.style.top = '-1000px';
+    span.contentEditable = 'true';
+    document.body.appendChild(span);
+    range.selectNodeContents(span);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(span);
+    done(ok);
+    return;
+  } catch (e) { /* fall through */ }
+
+  done(false);
 }
 
 function escHtml(str) {

@@ -328,8 +328,10 @@ async function handleGroupRegister(request, env, corsHeaders) {
 // сам token для отзыва через UI не светим, но хранится внутри inv-by-group).
 
 // POST /api/invite/create
-// Body: { group, label? }. Требует writer/owner. Для owner — group из body.
-// Возвращает { link, id, token }.
+// Body: { group, label?, dryRun? }. Требует owner. Для owner — group из body.
+// При dryRun=true — только проверяет права owner, НЕ создаёт ссылку
+// (используется для авто-claim'а владельца по ссылке ?owner=<code>).
+// Возвращает { link, id, token } (без dryRun) или { ok: true } (с dryRun).
 async function handleInviteCreate(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) {
@@ -344,6 +346,13 @@ async function handleInviteCreate(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
+  const dryRun = body.dryRun === true || body.dryRun === 'true';
+
+  if (dryRun) {
+    // Только подтверждаем права owner, не создавая ссылку.
+    return jsonResponse({ ok: true }, corsHeaders);
+  }
+
   let group = body.group;
 
   // owner может создавать приглашения для любой группы.
@@ -419,12 +428,12 @@ async function handleInviteList(request, env, corsHeaders) {
   }
 
   const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
-  // Не светим токены наружу — только id/created/label.
-  const items = listRaw.map(({ id, createdAt, label }) => ({
+  const items = listRaw.map(({ id, token, createdAt, label }) => ({
     id,
+    token,
     createdAt,
-    ...(label ? { label } : {},
-  )}));
+    ...(label ? { label } : {}),
+  }));
   return jsonResponse({ ok: true, items }, corsHeaders);
 }
 
