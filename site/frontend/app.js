@@ -35,6 +35,10 @@ let state = {
   selectedDay: null,
   homework: [],
   syncing: false,
+  // Тема оформления: 'dark' | 'light' | 'auto'. По умолчанию тёмная.
+  theme: localStorage.getItem('theme') || 'dark',
+  // Цвет акцента (кнопки). Хранится как hex. По умолчанию синий из :root.
+  accent: localStorage.getItem('accent') || '',
   // Флаг «свежести» списка недель: ставится когда bootstrap или
   // syncWeeksFromCampus обновили state.weeks за последние 60 секунд. Между
   // ними бывает гонка (оба тянут недели параллельно), что приводит к
@@ -168,6 +172,79 @@ function isOwner() {
   return isWriter() && state.ownerRole;
 }
 
+// ── Тема и акцент ───────────────────────────────────────────
+function resolveTheme() {
+  if (state.theme === 'auto') {
+    const prefersLight = window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: light)').matches;
+    return prefersLight ? 'light' : 'dark';
+  }
+  return state.theme === 'light' ? 'light' : 'dark';
+}
+
+function applyTheme() {
+  const t = resolveTheme();
+  document.documentElement.setAttribute('data-theme', t);
+  // Следим за системной темой, только если выбран auto.
+  if (window._themeMq) {
+    window._themeMq.removeEventListener('change', window._themeMqHandler);
+  }
+  if (state.theme === 'auto') {
+    if (!window._themeMq) {
+      window._themeMq = window.matchMedia('(prefers-color-scheme: light)');
+    }
+    window._themeMqHandler = () => {
+      document.documentElement.setAttribute('data-theme', resolveTheme());
+    };
+    window._themeMq.addEventListener('change', window._themeMqHandler);
+  }
+}
+
+function applyAccent() {
+  if (state.accent) {
+    document.documentElement.style.setProperty('--accent', state.accent);
+    // accent-dim — чуть темнее для hover/gradients.
+    document.documentElement.style.setProperty('--accent-dim', shade(state.accent, -0.18));
+  } else {
+    document.documentElement.style.removeProperty('--accent');
+    document.documentElement.style.removeProperty('--accent-dim');
+  }
+}
+
+// Затемнение/осветление hex-цвета на долю f (-1..1).
+function shade(hex, f) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!m) return hex;
+  let r = parseInt(m[1], 16), g = parseInt(m[2], 16), b = parseInt(m[3], 16);
+  const adj = (c) => {
+    const v = Math.round(f < 0 ? c * (1 + f) : c + (255 - c) * f);
+    return Math.max(0, Math.min(255, v));
+  };
+  r = adj(r); g = adj(g); b = adj(b);
+  return '#' + [r, g, b].map((c) => c.toString(16).padStart(2, '0')).join('');
+}
+
+// Заглушка для совместимости: иконки через <use href="#icon-x"> рендерятся
+// сами из инлайн-спрайта в index.html. Вызывается после обновлений DOM на всякий случай.
+function refreshIcons() {}
+
+// Делегированный обработчик анимаций клика для кнопок с data-anim.
+function setupAnimations() {
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-anim]');
+    if (!btn) return;
+    const type = btn.getAttribute('data-anim');
+    const map = { spin: 'anim-spin', scale: 'anim-scale', 'slide-right': 'anim-slide-right', 'slide-left': 'anim-slide-left' };
+    const cls = map[type];
+    if (!cls) return;
+    btn.classList.remove(cls);
+    // reflow, чтобы перезапустить transition
+    void btn.offsetWidth;
+    btn.classList.add(cls);
+    setTimeout(() => btn.classList.remove(cls), 600);
+  });
+}
+
 let editingHwId = null;
 
 // Множество id ДЗ, отмеченных пользователем как выполненные (локально, per-группа).
@@ -211,6 +288,12 @@ function getCurrentWeekSchedule() {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  // Тема и акцент — применяем максимально рано, до рендера.
+  applyTheme();
+  applyAccent();
+  setupAnimations();
+  refreshIcons();
+
   setupSettingsModal();
   setupHomeworkModal();
   setupTgSection();
@@ -335,39 +418,38 @@ function refreshEditVisibility() {
   const addBtn = document.getElementById('addHomeworkBtn');
   if (addBtn) addBtn.style.display = writer ? '' : 'none';
 
-  // Кнопка 🔄 синхронизации: для reader — прячем, вместо неё бейдж «только чтение».
+  // Кнопка синхронизации: для reader — прячем.
   const syncBtn = document.getElementById('syncBtn');
-  const readBadge = document.getElementById('readerBadge');
   if (syncBtn) syncBtn.style.display = writer ? '' : 'none';
-  if (readBadge) readBadge.style.display = writer ? 'none' : '';
 
-  // Подпись «(только чтение)» в шапке.
-  updateGroupHeaderBadge();
-
-  // Перерисовка списка ДЗ (там есть кнопки ✓/✎) — скроются через render.
+  // Перерисовка списка ДЗ (там есть кнопки выполнено/редактировать) — скроются через render.
   if (state.homework && state.homework.length) renderHomework();
+
+  // Обновляем блок роли в настройках (на случай смены writer/owner).
+  renderRoleStatus();
 }
 
-// Дописывает к имени группы бейдж «(только чтение)» или «(редактирование)».
-function updateGroupHeaderBadge() {
-  const nameEl = document.getElementById('groupName');
-  if (!nameEl) return;
-  // Имя оставляем как есть — applyScheduleHeader его перезаписывает. Поэтому
-  // бейдж держим отдельным span и управляем только им.
-  let badge = document.getElementById('groupAccessBadge');
-  if (!badge) {
-    badge = document.createElement('span');
-    badge.id = 'groupAccessBadge';
-    badge.className = 'group-access-badge';
-    nameEl.parentNode.insertBefore(badge, nameEl.nextSibling);
-  }
-  if (isWriter()) {
-    badge.textContent = isOwner() ? '· владелец' : '· редактор';
-    badge.className = 'group-access-badge badge-writer';
+// Заполняет блок «Ваша роль» в настройках (роль больше не показывается в шапке).
+function renderRoleStatus() {
+  const el = document.getElementById('roleStatus');
+  if (!el) return;
+  let role, icon, cls, desc;
+  if (isOwner()) {
+    role = 'Владелец'; icon = 'crown'; cls = 'role-owner';
+    desc = 'Полный доступ: редактирование, ссылки-приглашения.';
+  } else if (isWriter()) {
+    role = 'Редактор'; icon = 'pencil'; cls = 'role-writer';
+    desc = 'Можно редактировать расписание и ДЗ.';
   } else {
-    badge.textContent = '· только чтение';
-    badge.className = 'group-access-badge badge-reader';
+    role = 'Только чтение'; icon = 'eye'; cls = 'role-reader';
+    desc = 'Откройте ссылку-приглашение, чтобы редактировать.';
   }
+  el.className = 'role-status ' + cls;
+  el.innerHTML =
+    '<svg class="role-icon"><use href="#icon-' + icon + '"></use></svg>' +
+    '<div><div class="role-label">' + role + '</div>' +
+    '<div class="role-desc">' + desc + '</div></div>';
+  refreshIcons();
 }
 
 // ── Main data loading ─────────────────────────────────────────
@@ -376,7 +458,7 @@ function updateGroupHeaderBadge() {
 //  1. При загрузке сайта берём из БД: предыдущую неделю, текущую и две следующих,
 //     и сразу отрисовываем (БД — источник первым делом, кампус НЕ блокирует экран).
 //     Параллельно (если campusEnabled) в фоне запускается полная логика синхронизации
-//     как по кнопке 🔄: check-campus-update, при изменении — текущая + 5 недель вперёд
+//     как по кнопке синхронизации: check-campus-update, при изменении — текущая + 5 недель вперёд
 //     из кампуса, запись в БД, пересчёт ДЗ. Экран обновляется, только если данные
 //     реально изменились. Если в БД пусто (первый визит) — кампус используется как
 //     запасной источник (синхронизация выполняется ожидаемо, не в фоне).
@@ -447,7 +529,7 @@ async function loadData() {
         await syncWeeksFromCampus(true);
       }
       if (state.weeks.length === 0) {
-        showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите 🔄.', () => syncAll(null, { forceSync: true }));
+        showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.', () => syncAll(null, { forceSync: true }));
         return;
       }
       // Теперь недели известны — дозагружаем стартовые расписания.
@@ -462,7 +544,7 @@ async function loadData() {
     }
 
     if (state.campusEnabled) {
-      // Фон: полноценная синхронизация как по кнопке 🔄. При свежих данных
+      // Фон: полноценная синхронизация как по кнопке синхронизации. При свежих данных
       // (campusUpdatedAt < 5 мин) ранний выход в syncAll. Недели не трогаем,
       // если только что их обновили через bootstrap (markWeeksFresh).
       const cur = findRealCurrentIdx();
@@ -646,7 +728,7 @@ async function loadInitialSchedules() {
   const renderedFromDb = renderFromCache();
 
   if (!renderedFromDb) {
-    content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите 🔄 для синхронизации.</div>';
+      content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите кнопку синхронизации в шапке.</div>';
   }
 
   // Синхронизацию кампуса (syncAll) запускает loadData() — в одном месте,
@@ -902,7 +984,7 @@ function saveSyncMeta(campusUpdatedAt) {
 
 async function syncAll(anchorIdxOverride = null, opts = {}) {
   // opts.forceSync = true → игнорируем свежесть campusUpdatedAt. Используется
-  // при явном клике на 🔄. При авто-открытии страницы (forceSync=false) —
+  // при явном клике на кнопку синхронизации. При авто-открытии страницы (forceSync=false) —
   // пропускаем все запросы, если campusUpdatedAt свежее 5 минут (экономия
   // 2 вызовов воркера: check-campus-update + sync-from-campus).
   const forceSync = !!opts.forceSync;
@@ -925,7 +1007,7 @@ async function syncAll(anchorIdxOverride = null, opts = {}) {
     }
   }
 
-  // Лёгкий шорткат для forceSync=true (наминация 🔄): если campusUpdatedAt
+  // Лёгкий шорткат для forceSync=true (наминация синхронизации): если campusUpdatedAt
   // свежий, всё равно спрашиваем бэкенд, но не качаем неделю-якорь из кампуса
   // и не делаем syncWeeksFromCampus — экономия 6+ campus-запросов. Бэкенд сам
   // скажет needUpdate, если что-то поменялось снаружи нашего кеша.
@@ -1893,7 +1975,7 @@ function renderDaySchedule(day) {
   const activePairs = dayData.pairs.filter(p => p.subject && pairVisibleForSubgroupFilter(p));
 
   if (activePairs.length === 0) {
-    pairsHtml = '<div class="no-pairs">Нет пар 🎉</div>';
+      pairsHtml = '<div class="no-pairs"><svg class="icon" style="width:32px;height:32px"><use href="#icon-party-popper"></use></svg><br>Нет пар</div>';
   } else {
     for (const p of activePairs) {
       const typeClass = PAIR_TYPE_NAMES[p.type] || '';
@@ -1914,7 +1996,7 @@ function renderDaySchedule(day) {
           }
           const done = doneHwIds.has(hw.id);
           const dueText = (hw.author ? escHtml(hw.author) : '');
-          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным">✓</span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
+          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
 
@@ -1932,7 +2014,7 @@ function renderDaySchedule(day) {
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
               ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
-              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ">+</button>
+              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>
             </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
@@ -2032,13 +2114,13 @@ function updateSyncUI(status, errorMsg) {
   if (!el) return;
 
   if (status === 'syncing') {
-    el.innerHTML = '<span class="sync-icon spinning">⟳</span> Синхронизация...';
+    el.innerHTML = '<span class="sync-icon spinning"><svg class="icon" style="width:16px;height:16px"><use href="#icon-refresh-cw"></use></svg></span> Синхронизация...';
     el.className = 'sync-status syncing';
   } else if (status === 'ok') {
-    el.innerHTML = '<span class="sync-icon">✓</span> ' + new Date().toLocaleTimeString('ru');
+    el.innerHTML = '<span class="sync-icon"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span> ' + new Date().toLocaleTimeString('ru');
     el.className = 'sync-status ok';
   } else if (status === 'error') {
-    el.innerHTML = '<span class="sync-icon">✕</span> Ошибка. <button onclick="syncAll(null,{forceSync:true})" class="sync-retry">Повторить</button>';
+    el.innerHTML = '<span class="sync-icon"><svg class="icon" style="width:16px;height:16px"><use href="#icon-x-circle"></use></svg></span> Ошибка. <button onclick="syncAll(null,{forceSync:true})" class="sync-retry">Повторить</button>';
     el.className = 'sync-status error';
   }
 }
@@ -2841,13 +2923,14 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw) {
       document.getElementById('hwDateWrap').classList.remove('hidden');
       if (existingHw.dueDate) {
         const parts = existingHw.dueDate.split('-').map(Number);
-        if (parts[0]) {
-          calState.year = parts[0];
-          calState.month = parts[1] - 1;
-          calState.selectedDate = existingHw.dueDate;
-          renderCalendar(calState.year, calState.month, existingHw.dueDate);
-          document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
-        }
+        // Календарь всегда открывается на текущем месяце (сброс при переоткрытии),
+        // но сохраняем выбранную дату для подсветки.
+        const now = new Date();
+        calState.year = now.getFullYear();
+        calState.month = now.getMonth();
+        calState.selectedDate = existingHw.dueDate;
+        renderCalendar(calState.year, calState.month, existingHw.dueDate);
+        document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
       }
     } else {
       document.getElementById('hwDateWrap').classList.add('hidden');
@@ -3112,8 +3195,8 @@ function renderHomework() {
            ${authorHtml}
          </div>
         ${isWriter() ? `<div class="hw-actions">
-          <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным">✓</button>
-          <button class="hw-edit" data-id="${hw.id}" title="Редактировать">✎</button>
+          <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:18px;height:18px"><use href="#icon-check"></use></svg></button>
+          <button class="hw-edit" data-id="${hw.id}" title="Редактировать"><svg class="icon" style="width:18px;height:18px"><use href="#icon-pencil"></use></svg></button>
         </div>` : ''}
       </div>`;
    }).join('');
@@ -3161,10 +3244,10 @@ function setupTgSection() {
   }
   chatInput.value = state.tgChatId || '';
   if (state.tgChatId) {
-    statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
+    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + state.tgChatId + ')';
     statusEl.className = 'tg-status tg-ok';
   } else {
-    statusEl.textContent = 'ℹ️ Уведомления не настроены';
+    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
     statusEl.className = 'tg-status';
   }
 
@@ -3182,7 +3265,7 @@ function setupTgSection() {
       await apiPost('/api/tg/subscribe', { group: state.group, chatId });
       state.tgChatId = chatId;
       localStorage.setItem('tgChatId', chatId);
-      statusEl.textContent = '✅ Уведомления включены (chat_id: ' + chatId + ')';
+      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + chatId + ')';
       statusEl.className = 'tg-status tg-ok';
       showMsg('Готово! Теперь уведомления будут приходить в Telegram.', 'ok');
     } catch (e) {
@@ -3200,7 +3283,7 @@ function setupTgSection() {
       state.tgChatId = '';
       localStorage.removeItem('tgChatId');
       chatInput.value = '';
-      statusEl.textContent = 'ℹ️ Уведомления не настроены';
+      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
       statusEl.className = 'tg-status';
       showMsg('Отвязано. Уведомления приходить не будут.', 'ok');
     } catch (e) {
@@ -3229,7 +3312,7 @@ function setupInviteSection() {
 
   // ── Создать ссылку-приглашение ──
   function showInviteLink(link) {
-    inviteMsg.innerHTML = '✅ Ссылка готова: <a href="' + escHtml(link) + '" target="_blank" rel="noopener">' + escHtml(link) + '</a> ' +
+    inviteMsg.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Ссылка готова: <a href="' + escHtml(link) + '" target="_blank" rel="noopener">' + escHtml(link) + '</a> ' +
       '<button id="copyInviteBtn" class="btn-secondary">Копировать</button>';
     inviteMsg.className = 'invite-msg tg-ok';
     const cp = document.getElementById('copyInviteBtn');
@@ -3276,7 +3359,7 @@ function setupInviteSection() {
               <span class="invite-date">${created}</span>
             </div>
             <div class="invite-actions">
-              <button class="rename-btn" data-id="${escHtml(it.id)}" title="Переименовать">✎</button>
+              <button class="rename-btn" data-id="${escHtml(it.id)}" title="Переименовать"><svg class="icon" style="width:16px;height:16px"><use href="#icon-pencil"></use></svg></button>
               <button class="revoke-btn" data-id="${escHtml(it.id)}" title="Отозвать">Отозвать</button>
             </div>
             <div class="rename-wrap hidden" data-id="${escHtml(it.id)}">
@@ -3389,19 +3472,58 @@ function copyToClipboard(text, okMsg) {
   }
 }
 
+// Палитра акцентных цветов для кнопок.
+const ACCENT_PALETTE = [
+  '#6c8cff', '#4a65cc', '#3b82f6', '#0ea5e9', '#06b6d4',
+  '#10b981', '#22c55e', '#84cc16', '#eab308', '#f59e0b',
+  '#f97316', '#ef4444', '#ec4899', '#d946ef', '#8b5cf6',
+];
+
+// Строит выбор цвета кнопок (swatch-кнопки). Выбранный цвет сохраняется сразу.
+function buildAccentPicker() {
+  const wrap = document.getElementById('accentPicker');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  ACCENT_PALETTE.forEach((hex) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'accent-swatch' + (state.accent === hex ? ' selected' : '');
+    b.style.background = hex;
+    b.style.color = hex;
+    b.title = hex;
+    b.setAttribute('aria-label', 'Цвет ' + hex);
+    b.onclick = () => {
+      state.accent = hex;
+      localStorage.setItem('accent', hex);
+      applyAccent();
+      wrap.querySelectorAll('.accent-swatch').forEach((s) => s.classList.remove('selected'));
+      b.classList.add('selected');
+      refreshIcons();
+    };
+    wrap.appendChild(b);
+  });
+}
+
 function setupSettingsModal() {
   const modal = document.getElementById('settingsModal');
   let syncMetaLoaded = false;
 
-  document.getElementById('settingsBtn').onclick = () => {
-    document.getElementById('groupInput').value = state.group;
-    document.getElementById('apiUrlInput').value = state.apiBase;
-    document.getElementById('campusToggle').checked = state.campusEnabled;
-    document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
-    document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
-    document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
-    document.getElementById('tgChatIdInput').value = state.tgChatId || '';
-    modal.classList.remove('hidden');
+    document.getElementById('settingsBtn').onclick = () => {
+      document.getElementById('groupInput').value = state.group;
+      document.getElementById('apiUrlInput').value = state.apiBase;
+      document.getElementById('campusToggle').checked = state.campusEnabled;
+      document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
+      document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
+      document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
+      document.getElementById('tgChatIdInput').value = state.tgChatId || '';
+      // Тема
+      const themeRadios = document.querySelectorAll('input[name="theme-mode"]');
+      themeRadios.forEach((r) => { r.checked = (r.value === (state.theme || 'dark')); });
+      // Акцент
+      buildAccentPicker();
+      // Роль (вынесена из шапки)
+      renderRoleStatus();
+      modal.classList.remove('hidden');
 
     // Обновляем видимость секции приглашений под текущего пользователя.
     if (setupInviteSection._refresh) setupInviteSection._refresh();
@@ -3420,10 +3542,10 @@ function setupSettingsModal() {
         state.tgChatId = res.chatId || state.tgChatId;
         localStorage.setItem('tgChatId', state.tgChatId);
         document.getElementById('tgChatIdInput').value = state.tgChatId;
-        statusEl.textContent = '✅ Уведомления включены (chat_id: ' + state.tgChatId + ')';
+        statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + state.tgChatId + ')';
         statusEl.className = 'tg-status tg-ok';
       } else {
-        statusEl.textContent = 'ℹ️ Уведомления не настроены';
+        statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
         statusEl.className = 'tg-status';
       }
     }).catch(() => {});
@@ -3447,6 +3569,17 @@ function setupSettingsModal() {
 
   document.getElementById('closeSettings').onclick = () => modal.classList.add('hidden');
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+
+  // Переключение темы в реальном времени (без перезагрузки).
+  document.querySelectorAll('input[name="theme-mode"]').forEach((r) => {
+    r.addEventListener('change', () => {
+      if (!r.checked) return;
+      state.theme = r.value;
+      localStorage.setItem('theme', state.theme);
+      applyTheme();
+      renderRoleStatus();
+    });
+  });
 
   document.getElementById('resetDoneHw').onclick = () => {
     if (!confirm('Сбросить все отметки «выполнено» для группы ' + state.group + '?')) return;
