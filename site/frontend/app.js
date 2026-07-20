@@ -425,6 +425,9 @@ function refreshEditVisibility() {
   // Перерисовка списка ДЗ (там есть кнопки выполнено/редактировать) — скроются через render.
   if (state.homework && state.homework.length) renderHomework();
 
+  // Перерисовка текущего дня (кнопки + на парах скроются/появятся через render).
+  refreshScheduleView();
+
   // Обновляем блок роли в настройках (на случай смены writer/owner).
   renderRoleStatus();
 }
@@ -1892,7 +1895,14 @@ async function recalcNextPairDates() {
 function renderWeekNav() {
   const label = document.getElementById('weekLabel');
   const w = state.weeks[state.currentWeekIdx];
-  if (w) label.textContent = w.text;
+  if (w) {
+    const paren = w.text.indexOf(' (');
+    if (paren >= 0) {
+      label.innerHTML = `<span>${w.text.slice(0, paren)}</span><span class="week-dates">${w.text.slice(paren + 1)}</span>`;
+    } else {
+      label.textContent = w.text;
+    }
+  }
 
   document.getElementById('prevWeek').onclick = () => {
     if (state.currentWeekIdx > 0) {
@@ -2106,7 +2116,7 @@ function renderDaySchedule(day) {
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
               ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
-              <button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>
+              ${isWriter() ? `<button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>` : ''}
             </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
@@ -3664,8 +3674,16 @@ function setupSettingsModal() {
     }
   };
 
-  document.getElementById('closeSettings').onclick = () => closeModal(modal);
-  modal.onclick = (e) => { if (e.target === modal) closeModal(modal); };
+  function closeSettingsWithAnim() {
+    const btn = document.getElementById('settingsBtn');
+    btn.classList.remove('anim-spin-reverse');
+    void btn.offsetWidth;
+    btn.classList.add('anim-spin-reverse');
+    setTimeout(() => btn.classList.remove('anim-spin-reverse'), 600);
+    closeModal(modal);
+  }
+  document.getElementById('closeSettings').onclick = () => closeSettingsWithAnim();
+  modal.onclick = (e) => { if (e.target === modal) closeSettingsWithAnim(); };
 
   // Переключение темы в реальном времени (без перезагрузки).
   document.querySelectorAll('input[name="theme-mode"]').forEach((r) => {

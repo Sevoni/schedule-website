@@ -70,14 +70,14 @@ body {
 .inline-icon { width: 14px; height: 14px; vertical-align: -2px; }
 
 header {
-  margin-bottom: 16px;
+  margin-bottom: 20px;
 }
 
 .header-top {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 12px;
 }
 
 .header-top h1 {
@@ -117,7 +117,10 @@ header {
   transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .icon-btn.anim-spin .icon {
-  transform: rotate(360deg);
+  animation: spinOnce 0.5s ease forwards;
+}
+.icon-btn.anim-spin-reverse .icon {
+  animation: spinOnceReverse 0.5s ease forwards;
 }
 .icon-btn.anim-scale .icon {
   transform: scale(0.7);
@@ -130,10 +133,20 @@ header {
   transform: translateX(4px);
 }
 
+@keyframes spinOnce {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes spinOnceReverse {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(-360deg); }
+}
+
 .group-info {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-top: 6px;
 }
 
 .sync-status {
@@ -190,7 +203,7 @@ header {
   padding: 12px;
   background: var(--surface);
   border-radius: var(--radius);
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .nav-btn {
@@ -213,14 +226,20 @@ header {
 #weekLabel {
   font-size: 0.9rem;
   color: var(--text-dim);
+  text-align: center;
+}
+
+.week-dates {
+  display: inline-block;
+  white-space: nowrap;
 }
 
 .day-tabs {
   display: flex;
-  gap: 4px;
+  gap: 6px;
   overflow-x: auto;
   padding-bottom: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
   scrollbar-width: none;
 }
 
@@ -230,7 +249,7 @@ header {
 
 .day-tab {
   flex-shrink: 0;
-  padding: 8px 14px;
+  padding: 9px 15px;
   border-radius: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -323,7 +342,7 @@ header {
 .day-header {
   font-size: 1.1rem;
   font-weight: 600;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
   color: var(--text);
 }
 
@@ -338,8 +357,8 @@ header {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px;
-  margin-bottom: 8px;
+  padding: 16px;
+  margin-bottom: 10px;
   transition: border-color 0.2s;
 }
 
@@ -363,7 +382,9 @@ header {
   color: var(--on-accent);
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  padding: 4px;
+  border: 1px solid transparent;
+  border-radius: 9px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -544,10 +565,11 @@ header {
 }
 
 .pair-add-hw {
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  padding: 4px;
   border: 1px solid var(--border);
+  border-radius: 9px;
   background: none;
   color: var(--text-dim);
   font-size: 1rem;
@@ -674,7 +696,7 @@ header {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 12px 14px;
+  padding: 14px;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -1123,7 +1145,7 @@ header {
       "days days"
       "schedule homework";
     gap: 20px;
-    align-items: start;
+    align-items: stretch;
   }
   header,
   #weekNav,
@@ -1141,7 +1163,8 @@ header {
     max-height: calc(100vh - 32px);
     overflow-y: auto;
   }
-  .homework-header { position: sticky; top: 0; background: var(--bg); padding-bottom: 8px; }
+  .homework-header { position: sticky; top: 0; background: var(--bg); padding-bottom: 0; margin-bottom: 14px; align-items: flex-start; }
+  .day-header { margin-top: 0; }
 }
 
 /* ── Telegram settings section ─────────────────────────────── */
