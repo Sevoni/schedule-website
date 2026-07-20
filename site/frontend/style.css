@@ -48,7 +48,7 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  overflow-x: hidden;
+  overflow-x: clip;
   transition: background 0.25s ease, color 0.25s ease;
 }
 
@@ -261,13 +261,13 @@ header {
 }
 
 /* Карусель смены недели/дня.
-   Старый слой (.week-leaving) — абсолютно поверх, уезжает в сторону.
+   Старый слой (.week-leaving-fixed) — абсолютно поверх, уезжает в сторону.
    Новый контент (#scheduleContent) въезжает с противоположной.
    Оба видны частично в момент пересечения. */
 .schedule-content {
   position: relative;
 }
-.schedule-content .week-leaving-fixed {
+.week-leaving-fixed {
   position: fixed;
   z-index: 50;
   background: var(--bg);
@@ -275,10 +275,10 @@ header {
   pointer-events: none;
   will-change: transform, opacity;
 }
-.schedule-content.anim-next .week-leaving {
+.week-leaving-fixed.anim-next {
   animation: weekOutLeft 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
 }
-.schedule-content.anim-prev .week-leaving {
+.week-leaving-fixed.anim-prev {
   animation: weekOutRight 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
 }
 .schedule-content.anim-next {

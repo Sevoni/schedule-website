@@ -1918,22 +1918,32 @@ function openModal(modal, originEl) {
   modal.classList.remove('hidden');
 
   const content = modal.querySelector('.modal-content');
-  if (content) content.classList.remove('from-origin');
 
-  // В одном rAF: ставим начальное состояние (из кнопки), делаем reflow,
-  // затем добавляем is-open — transition гарантированно идёт от старта.
   requestAnimationFrame(() => {
+    if (content) {
+      content.style.transition = 'none';
+      content.classList.remove('from-origin');
+      content.style.setProperty('--from-x', '0px');
+      content.style.setProperty('--from-y', '0px');
+      void content.offsetWidth;
+      content.style.transition = '';
+    }
+
     if (content && originEl) {
       const cr = content.getBoundingClientRect();
       const br = originEl.getBoundingClientRect();
       const ox = br.left + br.width / 2 - (cr.left + cr.width / 2);
       const oy = br.top + br.height / 2 - (cr.top + cr.height / 2);
+
+      content.style.transition = 'none';
       content.style.transformOrigin = 'center center';
       content.style.setProperty('--from-x', ox + 'px');
       content.style.setProperty('--from-y', oy + 'px');
       content.classList.add('from-origin');
+      void content.offsetWidth;
+      content.style.transition = '';
     }
-    void (content ? content.offsetWidth : 0); // reflow — зафиксировать старт
+    void (content ? content.offsetWidth : 0);
     modal.classList.add('is-open');
   });
 }
@@ -1968,6 +1978,7 @@ function animateSchedule(direction) {
   document.body.appendChild(leaving);
 
   const cls = direction === 'prev' ? 'anim-prev' : 'anim-next';
+  leaving.classList.add(cls);
   el.classList.remove('anim-next', 'anim-prev');
   void el.offsetWidth; // reflow — перезапуск анимации
   el.classList.add(cls);
@@ -2613,9 +2624,9 @@ function setupHomeworkModal() {
     const cur = getCurrentPair();
     if (cur) {
       const sub = cur.subgroup ? cur.subgroup.replace(/\D/g, '') : '';
-      openHwModal(cur.subject, cur.type || '', sub, e.currentTarget);
+      openHwModal(cur.subject, cur.type || '', sub, null, e.currentTarget);
     } else {
-      openHwModal(undefined, undefined, undefined, e.currentTarget);
+      openHwModal(undefined, undefined, undefined, null, e.currentTarget);
     }
   };
 
