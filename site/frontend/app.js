@@ -28,6 +28,7 @@ let state = {
   // ownerCode — вводится в настройках. Если совпадает с env.OWNER_CODE, пользователь owner.
   // Хранится отдельно, чтобы можно было «стать владельцем» без перезаписи writerToken.
   ownerRole: localStorage.getItem('ownerRole') === '1',
+  ownerCode: localStorage.getItem('ownerCode') || '',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -166,10 +167,13 @@ function invalidateSubjectsCache() {
 // Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
 // всё равно проверяет бэкенд (requireWriter) — фронтенд здесь не критичен.
 function isWriter() {
-  return !!state.writerToken;
+  return !!state.writerToken || state.ownerRole;
 }
 function isOwner() {
-  return isWriter() && state.ownerRole;
+  return state.ownerRole;
+}
+function getAuthToken() {
+  return state.writerToken || (state.ownerRole ? state.ownerCode : '');
 }
 
 // ── Тема и акцент ───────────────────────────────────────────
@@ -335,10 +339,9 @@ async function consumeInviteTokenFromUrl() {
     const data = await resp.json();
     if (resp.ok && data.ok && data.group) {
       // Сохраняем токен writer'а (он же используется как Bearer).
+      // ownerRole не трогаем — он глобальный.
       state.writerToken = data.token;
-      state.ownerRole = false;
       localStorage.setItem('writerToken', data.token);
-      localStorage.setItem('ownerRole', '0');
 
       // Подставляем группу из приглашения. Так пользователь сразу попадёт
       // на ту группу, к которой его пригласили.
@@ -390,8 +393,10 @@ async function becomeOwner(code, opts = {}) {
     if (resp.ok && data.ok) {
       state.writerToken = code;
       state.ownerRole = true;
+      state.ownerCode = code;
       localStorage.setItem('writerToken', code);
       localStorage.setItem('ownerRole', '1');
+      localStorage.setItem('ownerCode', code);
       const section = document.getElementById('inviteSection');
       if (section) section.classList.add('is-owner');
       // Только подтверждаем права owner (dryRun), новую ссылку не создаём.
@@ -1550,9 +1555,7 @@ function parseScheduleHTML(html) {
 function invalidateWriterAccess(reason) {
   if (!state.writerToken) return;
   state.writerToken = '';
-  state.ownerRole = false;
   localStorage.removeItem('writerToken');
-  localStorage.removeItem('ownerRole');
   refreshEditVisibility();
   const section = document.getElementById('inviteSection');
   if (section) section.style.display = 'none';
@@ -1565,10 +1568,11 @@ async function apiFetch(path, params = {}) {
     if (v) url.searchParams.set(k, v);
   }
   const headers = {};
-  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const auth = getAuthToken();
+  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetch(url.toString(), { headers });
   if (!resp.ok) {
-    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error('API ' + resp.status);
   }
   return resp.json();
@@ -1576,7 +1580,8 @@ async function apiFetch(path, params = {}) {
 
 async function apiPost(path, body) {
   const headers = { 'Content-Type': 'application/json' };
-  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const auth = getAuthToken();
+  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetch(state.apiBase + path, {
     method: 'POST',
     headers,
@@ -1584,7 +1589,7 @@ async function apiPost(path, body) {
   });
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -1596,11 +1601,12 @@ async function apiDelete(path, params = {}) {
     if (v) url.searchParams.set(k, v);
   }
   const headers = {};
-  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const auth = getAuthToken();
+  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetch(url.toString(), { method: 'DELETE', headers });
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -1608,7 +1614,8 @@ async function apiDelete(path, params = {}) {
 
 async function apiPut(path, body) {
   const headers = { 'Content-Type': 'application/json' };
-  if (state.writerToken) headers['Authorization'] = 'Bearer ' + state.writerToken;
+  const auth = getAuthToken();
+  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetch(state.apiBase + path, {
     method: 'PUT',
     headers,
@@ -1616,7 +1623,7 @@ async function apiPut(path, body) {
   });
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && state.writerToken) invalidateWriterAccess();
+    if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -3338,11 +3345,8 @@ function setupTgSection() {
   const linkEl = document.getElementById('tgBotLink');
   const chatInput = document.getElementById('tgChatIdInput');
   const msgEl = document.getElementById('tgMsg');
-  const subBtn = document.getElementById('tgSubscribe');
-  const unsubBtn = document.getElementById('tgUnsubscribe');
+  const actionsEl = document.getElementById('tgActions');
 
-  // Статический рендер известных данных (без HTTP-запроса). Полные данные
-  // подтянутся при первом открытии модалки настроек (см. setupSettingsModal).
   if (state.tgBotUsername) {
     linkEl.href = 'https://t.me/' + state.tgBotUsername;
     linkEl.textContent = '@' + state.tgBotUsername;
@@ -3363,10 +3367,32 @@ function setupTgSection() {
     msgEl.className = 'tg-msg' + (kind ? ' tg-' + kind : '');
   }
 
-  subBtn.onclick = async () => {
+  function renderTgButtons() {
+    const currentVal = chatInput.value.trim();
+    const isBound = !!state.tgChatId;
+    const isChanged = isBound && currentVal !== state.tgChatId;
+    actionsEl.innerHTML = '';
+    if (!isBound || isChanged) {
+      const sub = document.createElement('button');
+      sub.className = 'save-btn';
+      sub.textContent = 'Привязать';
+      sub.onclick = doSubscribe;
+      actionsEl.appendChild(sub);
+    }
+    if (isBound) {
+      const unsub = document.createElement('button');
+      unsub.className = 'btn-secondary';
+      unsub.textContent = 'Отвязать';
+      unsub.onclick = doUnsubscribe;
+      actionsEl.appendChild(unsub);
+    }
+  }
+
+  chatInput.addEventListener('input', renderTgButtons);
+
+  async function doSubscribe() {
     const chatId = chatInput.value.trim();
     if (!chatId) { showMsg('Введите chat_id из сообщения бота', 'warn'); return; }
-    subBtn.disabled = true;
     showMsg('Проверяем…', '');
     try {
       await apiPost('/api/tg/subscribe', { group: state.group, chatId });
@@ -3375,16 +3401,14 @@ function setupTgSection() {
       statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + chatId + ')';
       statusEl.className = 'tg-status tg-ok';
       showMsg('Готово! Теперь уведомления будут приходить в Telegram.', 'ok');
+      renderTgButtons();
     } catch (e) {
       showMsg('Ошибка: ' + (e.message || 'не удалось привязать'), 'warn');
-    } finally {
-      subBtn.disabled = false;
     }
-  };
+  }
 
-  unsubBtn.onclick = async () => {
+  async function doUnsubscribe() {
     if (!state.tgChatId) { showMsg('Привязка отсутствует', 'warn'); return; }
-    unsubBtn.disabled = true;
     try {
       await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
       state.tgChatId = '';
@@ -3393,12 +3417,13 @@ function setupTgSection() {
       statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
       statusEl.className = 'tg-status';
       showMsg('Отвязано. Уведомления приходить не будут.', 'ok');
+      renderTgButtons();
     } catch (e) {
       showMsg('Ошибка: ' + (e.message || 'не удалось отвязать'), 'warn');
-    } finally {
-      unsubBtn.disabled = false;
     }
-  };
+  }
+
+  renderTgButtons();
 }
 
 // ── Invite links UI (writer/owner) ────────────────────────────
@@ -3617,7 +3642,6 @@ function setupSettingsModal() {
 
     document.getElementById('settingsBtn').onclick = () => {
       document.getElementById('groupInput').value = state.group;
-      document.getElementById('apiUrlInput').value = state.apiBase;
       document.getElementById('campusToggle').checked = state.campusEnabled;
       document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
       document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
@@ -3655,6 +3679,7 @@ function setupSettingsModal() {
         statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
         statusEl.className = 'tg-status';
       }
+      document.getElementById('tgChatIdInput').dispatchEvent(new Event('input'));
     }).catch(() => {});
 
     if (!syncMetaLoaded) {
@@ -3707,34 +3732,26 @@ function setupSettingsModal() {
 
   document.getElementById('saveSettings').onclick = () => {
     const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
-    const newApiBase = document.getElementById('apiUrlInput').value.trim();
     const newCampusEnabled = document.getElementById('campusToggle').checked;
     const newSubgroupFilter = document.getElementById('subgroupFilter').value || 'any';
 
     const groupChanged = newGroup !== state.group;
-    const apiChanged = newApiBase !== state.apiBase;
     const campusChanged = newCampusEnabled !== state.campusEnabled;
 
     state.group = newGroup;
-    state.apiBase = newApiBase;
     state.campusEnabled = newCampusEnabled;
     state.subgroupFilter = newSubgroupFilter;
     localStorage.setItem('group', state.group);
-    localStorage.setItem('apiBase', state.apiBase);
     localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
     localStorage.setItem('subgroupFilter', state.subgroupFilter);
     closeModal(modal);
 
-    // Смена группы должна перепроверить права: приглашение привязано к
-    // конкретной группе, поэтому writerToken может перестать быть валидным.
-    // Сбрасываем writer-статус при смене группы — пользователь переходит по
-    // ссылке заново (или вводит owner-код). Это безопаснее, чем оставлять
-    // токен чужой группы.
-    if (groupChanged) {
+    // Смена группы: writerToken привязан к группе, может стать невалидным.
+    // Но ownerRole глобальный — OWNER_CODE работает для любой группы,
+    // поэтому токен не очищаем если пользователь owner.
+    if (groupChanged && !state.ownerRole) {
       state.writerToken = '';
-      state.ownerRole = false;
       localStorage.removeItem('writerToken');
-      localStorage.removeItem('ownerRole');
       refreshEditVisibility();
       // Кеш расписаний per-group: при смене группы обнуляем, чтобы старые
       // данные чужой группы не попали в новую (ключ кеша зависит от группы,
@@ -3750,7 +3767,7 @@ function setupSettingsModal() {
     if (groupChanged) {
       doneHwIds = loadDoneHw();
     }
-    if (!groupChanged && !apiChanged && !campusChanged) {
+    if (!groupChanged && !campusChanged) {
       state.selectedDay = null;
       renderHomework();
       if (state.schedule) renderDayTabs();

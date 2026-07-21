@@ -87,13 +87,10 @@
           Группа
           <input type="text" id="groupInput" placeholder="131-ИБо">
         </label>
-        <label>
-          API URL (Worker)
-          <input type="text" id="apiUrlInput" placeholder="https://your-worker.workers.dev">
-        </label>
         <label class="settings-toggle">
           <input type="checkbox" id="campusToggle">
-          <span>Загружать расписание с campus.syktsu.ru</span>
+          <span class="toggle-track"></span>
+          <span class="settings-toggle-label">Загружать расписание с campus.syktsu.ru</span>
         </label>
         <label>
           Подгруппа
@@ -103,10 +100,6 @@
             <option value="2">Подгруппа 2</option>
           </select>
         </label>
-        <div class="settings-note">
-          Если загрузка из кампуса отключена, расписание берётся только из БД.
-          Нажмите кнопку <svg class="icon inline-icon"><use href="#icon-refresh-cw"></use></svg> (в шапке) для принудительной синхронизации.
-        </div>
 
         <hr class="settings-divider">
 
@@ -123,10 +116,7 @@
             <input type="text" id="tgChatIdInput" placeholder="например 123456789">
           </label>
           <div id="tgMsg" class="tg-msg hidden"></div>
-          <div class="tg-actions">
-            <button id="tgSubscribe" class="save-btn">Привязать</button>
-            <button id="tgUnsubscribe" class="btn-secondary">Отвязать</button>
-          </div>
+          <div id="tgActions" class="tg-actions"></div>
         </div>
 
         <hr class="settings-divider">
@@ -155,7 +145,6 @@
 
         <div class="hw-reset-section">
           <h3><svg class="icon icon-h3"><use href="#icon-trash-2"></use></svg> Данные</h3>
-          <p class="settings-note">Сбросить локальные отметки «выполнено» для текущей группы. Сами записи ДЗ не удаляются.</p>
           <button id="resetDoneHw" class="btn-secondary">Сбросить отметки «выполнено»</button>
         </div>
 
