@@ -118,6 +118,11 @@ function invalidateSchedCache() {
     localStorage.removeItem(schedCacheKey());
   } catch (e) { /* ignore */ }
 }
+function invalidateWeeksCache() {
+  try {
+    localStorage.removeItem(weeksCacheKey());
+  } catch (e) { /* ignore */ }
+}
 
 // Кеш ДЗ per-group: `hwCache:{group}` = { ts, data }
 // TTL 5 минут — синхронизация с бэкендом приносит свежий список в ответе
@@ -472,6 +477,13 @@ function refreshEditVisibility() {
   // Кнопка синхронизации: для reader — прячем.
   const syncBtn = document.getElementById('syncBtn');
   if (syncBtn) syncBtn.style.display = writer ? '' : 'none';
+
+  // Переключатель кампуса: для reader — прячем.
+  const campusToggle = document.getElementById('campusToggle');
+  if (campusToggle) {
+    const toggleLabel = campusToggle.closest('label');
+    if (toggleLabel) toggleLabel.style.display = writer ? '' : 'none';
+  }
 
   // Перерисовка списка ДЗ (там есть кнопки выполнено/редактировать) — скроются через render.
   if (state.homework && state.homework.length) renderHomework();
@@ -3395,23 +3407,23 @@ function renderHomework() {
    // Просроченные ДЗ убираем из общего списка внизу. Их всё ещё можно увидеть
    // на дне сдачи — при переходе на прошедший день через расписание.
    const f = state.subgroupFilter || 'any';
-   const visible = sorted.filter(hw => {
-     // Выполненное ДЗ скрываем из нижнего списка (но оно остаётся в меню дней).
-     if (doneHwIds.has(hw.id)) return false;
-     if (!hw.dueDate) return true;
-      const due = new Date(hw.dueDate);
-      due.setHours(0, 0, 0, 0);
-      if (due < today) return false;
-      // Сегодняшнее ДЗ на пару, которая уже прошла (>= 1.5ч с начала) — скрываем.
-      if (due.getTime() === today.getTime() && isHwPairFinished(hw)) return false;
-     // Фильтр подгруппы: ДЗ «any» (для обеих) видно всегда;
-     // иначе оставляем только ДЗ своей подгруппы.
-     if (f !== 'any') {
-       const hwSub = hw.subgroup || 'any';
-       if (hwSub !== 'any' && hwSub !== f) return false;
-     }
-     return true;
-   });
+    const visible = sorted.filter(hw => {
+      // Выполненное ДЗ скрываем из нижнего списка (но оно остаётся в меню дней).
+      if (doneHwIds.has(hw.id)) return false;
+      // Фильтр подгруппы — проверяем ПЕРВЫМ делом (до dueDate),
+      // иначе ДЗ без даты всегда проходит мимо фильтра.
+      if (f !== 'any') {
+        const hwSub = hw.subgroup || 'any';
+        if (hwSub !== 'any' && hwSub !== f) return false;
+      }
+      if (!hw.dueDate) return true;
+       const due = new Date(hw.dueDate);
+       due.setHours(0, 0, 0, 0);
+       if (due < today) return false;
+       // Сегодняшнее ДЗ на пару, которая уже прошла (>= 1.5ч с начала) — скрываем.
+       if (due.getTime() === today.getTime() && isHwPairFinished(hw)) return false;
+      return true;
+    });
 
   if (visible.length === 0) {
     list.innerHTML = '<div class="no-homework">Нет заданий</div>';
@@ -3883,62 +3895,63 @@ function setupSettingsModal() {
     showToast('Отметки выполненных ДЗ сброшены', 'ok');
   };
 
-  document.getElementById('saveSettings').onclick = () => {
-    const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
-    const newCampusEnabled = document.getElementById('campusToggle').checked;
-    const newSubgroupFilter = document.getElementById('subgroupFilter').value || 'any';
+  // Мгновенное переключение подгруппы — без кнопки «Сохранить».
+  document.getElementById('subgroupFilter').addEventListener('change', function() {
+    state.subgroupFilter = this.value || 'any';
+    localStorage.setItem('subgroupFilter', state.subgroupFilter);
+    renderHomework();
+    if (state.schedule) renderDayTabs();
+  });
 
-    const groupChanged = newGroup !== state.group;
-    const campusChanged = newCampusEnabled !== state.campusEnabled;
+  // Мгновенное переключение кампуса — без кнопки «Сохранить».
+  document.getElementById('campusToggle').addEventListener('change', function() {
+    state.campusEnabled = this.checked;
+    localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
+  });
+
+  // Кнопка-стрелка рядом с полем группы: сохраняет ТОЛЬКО группу.
+  document.getElementById('saveGroupBtn').onclick = () => {
+    const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
+    const groupChanged = newGroup.toLowerCase() !== state.group;
 
     state.group = newGroup.toLowerCase();
-    state.campusEnabled = newCampusEnabled;
-    state.subgroupFilter = newSubgroupFilter;
     localStorage.setItem('group', state.group);
-    localStorage.setItem('campusEnabled', state.campusEnabled ? '1' : '0');
-    localStorage.setItem('subgroupFilter', state.subgroupFilter);
     closeModal(modal);
 
-// Смена группы: writerToken привязан к группе (хранится per-group в writerTokens).
-// ownerRole глобальный — OWNER_CODE работает для любой группы,
-// поэтому токен не очищаем если пользователь owner.
-if (groupChanged && !state.ownerRole) {
-  // НЕ удаляем токен из localStorage — он хранится per-group.
-  // Просто обновляем UI (текущая группа может не иметь токена).
-  refreshEditVisibility();
-  // Кеш расписаний per-group: при смене группы обнуляем, чтобы старые
-  // данные чужой группы не попали в новую (ключ кеша зависит от группы,
-  // но in-memory кеш — нет). То же для ДЗ и предметов.
-  state.scheduleCache = {};
-  invalidateSchedCache();
-  invalidateHwCache();
-  invalidateSubjectsCache();
-}
+    // Смена группы: writerToken привязан к группе (хранится per-group в writerTokens).
+    if (groupChanged && !state.ownerRole) {
+      refreshEditVisibility();
+      state.scheduleCache = {};
+      invalidateSchedCache();
+      invalidateHwCache();
+      invalidateSubjectsCache();
+      invalidateWeeksCache();
+    }
 
-// Если переключились обратно в группу с сохранённым токеном — ревалидируем.
-if (groupChanged && !state.ownerRole) {
-  const savedToken = state.writerTokens[newGroup.toLowerCase()];
-  if (savedToken) {
-    revalidateInviteToken(savedToken, newGroup.toLowerCase());
-  }
-}
+    if (groupChanged && !state.ownerRole) {
+      const savedToken = state.writerTokens[newGroup.toLowerCase()];
+      if (savedToken) {
+        revalidateInviteToken(savedToken, newGroup.toLowerCase());
+      }
+    }
 
-    // Если сменилась только подгруппа — перерисовываем локально,
-    // без лишних запросов к сети/кампусу. Иначе — полная перезагрузка.
+    // Полный сброс состояния — чтобы старые данные группы не мелькали.
+    state.homework = [];
+    state.weeks = [];
+    state.schedule = null;
+    state.selectedDay = null;
     if (groupChanged) {
       doneHwIds = loadDoneHw();
     }
-    if (!groupChanged && !campusChanged) {
-      state.selectedDay = null;
-      renderHomework();
-      if (state.schedule) renderDayTabs();
-    } else {
-      state.selectedDay = null;
-      loadData();
-    }
 
-    // Привязка Telegram относится к конкретной группе — при смене группы
-    // обновляем сохранённый chat_id и статус (он может отличаться).
+    // Показываем загрузку в UI.
+    document.getElementById('scheduleContent').innerHTML = '<div class="loading">Загрузка...</div>';
+    document.getElementById('homeworkList').innerHTML = '';
+    document.getElementById('weekLabel').textContent = 'Загрузка...';
+    document.getElementById('dayTabs').innerHTML = '';
+
+    loadData();
+
     if (groupChanged) {
       apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
         if (res.subscribed) {

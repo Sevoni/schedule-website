@@ -101,7 +101,12 @@
 
         <label>
           Группа
-          <input type="text" id="groupInput" placeholder="131-ИБо">
+          <div class="group-input-wrap">
+            <input type="text" id="groupInput" placeholder="131-ИБо">
+            <button id="saveGroupBtn" class="group-save-btn" title="Применить">
+              <svg class="icon"><use href="#icon-chevron-right"></use></svg>
+            </button>
+          </div>
         </label>
         <label class="settings-toggle">
           <input type="checkbox" id="campusToggle">
@@ -163,8 +168,6 @@
           <h3><svg class="icon icon-h3"><use href="#icon-trash-2"></use></svg> Данные</h3>
           <button id="resetDoneHw" class="btn-secondary">Сбросить отметки «выполнено»</button>
         </div>
-
-        <button id="saveSettings" class="save-btn">Сохранить</button>
       </div>
     </div>
   </div>

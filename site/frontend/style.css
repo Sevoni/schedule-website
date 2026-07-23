@@ -906,6 +906,39 @@ header {
   gap: 12px;
 }
 
+.group-input-wrap {
+  position: relative;
+}
+.group-input-wrap input {
+  width: 100%;
+  padding-right: 48px;
+  border-radius: 8px;
+}
+.group-save-btn {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  bottom: 4px;
+  width: 36px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.2s;
+}
+.group-save-btn:hover {
+  opacity: 0.85;
+}
+.group-save-btn .icon {
+  width: 18px;
+  height: 18px;
+}
+
 .modal-body label {
   display: flex;
   flex-direction: column;
