@@ -1,7 +1,7 @@
 // ── Config ────────────────────────────────────────────────────
 
 const DEFAULT_API = 'https://kampussgu.dpdns.org';
-const DEFAULT_GROUP = '131-ИБо';
+const DEFAULT_GROUP = '131-ибо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
 const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 
@@ -12,7 +12,7 @@ const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
 let state = {
   apiBase: localStorage.getItem('apiBase') || DEFAULT_API,
-  group: localStorage.getItem('group') || DEFAULT_GROUP,
+  group: (localStorage.getItem('group') || '').toLowerCase(),
   // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
   campusEnabled: localStorage.getItem('campusEnabled') !== '0',
   // subgroupFilter: 'any' — показывать обе подгруппы; '1'/'2' — только свою.
@@ -302,6 +302,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupHomeworkModal();
   setupTgSection();
   setupInviteSection();
+  setupStartPage();
 
   // Если в URL есть ?token=... — это переход по ссылке-приглашению.
   // Валидируем через бэкенд, при успехе сохраняем токен как writerToken.
@@ -319,6 +320,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Принудительная синхронизация — игнорируем свежесть campusUpdatedAt.
     syncAll(null, { forceSync: true });
   };
+
+  // Если группы нет (нет в localStorage и не пришла из приглашения) —
+  // показываем стартовую страницу с выбором группы.
+  if (!state.group) {
+    showStartPage();
+    refreshEditVisibility();
+    return;
+  }
 
   loadData();
   refreshEditVisibility();
@@ -345,8 +354,8 @@ async function consumeInviteTokenFromUrl() {
 
       // Подставляем группу из приглашения. Так пользователь сразу попадёт
       // на ту группу, к которой его пригласили.
-      state.group = data.group;
-      localStorage.setItem('group', data.group);
+      state.group = data.group.toLowerCase();
+      localStorage.setItem('group', data.group.toLowerCase());
 
       showToast('Доступ на редактирование получен (' + data.group + ')', 'ok');
     } else {
@@ -460,6 +469,54 @@ function renderRoleStatus() {
   refreshIcons();
 }
 
+// ── Start Page (Google-style group picker) ─────────────────────
+//
+// Показывается, когда у пользователя нет сохранённой группы
+// и нет ссылки-приглашения в URL. Стиль — как Google: по центру,
+// поле ввода, кнопка.
+
+function showStartPage() {
+  document.getElementById('startPage').classList.remove('hidden');
+  document.querySelector('.container').style.display = 'none';
+  const input = document.getElementById('startGroupInput');
+  input.value = state.group || '';
+  input.focus();
+}
+
+function hideStartPage() {
+  const el = document.getElementById('startPage');
+  el.classList.add('fade-out');
+  document.querySelector('.container').style.display = '';
+  setTimeout(() => {
+    el.classList.add('hidden');
+    el.classList.remove('fade-out');
+  }, 300);
+}
+
+function setupStartPage() {
+  const input = document.getElementById('startGroupInput');
+  const btn = document.getElementById('startGroupBtn');
+  const errEl = document.getElementById('startGroupError');
+
+  function submitGroup() {
+    const group = input.value.trim();
+    if (!group) {
+      errEl.textContent = 'Введите номер группы';
+      errEl.classList.remove('hidden');
+      input.focus();
+      return;
+    }
+    const normalizedGroup = group.toLowerCase();
+    localStorage.setItem('group', normalizedGroup);
+    location.reload();
+  }
+
+  btn.onclick = submitGroup;
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') submitGroup();
+  };
+}
+
 // ── Main data loading ─────────────────────────────────────────
 //
 // Поведение:
@@ -479,6 +536,7 @@ function renderRoleStatus() {
 async function loadData() {
   try {
     state.scheduleCache = {};
+    applyGroupDisplay(state.group);
 
     // 0) Пробуем загрузить всё одним запросом /api/bootstrap (weeks +
     //    schedules + hw + subjects + campusUpdatedAt) — экономия 3-4
@@ -533,8 +591,13 @@ async function loadData() {
       // четырёх (weeks + schedules + hw + subjects по отдельности).
       await bootstrapFromApi({ weeks: true, schedWeeks: [] });
       if (state.weeks.length === 0 && state.campusEnabled) {
-        // БД пуста — тянем недели из кампуса. синхронизация строго ожидаемая.
-        await syncWeeksFromCampus(true);
+        // БД пуста — тянем недели из кампуса. Если campus недоступен —
+        // не крашим loadData, а дойдём до «Нет данных» ниже.
+        try {
+          await syncWeeksFromCampus(true);
+        } catch (e) {
+          console.warn('[loadData] syncWeeksFromCampus failed:', e.message);
+        }
       }
       if (state.weeks.length === 0) {
         showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.', () => syncAll(null, { forceSync: true }));
@@ -956,8 +1019,15 @@ async function backgroundSyncSingle(idx, dbData) {
   }
 }
 
+// Обновляет отображение группы: заголовок в шапке + title страницы.
+function applyGroupDisplay(groupName) {
+  document.getElementById('groupName').textContent = groupName || state.group;
+  document.title = 'Расписание — ' + (groupName || state.group);
+}
+
 function applyScheduleHeader() {
-  document.getElementById('groupName').textContent = (state.schedule && state.schedule.group) || state.group;
+  const displayGroup = (state.schedule && state.schedule.group) || state.group;
+  applyGroupDisplay(displayGroup);
   if (state.schedule && state.schedule.weekStart) {
     document.getElementById('weekRange').textContent =
       state.schedule.weekStart + ' — ' + state.schedule.weekEnd;
@@ -3738,7 +3808,7 @@ function setupSettingsModal() {
     const groupChanged = newGroup !== state.group;
     const campusChanged = newCampusEnabled !== state.campusEnabled;
 
-    state.group = newGroup;
+    state.group = newGroup.toLowerCase();
     state.campusEnabled = newCampusEnabled;
     state.subgroupFilter = newSubgroupFilter;
     localStorage.setItem('group', state.group);

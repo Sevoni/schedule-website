@@ -1,5 +1,12 @@
 import { createStore, setRequestLogger } from './store.js';
 
+// Нормализация названия группы: trim + toLowerCase.
+// Campus.syktsu.ru принимает любой регистр, но в БД храним всегда нижний,
+// чтобы "131-Ибо" и "131-ИБо" не создавали разные записи.
+function normalizeGroup(g) {
+  return (g || '').trim().toLowerCase();
+}
+
 // Текущий request context (для ctx.waitUntil фоновых уведомлений).
 // Устанавливается в начале fetch и используется в notifyGroupBg.
 let currentCtx = null;
@@ -209,7 +216,7 @@ async function resolveAuth(request, env) {
   try {
     const inv = await store.get(`inv:${token}`, { type: 'json' });
     if (inv && inv.group) {
-      return { role: 'writer', token, group: inv.group };
+      return { role: 'writer', token, group: normalizeGroup(inv.group) };
     }
   } catch (e) {
     console.log('resolveAuth inv-read failed:', e.message);
@@ -221,7 +228,7 @@ async function resolveAuth(request, env) {
 // Извлекает группу для owner из query (GET/DELETE) или body (POST/PUT).
 // Для writer группа уже известна из resolveAuth.
 function groupFromAuth(auth, request) {
-  if (auth && auth.role === 'writer' && auth.group) return auth.group;
+  if (auth && auth.role === 'writer' && auth.group) return normalizeGroup(auth.group);
   // owner / reader без группы в auth — берём из запроса
   return null;
 }
@@ -230,12 +237,12 @@ async function groupFromBodyOrQuery(request) {
   try {
     if (request.method === 'GET' || request.method === 'DELETE') {
       const url = new URL(request.url);
-      return url.searchParams.get('group');
+      return normalizeGroup(url.searchParams.get('group'));
     }
     // clone, чтобы обработчик ниже тоже мог звать .json()
     const clone = request.clone();
     const body = await clone.json().catch(() => ({}));
-    return body.group || null;
+    return normalizeGroup(body.group) || null;
   } catch {
     return null;
   }
@@ -262,7 +269,8 @@ async function handleAuth(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const { group, password } = await request.json();
+  const { group: _group, password } = await request.json();
+  const group = normalizeGroup(_group);
 
   if (!group || !password) {
     return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
@@ -295,7 +303,8 @@ async function handleGroupRegister(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const { group, password } = await request.json();
+  const { group: _group, password } = await request.json();
+  const group = normalizeGroup(_group);
 
   if (!group || !password) {
     return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
@@ -353,7 +362,7 @@ async function handleInviteCreate(request, env, corsHeaders) {
     return jsonResponse({ ok: true }, corsHeaders);
   }
 
-  let group = body.group;
+  let group = normalizeGroup(body.group);
 
   // owner может создавать приглашения для любой группы.
   if (!group) {
@@ -405,7 +414,7 @@ async function handleInviteVerify(request, env, corsHeaders) {
     return jsonResponse({ error: 'Invite not found or revoked' }, corsHeaders, 404);
   }
 
-  return jsonResponse({ ok: true, group: inv.group, token }, corsHeaders);
+  return jsonResponse({ ok: true, group: normalizeGroup(inv.group), token }, corsHeaders);
 }
 
 // GET /api/invite?group=...
@@ -422,7 +431,7 @@ async function handleInviteList(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = url.searchParams.get('group');
+  const group = normalizeGroup(url.searchParams.get('group'));
   if (!group) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
@@ -453,7 +462,7 @@ async function handleInviteDelete(request, env, corsHeaders) {
 
   const url = new URL(request.url);
   const id = (url.searchParams.get('id') || '').toString().trim();
-  const group = url.searchParams.get('group');
+  const group = normalizeGroup(url.searchParams.get('group'));
   if (!id || !group) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
@@ -497,7 +506,7 @@ async function handleInviteRename(request, env, corsHeaders) {
 
   const body = await request.json().catch(() => ({}));
   const id = (body.id || '').toString().trim();
-  const group = body.group;
+  const group = normalizeGroup(body.group);
   if (!id || !group) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
@@ -543,7 +552,7 @@ async function sha256(message) {
 
 async function handleGetSchedule(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const weekCode = url.searchParams.get('week');
 
   const store = createStore(env);
@@ -564,7 +573,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
 async function handleGetWeeks(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
 
   const store = createStore(env);
   if (!env.DB) {
@@ -583,7 +592,7 @@ async function handleGetWeeks(request, env, corsHeaders) {
 
 async function handleGetSchedules(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const weeksParam = url.searchParams.get('weeks') || '';
   const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -634,7 +643,7 @@ async function handleGetSchedules(request, env, corsHeaders) {
 
 async function handleBootstrap(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const weeksParam = url.searchParams.get('weeks') || '';
   const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -660,6 +669,7 @@ async function handleBootstrap(request, env, corsHeaders) {
 
   const [weeksData, hwData, subjectsData, campusUpdatedAt, schedResult] = await Promise.all(parallel);
 
+  let weeksDb = weeksData || [];
   const schedules = {};
   if (schedResult && Array.isArray(schedResult.entries)) {
     const prefix = `schedule:${group}:`;
@@ -670,13 +680,54 @@ async function handleBootstrap(request, env, corsHeaders) {
     }
   }
 
+  // Если weeks в БД пусты, но есть расписания — восстанавливаем список недель
+  // из данных расписаний (weekStart/weekEnd). Это покрывает случай, когда
+  // syncWeeksFromCampus был недоступен, но расписания были загружены.
+  if (weeksDb.length === 0) {
+    // Если schedResult пуст (не передали weekCodes в запросе), сканируем
+    // D1 по префиксу schedule:{group}: чтобы найти все расписания.
+    if (Object.keys(schedules).length === 0) {
+      try {
+        const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
+        if (entries && entries.length > 0) {
+          const prefix = `schedule:${group}:`;
+          for (const e of entries) {
+            if (e.value == null) continue;
+            const weekCode = e.key.slice(prefix.length);
+            if (weekCode && weekCode !== 'current') schedules[weekCode] = e.value;
+          }
+        }
+      } catch (e) {
+        console.log('schedule scan for weeks recovery failed:', e.message);
+      }
+    }
+
+    if (Object.keys(schedules).length > 0) {
+      weeksDb = Object.entries(schedules).map(([weekCode, data]) => {
+        const weekNum = weekCode.split('_')[0];
+        const weekStart = data?.weekStart || '';
+        const weekEnd = data?.weekEnd || '';
+        const dates = [weekStart, weekEnd].filter(Boolean);
+        const text = `${weekNum} неделя${dates.length ? ' (' + dates.join(' - ') + ')' : ''}`;
+        return { value: weekCode, text, weekNum, dates };
+      });
+      weeksDb.sort((a, b) => (a.weekNum || '').localeCompare(b.weekNum || '', undefined, { numeric: true }));
+      // Сохраняем восстановленный список для будущих запросов
+      try {
+        await store.put(`weeks:${group}`, JSON.stringify(weeksDb), { expirationTtl: 604800 });
+      } catch (e) {
+        console.log('weeks recovery save skipped:', e.message);
+      }
+    }
+  }
+
   // subjects может прийти в трёх видах:
   //   - null/[]  → в БД пусто
   //   - старый формат (без поля subgroups) → фронт сам триггерит recomput
   //   - актуальный формат
   // Здесь ничего не нормализуем — отдаём как есть, фронтенд сам решает.
   return jsonResponse({
-    weeks: weeksData || [],
+    weeks: weeksDb,
     schedules,
     hw: hwData || [],
     subjects: subjectsData || [],
@@ -695,7 +746,8 @@ async function handleUpload(request, env, corsHeaders) {
   const { type } = body;
 
   if (type === 'weeks') {
-    const { group, weeks } = body;
+    const { group: _group, weeks } = body;
+    const group = normalizeGroup(_group);
     if (!group || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
@@ -705,7 +757,8 @@ async function handleUpload(request, env, corsHeaders) {
   }
 
   if (type === 'schedule') {
-    const { group, weekCode, data } = body;
+    const { group: _group, weekCode, data } = body;
+    const group = normalizeGroup(_group);
     if (!group || !data) {
       return jsonResponse({ error: 'Missing group or data' }, corsHeaders, 400);
     }
@@ -715,7 +768,6 @@ async function handleUpload(request, env, corsHeaders) {
 
     await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
-      lastGroup: group,
       lastWeek: weekCode || 'current',
     }), { expirationTtl: 604800 });
 
@@ -729,7 +781,8 @@ async function handleUpload(request, env, corsHeaders) {
   }
 
   if (type === 'schedule-batch') {
-    const { group, schedules } = body;
+    const { group: _group, schedules } = body;
+    const group = normalizeGroup(_group);
     if (!group || !Array.isArray(schedules)) {
       return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
     }
@@ -779,7 +832,6 @@ async function handleUpload(request, env, corsHeaders) {
 
     await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
-      lastGroup: group,
       lastWeek: 'batch',
     }), { expirationTtl: 604800 });
 
@@ -814,7 +866,8 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const { group, campusUpdatedAt } = body;
+  const { group: _group, campusUpdatedAt } = body;
+  const group = normalizeGroup(_group);
 
   if (!group) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
@@ -827,7 +880,6 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
   const meta = await store.get('sync:meta', { type: 'json' });
   await store.put('sync:meta', JSON.stringify({
     lastSync: new Date().toISOString(),
-    lastGroup: group,
     lastWeek: meta?.lastWeek || 'check',
     campusUpdatedAt: meta?.campusUpdatedAt || null,
   }), { expirationTtl: 604800 });
@@ -850,7 +902,8 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const { group, campusUpdatedAt, schedules } = body;
+  const { group: _group, campusUpdatedAt, schedules } = body;
+  const group = normalizeGroup(_group);
 
   if (!group || !Array.isArray(schedules)) {
     return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
@@ -925,6 +978,32 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     console.log('recalcHomeworkForGroup skipped:', e.message);
   }
 
+  // Обновляем список недель из полученных расписаний, чтобы bootstrap мог
+  // найти недели даже если syncWeeksFromCampus (campus) был недоступен.
+  // Формируем week-объекты из weekCode + weekStart/weekEnd в данных.
+  if (updated.length > 0) {
+    try {
+      const existingWeeks = await store.get(`weeks:${group}`, { type: 'json' }) || [];
+      const existingMap = new Map(existingWeeks.map(w => [w.value, w]));
+      for (const { weekCode, data } of schedules) {
+        if (!weekCode || !data || existingMap.has(weekCode)) continue;
+        const weekNum = weekCode.split('_')[0];
+        const weekStart = data.weekStart || '';
+        const weekEnd = data.weekEnd || '';
+        const dates = [weekStart, weekEnd].filter(Boolean);
+        const text = `${weekNum} неделя${dates.length ? ' (' + dates.join(' - ') + ')' : ''}`;
+        existingMap.set(weekCode, { value: weekCode, text, weekNum, dates });
+      }
+      if (existingMap.size > existingWeeks.length) {
+        const merged = Array.from(existingMap.values());
+        merged.sort((a, b) => (a.weekNum || '').localeCompare(b.weekNum || '', undefined, { numeric: true }));
+        await store.put(`weeks:${group}`, JSON.stringify(merged), { expirationTtl: 604800 });
+      }
+    } catch (e) {
+      console.log('weeks update skipped:', e.message);
+    }
+  }
+
   // Читаем актуальный список предметов текущего семестра
   // (он был обновлён через addSubjectsFromWeek выше)
   let subjects = [];
@@ -937,7 +1016,6 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
   await store.put('sync:meta', JSON.stringify({
     lastSync: new Date().toISOString(),
-    lastGroup: group,
     lastWeek: 'batch',
     campusUpdatedAt: campusUpdatedAt || null,
   }), { expirationTtl: 604800 });
@@ -976,7 +1054,7 @@ async function handleGetHw(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
 
   const data = await store.get(`hw:${group}`, { type: 'json' });
   // hw содержит данные всех студентов группы — кешируем для reader'ов на 30с.
@@ -995,7 +1073,8 @@ async function handleAddHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { group, subject, task, dueDate, dueMode, pairType, author, subgroup } = body;
+  const { group: _group, subject, task, dueDate, dueMode, pairType, author, subgroup } = body;
+  const group = normalizeGroup(_group);
 
   if (!group || !subject) {
     return jsonResponse({ error: 'Missing group or subject' }, corsHeaders, 400);
@@ -1046,7 +1125,8 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { id, group } = body;
+  const { id, group: _group } = body;
+  const group = normalizeGroup(_group);
 
   if (!id || !group) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
@@ -1100,7 +1180,8 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { group, updates } = body;
+  const { group: _group, updates } = body;
+  const group = normalizeGroup(_group);
 
   if (!group || !Array.isArray(updates) || updates.length === 0) {
     return jsonResponse({ error: 'Missing group or updates' }, corsHeaders, 400);
@@ -1165,7 +1246,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
 
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
 
   if (!id) {
     return jsonResponse({ error: 'Missing id' }, corsHeaders, 400);
@@ -1196,7 +1277,7 @@ async function handleGetSubjects(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const semester = currentSemesterKey();
 
   const key = `subjects:${group}:${semester}`;
@@ -1224,7 +1305,8 @@ async function handlePutSubjects(request, env, corsHeaders) {
   }
 
   const body = await request.json();
-  const { group, subjects, semester } = body;
+  const { group: _group, subjects, semester } = body;
+  const group = normalizeGroup(_group);
   if (!group || !Array.isArray(subjects)) {
     return jsonResponse({ error: 'Missing group or subjects' }, corsHeaders, 400);
   }
@@ -1248,7 +1330,7 @@ async function handleRecalcHw(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const group = body.group || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(body.group) || env.DEFAULT_GROUP || '131-ИБо';
 
   const result = await recalcHomeworkForGroup(env, group);
   if (result && result.changed) {
@@ -1551,7 +1633,7 @@ async function handleStatus(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = url.searchParams.get('group');
+  const group = normalizeGroup(url.searchParams.get('group'));
 
   const meta = await store.get('sync:meta', { type: 'json' });
 
@@ -1563,7 +1645,6 @@ async function handleStatus(request, env, corsHeaders) {
   return jsonResponse({
     db: true,
     lastSync: meta?.lastSync || null,
-    lastGroup: meta?.lastGroup || null,
     lastWeek: meta?.lastWeek || null,
     campusUpdatedAt: campusUpdatedAt || null,
   }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
@@ -1976,7 +2057,8 @@ async function handleTgSubscribe(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const body = await request.json().catch(() => ({}));
-  const { group, chatId } = body;
+  const { group: _group, chatId } = body;
+  const group = normalizeGroup(_group);
   if (!group || !chatId) return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
   const chatIdStr = String(chatId).replace(/[^\d-]/g, '');
   if (!chatIdStr) return jsonResponse({ error: 'Invalid chatId' }, corsHeaders, 400);
@@ -2012,7 +2094,8 @@ async function handleTgUnsubscribe(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const body = await request.json().catch(() => ({}));
-  const { group, chatId } = body;
+  const { group: _group, chatId } = body;
+  const group = normalizeGroup(_group);
 
   if (group && chatId) {
     await removeGroupSubscriber(env, group, chatId);
@@ -2047,7 +2130,7 @@ async function handleTgStatus(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const url = new URL(request.url);
-  const group = url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const chatId = url.searchParams.get('chatId') || '';
   const subs = await getGroupSubscribers(env, group);
   const isSub = chatId ? subs.some(c => String(c) === String(chatId)) : false;
