@@ -696,7 +696,7 @@ header {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px;
+  padding: 12px;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
@@ -751,7 +751,12 @@ header {
   color: var(--text-dim);
   cursor: pointer;
   font-size: 1.1rem;
-  padding: 4px;
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 6px;
   transition: all 0.2s;
   flex-shrink: 0;
@@ -768,7 +773,12 @@ header {
   color: var(--text-dim);
   cursor: pointer;
   font-size: 1.1rem;
-  padding: 4px;
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 6px;
   transition: all 0.2s;
   flex-shrink: 0;
@@ -785,7 +795,12 @@ header {
   color: var(--text-dim);
   cursor: pointer;
   font-size: 1.1rem;
-  padding: 4px;
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 6px;
   transition: all 0.2s;
   flex-shrink: 0;
@@ -847,10 +862,14 @@ header {
   max-width: 400px;
   max-height: 90vh;
   overflow-y: auto;
+  scrollbar-width: none;
   transform: translateY(12px) scale(0.96);
   opacity: 0;
   transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.24s ease;
   will-change: transform, opacity;
+}
+.modal-content::-webkit-scrollbar {
+  display: none;
 }
 
 .modal.is-open .modal-content {
@@ -1021,7 +1040,6 @@ header {
   font-size: 0.9rem;
   font-weight: 600;
   transition: background 0.2s, color 0.2s;
-  margin-top: 8px;
 }
 
 .delete-btn:hover {
@@ -1030,7 +1048,7 @@ header {
 }
 
 .delete-confirm {
-  margin-top: 10px;
+  margin-bottom: 8px;
   padding: 12px;
   border: 1px solid var(--danger);
   border-radius: 8px;
