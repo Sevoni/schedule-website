@@ -669,7 +669,6 @@ async function handleBootstrap(request, env, corsHeaders) {
 
   const [weeksData, hwData, subjectsData, campusUpdatedAt, schedResult] = await Promise.all(parallel);
 
-  let weeksDb = weeksData || [];
   const schedules = {};
   if (schedResult && Array.isArray(schedResult.entries)) {
     const prefix = `schedule:${group}:`;
@@ -680,54 +679,13 @@ async function handleBootstrap(request, env, corsHeaders) {
     }
   }
 
-  // Если weeks в БД пусты, но есть расписания — восстанавливаем список недель
-  // из данных расписаний (weekStart/weekEnd). Это покрывает случай, когда
-  // syncWeeksFromCampus был недоступен, но расписания были загружены.
-  if (weeksDb.length === 0) {
-    // Если schedResult пуст (не передали weekCodes в запросе), сканируем
-    // D1 по префиксу schedule:{group}: чтобы найти все расписания.
-    if (Object.keys(schedules).length === 0) {
-      try {
-        const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
-        if (entries && entries.length > 0) {
-          const prefix = `schedule:${group}:`;
-          for (const e of entries) {
-            if (e.value == null) continue;
-            const weekCode = e.key.slice(prefix.length);
-            if (weekCode && weekCode !== 'current') schedules[weekCode] = e.value;
-          }
-        }
-      } catch (e) {
-        console.log('schedule scan for weeks recovery failed:', e.message);
-      }
-    }
-
-    if (Object.keys(schedules).length > 0) {
-      weeksDb = Object.entries(schedules).map(([weekCode, data]) => {
-        const weekNum = weekCode.split('_')[0];
-        const weekStart = data?.weekStart || '';
-        const weekEnd = data?.weekEnd || '';
-        const dates = [weekStart, weekEnd].filter(Boolean);
-        const text = `${weekNum} неделя${dates.length ? ' (' + dates.join(' - ') + ')' : ''}`;
-        return { value: weekCode, text, weekNum, dates };
-      });
-      weeksDb.sort((a, b) => (a.weekNum || '').localeCompare(b.weekNum || '', undefined, { numeric: true }));
-      // Сохраняем восстановленный список для будущих запросов
-      try {
-        await store.put(`weeks:${group}`, JSON.stringify(weeksDb), { expirationTtl: 604800 });
-      } catch (e) {
-        console.log('weeks recovery save skipped:', e.message);
-      }
-    }
-  }
-
   // subjects может прийти в трёх видах:
   //   - null/[]  → в БД пусто
   //   - старый формат (без поля subgroups) → фронт сам триггерит recomput
   //   - актуальный формат
   // Здесь ничего не нормализуем — отдаём как есть, фронтенд сам решает.
   return jsonResponse({
-    weeks: weeksDb,
+    weeks: weeksData || [],
     schedules,
     hw: hwData || [],
     subjects: subjectsData || [],
@@ -976,32 +934,6 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     hwResult = await recalcHomeworkForGroup(env, group);
   } catch (e) {
     console.log('recalcHomeworkForGroup skipped:', e.message);
-  }
-
-  // Обновляем список недель из полученных расписаний, чтобы bootstrap мог
-  // найти недели даже если syncWeeksFromCampus (campus) был недоступен.
-  // Формируем week-объекты из weekCode + weekStart/weekEnd в данных.
-  if (updated.length > 0) {
-    try {
-      const existingWeeks = await store.get(`weeks:${group}`, { type: 'json' }) || [];
-      const existingMap = new Map(existingWeeks.map(w => [w.value, w]));
-      for (const { weekCode, data } of schedules) {
-        if (!weekCode || !data || existingMap.has(weekCode)) continue;
-        const weekNum = weekCode.split('_')[0];
-        const weekStart = data.weekStart || '';
-        const weekEnd = data.weekEnd || '';
-        const dates = [weekStart, weekEnd].filter(Boolean);
-        const text = `${weekNum} неделя${dates.length ? ' (' + dates.join(' - ') + ')' : ''}`;
-        existingMap.set(weekCode, { value: weekCode, text, weekNum, dates });
-      }
-      if (existingMap.size > existingWeeks.length) {
-        const merged = Array.from(existingMap.values());
-        merged.sort((a, b) => (a.weekNum || '').localeCompare(b.weekNum || '', undefined, { numeric: true }));
-        await store.put(`weeks:${group}`, JSON.stringify(merged), { expirationTtl: 604800 });
-      }
-    } catch (e) {
-      console.log('weeks update skipped:', e.message);
-    }
   }
 
   // Читаем актуальный список предметов текущего семестра

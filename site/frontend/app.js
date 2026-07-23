@@ -506,9 +506,14 @@ function setupStartPage() {
       input.focus();
       return;
     }
+    errEl.classList.add('hidden');
     const normalizedGroup = group.toLowerCase();
+    state.group = normalizedGroup;
     localStorage.setItem('group', normalizedGroup);
-    location.reload();
+    applyGroupDisplay(normalizedGroup);
+    hideStartPage();
+    loadData();
+    refreshEditVisibility();
   }
 
   btn.onclick = submitGroup;
@@ -1482,7 +1487,15 @@ function parseWeekOptions(html) {
   const optRegex = /<option\s+value="(\d+_[^"]+)"[^>]*>([\s\S]*?)<\/option>/g;
   let m;
   while ((m = optRegex.exec(selectMatch[1])) !== null) {
-    const value = m[1];
+    const rawValue = m[1];
+    // WeekCode format: {weekNum}_{groupLabel} (e.g. "50_131-ИБо").
+    // Campus returns groupLabel in whatever case the user typed, so we
+    // normalize it to lowercase — otherwise different inputs produce
+    // different DB keys for the same week of the same group.
+    const underscoreIdx = rawValue.indexOf('_');
+    const value = underscoreIdx >= 0
+      ? rawValue.slice(0, underscoreIdx) + '_' + rawValue.slice(underscoreIdx + 1).toLowerCase()
+      : rawValue;
     const text = m[2].replace(/<[^>]+>/g, '').trim();
     const dates = text.match(/\d{2}\.\d{2}\.\d{4}/g) || [];
     options.push({ value, text, weekNum: value.split('_')[0], dates });
