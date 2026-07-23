@@ -21,10 +21,24 @@ let state = {
   campusUpdatedAt: localStorage.getItem('campusUpdatedAt') || '',
   tgChatId: localStorage.getItem('tgChatId') || '',
   tgBotUsername: localStorage.getItem('tgBotUsername') || '',
-  // writerToken — токен ссылки-приглашения (writer) или OWNER_CODE (owner).
+  // writerTokens — токены ссылок-приглашений per-group: { "group": "token" }.
   // Сохраняется в localStorage, чтобы не вводить ссылку каждый раз.
-  // isWriter = !!writerToken.
-  writerToken: localStorage.getItem('writerToken') || '',
+  // isWriter = !!writerTokens[group].
+  writerTokens: (() => {
+    try {
+      const obj = JSON.parse(localStorage.getItem('writerTokens') || '{}');
+      const old = localStorage.getItem('writerToken');
+      const grp = (localStorage.getItem('group') || '').toLowerCase();
+      if (old && grp && !obj[grp]) {
+        obj[grp] = old;
+        localStorage.setItem('writerTokens', JSON.stringify(obj));
+        localStorage.removeItem('writerToken');
+      }
+      return obj;
+    } catch {
+      return {};
+    }
+  })(),
   // ownerCode — вводится в настройках. Если совпадает с env.OWNER_CODE, пользователь owner.
   // Хранится отдельно, чтобы можно было «стать владельцем» без перезаписи writerToken.
   ownerRole: localStorage.getItem('ownerRole') === '1',
@@ -167,13 +181,35 @@ function invalidateSubjectsCache() {
 // Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
 // всё равно проверяет бэкенд (requireWriter) — фронтенд здесь не критичен.
 function isWriter() {
-  return !!state.writerToken || state.ownerRole;
+  return !!state.writerTokens[state.group] || state.ownerRole;
 }
 function isOwner() {
   return state.ownerRole;
 }
 function getAuthToken() {
-  return state.writerToken || (state.ownerRole ? state.ownerCode : '');
+  return state.writerTokens[state.group] || (state.ownerRole ? state.ownerCode : '');
+}
+
+// Ревалидация токена-приглашения при возврате в группу.
+// Вызывается при переключении группы, если есть сохранённый токен для этой группы.
+async function revalidateInviteToken(token, group) {
+  try {
+    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok || normalizeGroup(data.group) !== normalizeGroup(group)) {
+      // Токен невалиден/отозван/не для этой группы — удаляем
+      delete state.writerTokens[group];
+      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
+      refreshEditVisibility();
+    }
+  } catch (e) {
+    // Сеть недоступна — оставляем токен, при следующем действии API вернёт 403
+    console.warn('[revalidateInviteToken] network error:', e.message);
+  }
 }
 
 // ── Тема и акцент ───────────────────────────────────────────
@@ -333,7 +369,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   refreshEditVisibility();
 });
 
-// Проверяет ?token= в URL, валидирует, сохраняет writerToken, чистит URL.
+// Проверяет ?token= в URL, валидирует, сохраняет writerToken per-group, чистит URL.
 async function consumeInviteTokenFromUrl() {
   const params = new URLSearchParams(location.search);
   const token = params.get('token');
@@ -347,15 +383,16 @@ async function consumeInviteTokenFromUrl() {
     });
     const data = await resp.json();
     if (resp.ok && data.ok && data.group) {
-      // Сохраняем токен writer'а (он же используется как Bearer).
+      // Сохраняем токен writer'а per-group.
       // ownerRole не трогаем — он глобальный.
-      state.writerToken = data.token;
-      localStorage.setItem('writerToken', data.token);
+      const group = data.group.toLowerCase();
+      state.writerTokens[group] = data.token;
+      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
 
       // Подставляем группу из приглашения. Так пользователь сразу попадёт
       // на ту группу, к которой его пригласили.
-      state.group = data.group.toLowerCase();
-      localStorage.setItem('group', data.group.toLowerCase());
+      state.group = group;
+      localStorage.setItem('group', group);
 
       showToast('Доступ на редактирование получен (' + data.group + ')', 'ok');
     } else {
@@ -365,7 +402,7 @@ async function consumeInviteTokenFromUrl() {
     showToast('Не удалось проверить ссылку: ' + e.message, 'warn');
   }
 
-  // Чистим URL, чтобы токен не висел в地址ной строке и не шарился.
+  // Чистим URL, чтобы токен не висел в адресной строке и не шарился.
   history.replaceState(null, '', location.pathname);
 }
 
@@ -384,7 +421,7 @@ async function consumeOwnerCodeFromUrl() {
 
 // Стать владельцем: пробует создать ссылку с Bearer = code. Бэкенд вернёт
 // ok, если code === env.OWNER_CODE (owner), иначе 403. При успехе сохраняем
-// code как writerToken + ownerRole=true. Возвращает Promise<boolean>.
+// code как writerToken для текущей группы + ownerRole=true. Возвращает Promise<boolean>.
 // Опционально показывает toast (silent=false) — для авто-claim из ссылки.
 async function becomeOwner(code, opts = {}) {
   const silent = opts.silent !== false; // по умолчанию показываем toast
@@ -400,10 +437,10 @@ async function becomeOwner(code, opts = {}) {
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.ok) {
-      state.writerToken = code;
+      state.writerTokens[state.group] = code;
       state.ownerRole = true;
       state.ownerCode = code;
-      localStorage.setItem('writerToken', code);
+      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
       localStorage.setItem('ownerRole', '1');
       localStorage.setItem('ownerCode', code);
       const section = document.getElementById('inviteSection');
@@ -605,7 +642,11 @@ async function loadData() {
         }
       }
       if (state.weeks.length === 0) {
-        showError('Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.', () => syncAll(null, { forceSync: true }));
+        showError(
+          isWriter() ? 'Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.'
+                     : 'Нет данных о неделях. Попросите редактора группы синхронизировать данные.',
+          isWriter() ? () => syncAll(null, { forceSync: true }) : null
+        );
         return;
       }
       // Теперь недели известны — дозагружаем стартовые расписания.
@@ -627,7 +668,10 @@ async function loadData() {
       syncAll(cur).catch((e) => console.warn('[openSync] error:', e.message));
     }
   } catch (e) {
-    showError('Не удалось загрузить данные: ' + e.message, () => syncAll(null, { forceSync: true }));
+    showError(
+      'Не удалось загрузить данные: ' + e.message,
+      isWriter() ? () => syncAll(null, { forceSync: true }) : null
+    );
   }
 }
 
@@ -1252,7 +1296,10 @@ async function syncAll(anchorIdxOverride = null, opts = {}) {
   } catch (e) {
     updateSyncUI('error', e.message);
     if (!state.schedule) {
-      showError('Не удалось синхронизировать: ' + e.message, () => syncAll(null, { forceSync: true }));
+      showError(
+        'Не удалось синхронизировать: ' + e.message,
+        isWriter() ? () => syncAll(null, { forceSync: true }) : null
+      );
     }
   } finally {
     state.syncing = false;
@@ -1636,13 +1683,36 @@ function parseScheduleHTML(html) {
 // невалиден (ссылка отозвана / неверный). Сбрасываем права и
 // переключаем UI в режим «только чтение».
 function invalidateWriterAccess(reason) {
-  if (!state.writerToken) return;
-  state.writerToken = '';
-  localStorage.removeItem('writerToken');
+  const group = state.group;
+  if (!state.writerTokens[group]) return;
+  delete state.writerTokens[group];
+  localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
   refreshEditVisibility();
   const section = document.getElementById('inviteSection');
   if (section) section.style.display = 'none';
   showToast(reason || 'Права на редактирование отозваны', 'warn');
+}
+
+// Ревалидация сохранённого токена при возврате в группу.
+// Вызывает /api/invite/verify, если токен невалиден/отозван/не для этой группы — удаляет.
+async function revalidateInviteToken(token, group) {
+  try {
+    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok || normalizeGroup(data.group) !== normalizeGroup(group)) {
+      // Токен невалиден/отозван/не для этой группы — удаляем
+      delete state.writerTokens[group];
+      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
+      refreshEditVisibility();
+    }
+  } catch (e) {
+    // Сеть недоступна — оставляем токен, при следующем действии API вернёт 403
+    console.warn('[revalidate] network error', e.message);
+  }
 }
 
 async function apiFetch(path, params = {}) {
@@ -3829,21 +3899,29 @@ function setupSettingsModal() {
     localStorage.setItem('subgroupFilter', state.subgroupFilter);
     closeModal(modal);
 
-    // Смена группы: writerToken привязан к группе, может стать невалидным.
-    // Но ownerRole глобальный — OWNER_CODE работает для любой группы,
-    // поэтому токен не очищаем если пользователь owner.
-    if (groupChanged && !state.ownerRole) {
-      state.writerToken = '';
-      localStorage.removeItem('writerToken');
-      refreshEditVisibility();
-      // Кеш расписаний per-group: при смене группы обнуляем, чтобы старые
-      // данные чужой группы не попали в новую (ключ кеша зависит от группы,
-      // но in-memory кеш — нет). То же для ДЗ и предметов.
-      state.scheduleCache = {};
-      invalidateSchedCache();
-      invalidateHwCache();
-      invalidateSubjectsCache();
-    }
+// Смена группы: writerToken привязан к группе (хранится per-group в writerTokens).
+// ownerRole глобальный — OWNER_CODE работает для любой группы,
+// поэтому токен не очищаем если пользователь owner.
+if (groupChanged && !state.ownerRole) {
+  // НЕ удаляем токен из localStorage — он хранится per-group.
+  // Просто обновляем UI (текущая группа может не иметь токена).
+  refreshEditVisibility();
+  // Кеш расписаний per-group: при смене группы обнуляем, чтобы старые
+  // данные чужой группы не попали в новую (ключ кеша зависит от группы,
+  // но in-memory кеш — нет). То же для ДЗ и предметов.
+  state.scheduleCache = {};
+  invalidateSchedCache();
+  invalidateHwCache();
+  invalidateSubjectsCache();
+}
+
+// Если переключились обратно в группу с сохранённым токеном — ревалидируем.
+if (groupChanged && !state.ownerRole) {
+  const savedToken = state.writerTokens[newGroup.toLowerCase()];
+  if (savedToken) {
+    revalidateInviteToken(savedToken, newGroup.toLowerCase());
+  }
+}
 
     // Если сменилась только подгруппа — перерисовываем локально,
     // без лишних запросов к сети/кампусу. Иначе — полная перезагрузка.
