@@ -709,7 +709,7 @@ async function handleUpload(request, env, corsHeaders) {
     if (!group || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
-    await store.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 604800 });
+    await store.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 21600000 });
     await purgeGroupCdnCache(env, group);
     return jsonResponse({ ok: true, type: 'weeks', count: weeks.length }, corsHeaders);
   }
@@ -722,12 +722,12 @@ async function handleUpload(request, env, corsHeaders) {
     }
 
     const key = weekCode ? `schedule:${group}:${weekCode}` : `schedule:${group}:current`;
-    await store.put(key, JSON.stringify(data), { expirationTtl: 604800 });
+    await store.put(key, JSON.stringify(data), { expirationTtl: 21600000 });
 
     await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
       lastWeek: weekCode || 'current',
-    }), { expirationTtl: 604800 });
+    }), { expirationTtl: 21600000 });
 
     try {
       await updateSubjectsForCurrentSemester(env, group);
@@ -758,7 +758,7 @@ async function handleUpload(request, env, corsHeaders) {
       const newStr = JSON.stringify(stripComparable(data));
 
       if (existingStr !== newStr) {
-        await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+        await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 21600000 });
         updated.push(weekCode);
 
           // Инкрементально обновим список предметов этой недели (собираем stmt
@@ -791,7 +791,7 @@ async function handleUpload(request, env, corsHeaders) {
     await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
       lastWeek: 'batch',
-    }), { expirationTtl: 604800 });
+    }), { expirationTtl: 21600000 });
 
     await purgeGroupCdnCache(env, group);
 
@@ -840,7 +840,7 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
     lastSync: new Date().toISOString(),
     lastWeek: meta?.lastWeek || 'check',
     campusUpdatedAt: meta?.campusUpdatedAt || null,
-  }), { expirationTtl: 604800 });
+  }), { expirationTtl: 21600000 });
 
   return jsonResponse({ needUpdate, stored: stored || null }, corsHeaders);
 }
@@ -893,7 +893,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
         }
       }
 
-      await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 604800 });
+      await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 21600000 });
       updated.push(weekCode);
 
       // Инкрементально обновляем список предметов этой недели (собираем stmt
@@ -925,7 +925,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
     // Записываем дату обновления кампуса (если прислали)
   if (campusUpdatedAt) {
-    await store.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 604800 });
+    await store.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 21600000 });
   }
 
   // Пересчёт ДЗ с dueMode='nextPair' — расписание могло измениться
@@ -950,7 +950,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     lastSync: new Date().toISOString(),
     lastWeek: 'batch',
     campusUpdatedAt: campusUpdatedAt || null,
-  }), { expirationTtl: 604800 });
+  }), { expirationTtl: 21600000 });
 
   // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
   if (diffs.length > 0) {
@@ -1038,7 +1038,7 @@ async function handleAddHw(request, env, corsHeaders) {
   const key = `hw:${group}`;
   const existing = await store.get(key, { type: 'json' }) || [];
   existing.push(item);
-  await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
 
   notifyGroupBg(env, group, formatHwMessage('add', group, item, null));
   await purgeGroupCdnCache(env, group);
@@ -1089,7 +1089,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   existing[idx] = item;
-  await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
 
   notifyGroupBg(env, group, formatHwMessage('update', group, item, prev));
   await purgeGroupCdnCache(env, group);
@@ -1153,7 +1153,7 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
   }
 
   if (changed) {
-    await store.put(key, JSON.stringify(existing), { expirationTtl: 2592000 });
+    await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
   }
 
   if (changed) {
@@ -1189,7 +1189,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   const removed = existing.find(h => h.id === id);
   const filtered = existing.filter(h => h.id !== id);
 
-  await store.put(key, JSON.stringify(filtered), { expirationTtl: 2592000 });
+  await store.put(key, JSON.stringify(filtered), { expirationTtl: 21600000 });
 
   if (removed) {
     notifyGroupBg(env, group, formatHwMessage('delete', group, removed, null));
@@ -1495,7 +1495,7 @@ async function recalcHomeworkForGroup(env, group) {
   }
 
   if (changed) {
-    await store.put(key, JSON.stringify(updatedItems), { expirationTtl: 2592000 });
+    await store.put(key, JSON.stringify(updatedItems), { expirationTtl: 21600000 });
   }
   return { updated: changed ? updatedItems.length : 0, items: updatedItems, changed };
 }
