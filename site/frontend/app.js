@@ -2127,12 +2127,16 @@ function openModal(modal, originEl) {
     }
     void (content ? content.offsetWidth : 0);
     modal.classList.add('is-open');
+    if (window.matchMedia('(max-width: 400px)').matches) {
+      document.body.style.overflow = 'hidden';
+    }
   });
 }
 
 function closeModal(modal) {
   if (!modal) return;
   modal.classList.remove('is-open');
+  document.body.style.overflow = '';
   setTimeout(() => modal.classList.add('hidden'), 240);
 }
 
