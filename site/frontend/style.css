@@ -940,14 +940,34 @@ header {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: opacity 0.2s;
+  transition: opacity 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
 }
-.group-save-btn:hover {
-  opacity: 0.85;
+.group-save-btn:hover:not(:disabled) {
+  transform: scale(1.08);
+  box-shadow: 0 2px 8px rgba(108, 140, 255, 0.35);
+}
+.group-save-btn:active:not(:disabled) {
+  transform: scale(0.92);
+  box-shadow: none;
+}
+.group-save-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
+  transform: scale(0.9);
 }
 .group-save-btn .icon {
   width: 18px;
   height: 18px;
+  transition: transform 0.25s ease;
+}
+.group-save-btn .icon-check {
+  display: none;
+}
+.group-save-btn:disabled .icon-chevron-right {
+  display: none;
+}
+.group-save-btn:disabled .icon-check {
+  display: block;
 }
 
 .modal-body label {

@@ -3825,8 +3825,25 @@ function setupSettingsModal() {
   const modal = document.getElementById('settingsModal');
   let syncMetaLoaded = false;
 
+  const groupInput = document.getElementById('groupInput');
+  const saveGroupBtn = document.getElementById('saveGroupBtn');
+
+  function updateSaveGroupBtnState() {
+    const current = groupInput.value.trim().toLowerCase();
+    saveGroupBtn.disabled = (current === state.group);
+  }
+
+  groupInput.addEventListener('input', updateSaveGroupBtnState);
+  groupInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !saveGroupBtn.disabled) {
+      e.preventDefault();
+      saveGroupBtn.click();
+    }
+  });
+
     document.getElementById('settingsBtn').onclick = () => {
-      document.getElementById('groupInput').value = state.group;
+      groupInput.value = state.group;
+      updateSaveGroupBtnState();
       document.getElementById('campusToggle').checked = state.campusEnabled;
       document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
       document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
