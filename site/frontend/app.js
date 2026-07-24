@@ -182,6 +182,12 @@ function invalidateSubjectsCache() {
   } catch (e) { /* ignore */ }
 }
 
+// Валидация номера группы: 3 цифры, (опционально буква), дефис, 3-4 буквы.
+const GROUP_RE = /^\d{3}[а-яА-ЯёЁ]?-[а-яА-ЯёЁ]{3,4}$/i;
+function isValidGroup(g) {
+  return typeof g === 'string' && GROUP_RE.test(g.trim());
+}
+
 // isWriter — true, если у пользователя есть token для записи (writer/owner).
 // Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
 // всё равно проверяет бэкенд (requireWriter) — фронтенд здесь не критичен.
@@ -555,6 +561,12 @@ function setupStartPage() {
       input.focus();
       return;
     }
+    if (!isValidGroup(group)) {
+      errEl.textContent = 'Формат: 3 цифры, дефис, 3-4 буквы (напр. 131-ИБо)';
+      errEl.classList.remove('hidden');
+      input.focus();
+      return;
+    }
     errEl.classList.add('hidden');
     const normalizedGroup = group.toLowerCase();
     state.group = normalizedGroup;
@@ -672,7 +684,7 @@ async function loadData() {
       recalcNextPairDates();
     }
 
-    if (state.campusEnabled) {
+    if (state.campusEnabled && isWriter()) {
       // Фон: полноценная синхронизация как по кнопке синхронизации. При свежих данных
       // (campusUpdatedAt < 5 мин) ранний выход в syncAll. Недели не трогаем,
       // если только что их обновили через bootstrap (markWeeksFresh).
@@ -1061,7 +1073,9 @@ async function backgroundSyncSingle(idx, dbData) {
 
     const changed = !dbData || JSON.stringify(stripComparable(dbData)) !== JSON.stringify(stripComparable(data));
     if (changed) {
-      await uploadSchedulesToBackend([{ weekCode: w.value, data }]);
+      if (isWriter()) {
+        await uploadSchedulesToBackend([{ weekCode: w.value, data }]);
+      }
       // loadHomework()/loadSubjects() НЕ нужны: ДЗ и предметы группы не
       // зависят от конкретной недели, а их списки уже загружены в state.
       // Экономия 2 вызовов воркера при каждом прокруте вперёд > +2 недель.
@@ -2017,7 +2031,9 @@ async function recalcNextPairDates() {
     for (const v of valid) state.scheduleCache[v.weekCode] = v.data;
 
     // Отправляем в KV (fire-and-forget, не ждём результат)
-    uploadSchedulesToBackend(valid).catch(e => console.warn('upload more weeks failed:', e.message));
+    if (isWriter()) {
+      uploadSchedulesToBackend(valid).catch(e => console.warn('upload more weeks failed:', e.message));
+    }
   }
 
   // Для ДЗ, которые так и не нашли — ставим dueDate=null
@@ -3915,7 +3931,12 @@ function setupSettingsModal() {
 
   // Кнопка-стрелка рядом с полем группы: сохраняет ТОЛЬКО группу.
   document.getElementById('saveGroupBtn').onclick = () => {
-    const newGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
+    const rawGroup = document.getElementById('groupInput').value.trim() || DEFAULT_GROUP;
+    if (!isValidGroup(rawGroup)) {
+      showToast('Формат: 3 цифры, дефис, 3-4 буквы (напр. 131-ИБо)', 'warn');
+      return;
+    }
+    const newGroup = rawGroup.toLowerCase();
     const groupChanged = newGroup.toLowerCase() !== state.group;
 
     state.group = newGroup.toLowerCase();

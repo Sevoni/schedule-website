@@ -97,6 +97,8 @@ export default {
 
       // ── Campus sync (frontend-parse flow) ───────────────
       if (path === '/api/check-campus-update' && method === 'POST') {
+        const guard = await requireWriter(request, env, corsHeaders);
+        if (guard) return guard;
         return await handleCheckCampusUpdate(request, env, corsHeaders);
       }
       if (path === '/api/sync-from-campus' && method === 'POST') {
@@ -255,6 +257,12 @@ async function requireWriter(request, env, corsHeaders) {
   const auth = await resolveAuth(request, env);
   if (!auth || (auth.role !== 'writer' && auth.role !== 'owner')) {
     return jsonResponse({ error: 'Forbidden: writer access required' }, corsHeaders, 403);
+  }
+  if (auth.role === 'writer') {
+    const targetGroup = await groupFromBodyOrQuery(request);
+    if (targetGroup && auth.group !== targetGroup) {
+      return jsonResponse({ error: 'Forbidden: group mismatch' }, corsHeaders, 403);
+    }
   }
   return null; // ок
 }
