@@ -1338,33 +1338,22 @@ header {
 .tg-status.tg-ok { color: var(--green); }
 .tg-status.tg-warn { color: var(--orange); }
 
-.tg-instructions {
-  margin: 0 0 12px 18px;
+.tg-hint {
   font-size: 0.82rem;
   color: var(--text-dim);
+  margin: 0 0 10px 0;
   line-height: 1.5;
 }
-.tg-instructions code {
+.tg-hint code {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 1px 5px;
   color: var(--text);
 }
-.tg-instructions a {
+.tg-hint a {
   color: var(--accent);
 }
-
-.tg-msg {
-  font-size: 0.82rem;
-  margin: 8px 0;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-}
-.tg-msg.tg-ok { color: var(--green); border-color: var(--green); }
-.tg-msg.tg-warn { color: var(--orange); border-color: var(--orange); }
 
 .tg-actions {
   display: flex;

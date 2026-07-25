@@ -21,6 +21,7 @@ let state = {
   campusUpdatedAt: localStorage.getItem('campusUpdatedAt') || '',
   tgChatId: localStorage.getItem('tgChatId') || '',
   tgBotUsername: localStorage.getItem('tgBotUsername') || '',
+  tgSubgroup: localStorage.getItem('tgSubgroup') || '',
   // writerTokens — токены ссылок-приглашений per-group: { "group": "token" }.
   // Сохраняется в localStorage, чтобы не вводить ссылку каждый раз.
   // isWriter = !!writerTokens[group].
@@ -3522,14 +3523,11 @@ function renderHomework() {
 
 // ── Telegram notifications UI ──────────────────────────────────
 
-// Загрузка статуса Telegram round-trip-вызов к воркеру, поэтому делаем его
-// только когда пользователь реально открывает настройки (см. setupSettingsModal).
-// Здесь — только статический рендер из уже известного state (без запроса).
+// Рендер статуса из уже известного state (без запроса).
+// Актуализация через settings refresh (setupSettingsModal).
 function setupTgSection() {
   const statusEl = document.getElementById('tgStatus');
   const linkEl = document.getElementById('tgBotLink');
-  const chatInput = document.getElementById('tgChatIdInput');
-  const msgEl = document.getElementById('tgMsg');
   const actionsEl = document.getElementById('tgActions');
 
   if (state.tgBotUsername) {
@@ -3538,33 +3536,23 @@ function setupTgSection() {
   } else {
     linkEl.textContent = '(бот не настроен)';
   }
-  chatInput.value = state.tgChatId || '';
-  if (state.tgChatId) {
-    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + state.tgChatId + ')';
-    statusEl.className = 'tg-status tg-ok';
-  } else {
-    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
-    statusEl.className = 'tg-status';
-  }
 
-  function showMsg(text, kind) {
-    msgEl.textContent = text;
-    msgEl.className = 'tg-msg' + (kind ? ' tg-' + kind : '');
+  function renderTgStatus() {
+    if (state.tgChatId) {
+      const subLabel = state.tgSubgroup === '1' ? 'подгруппа 1'
+        : state.tgSubgroup === '2' ? 'подгруппа 2'
+        : 'обе подгруппы';
+      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены — ' + escHtml(state.group) + ', ' + escHtml(subLabel);
+      statusEl.className = 'tg-status tg-ok';
+    } else {
+      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
+      statusEl.className = 'tg-status';
+    }
   }
 
   function renderTgButtons() {
-    const currentVal = chatInput.value.trim();
-    const isBound = !!state.tgChatId;
-    const isChanged = isBound && currentVal !== state.tgChatId;
     actionsEl.innerHTML = '';
-    if (!isBound || isChanged) {
-      const sub = document.createElement('button');
-      sub.className = 'save-btn';
-      sub.textContent = 'Привязать';
-      sub.onclick = doSubscribe;
-      actionsEl.appendChild(sub);
-    }
-    if (isBound) {
+    if (state.tgChatId) {
       const unsub = document.createElement('button');
       unsub.className = 'btn-secondary';
       unsub.textContent = 'Отвязать';
@@ -3573,43 +3561,58 @@ function setupTgSection() {
     }
   }
 
-  chatInput.addEventListener('input', renderTgButtons);
-
-  async function doSubscribe() {
-    const chatId = chatInput.value.trim();
-    if (!chatId) { showMsg('Введите chat_id из сообщения бота', 'warn'); return; }
-    showMsg('Проверяем…', '');
-    try {
-      await apiPost('/api/tg/subscribe', { group: state.group, chatId });
-      state.tgChatId = chatId;
-      localStorage.setItem('tgChatId', chatId);
-      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + chatId + ')';
-      statusEl.className = 'tg-status tg-ok';
-      showMsg('Готово! Теперь уведомления будут приходить в Telegram.', 'ok');
-      renderTgButtons();
-    } catch (e) {
-      showMsg('Ошибка: ' + (e.message || 'не удалось привязать'), 'warn');
-    }
-  }
-
   async function doUnsubscribe() {
-    if (!state.tgChatId) { showMsg('Привязка отсутствует', 'warn'); return; }
+    if (!state.tgChatId) return;
     try {
       await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
       state.tgChatId = '';
+      state.tgSubgroup = '';
       localStorage.removeItem('tgChatId');
-      chatInput.value = '';
-      statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
-      statusEl.className = 'tg-status';
-      showMsg('Отвязано. Уведомления приходить не будут.', 'ok');
+      localStorage.removeItem('tgSubgroup');
+      renderTgStatus();
       renderTgButtons();
     } catch (e) {
-      showMsg('Ошибка: ' + (e.message || 'не удалось отвязать'), 'warn');
+      console.log('tg unsubscribe error:', e);
     }
   }
 
+  renderTgStatus();
   renderTgButtons();
 }
+setupTgSection._refresh = function () {
+  const statusEl = document.getElementById('tgStatus');
+  if (!statusEl) return;
+  if (state.tgChatId) {
+    const subLabel = state.tgSubgroup === '1' ? 'подгруппа 1'
+      : state.tgSubgroup === '2' ? 'подгруппа 2'
+      : 'обе подгруппы';
+    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены — ' + escHtml(state.group) + ', ' + escHtml(subLabel);
+    statusEl.className = 'tg-status tg-ok';
+  } else {
+    statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
+    statusEl.className = 'tg-status';
+  }
+  const actionsEl = document.getElementById('tgActions');
+  if (actionsEl) {
+    actionsEl.innerHTML = '';
+    if (state.tgChatId) {
+      const unsub = document.createElement('button');
+      unsub.className = 'btn-secondary';
+      unsub.textContent = 'Отвязать';
+      unsub.onclick = async () => {
+        try {
+          await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
+          state.tgChatId = '';
+          state.tgSubgroup = '';
+          localStorage.removeItem('tgChatId');
+          localStorage.removeItem('tgSubgroup');
+          setupTgSection._refresh();
+        } catch (e) { console.log('tg unsubscribe error:', e); }
+      };
+      actionsEl.appendChild(unsub);
+    }
+  }
+};
 
 // ── Invite links UI (writer/owner) ────────────────────────────
 // Видно только когда isWriter(). Содержит:
@@ -3848,7 +3851,6 @@ function setupSettingsModal() {
       document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
       document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
       document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
-      document.getElementById('tgChatIdInput').value = state.tgChatId || '';
       // Тема
       const themeRadios = document.querySelectorAll('input[name="theme-mode"]');
       themeRadios.forEach((r) => { r.checked = (r.value === (state.theme || 'dark')); });
@@ -3873,15 +3875,23 @@ function setupSettingsModal() {
       }
       if (res.subscribed) {
         state.tgChatId = res.chatId || state.tgChatId;
+        state.tgSubgroup = res.subgroup || 'any';
         localStorage.setItem('tgChatId', state.tgChatId);
-        document.getElementById('tgChatIdInput').value = state.tgChatId;
-        statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены (chat_id: ' + state.tgChatId + ')';
+        localStorage.setItem('tgSubgroup', state.tgSubgroup);
+        const subLabel = state.tgSubgroup === '1' ? 'подгруппа 1'
+          : state.tgSubgroup === '2' ? 'подгруппа 2'
+          : 'обе подгруппы';
+        statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-check-circle"></use></svg> Уведомления включены — ' + escHtml(state.group) + ', ' + escHtml(subLabel);
         statusEl.className = 'tg-status tg-ok';
       } else {
+        state.tgChatId = '';
+        state.tgSubgroup = '';
+        localStorage.removeItem('tgChatId');
+        localStorage.removeItem('tgSubgroup');
         statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
         statusEl.className = 'tg-status';
       }
-      document.getElementById('tgChatIdInput').dispatchEvent(new Event('input'));
+      if (setupTgSection._refresh) setupTgSection._refresh();
     }).catch(() => {});
 
     if (!syncMetaLoaded) {
@@ -3998,10 +4008,14 @@ function setupSettingsModal() {
       apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
         if (res.subscribed) {
           state.tgChatId = res.chatId || '';
+          state.tgSubgroup = res.subgroup || 'any';
           localStorage.setItem('tgChatId', state.tgChatId);
+          localStorage.setItem('tgSubgroup', state.tgSubgroup);
         } else {
           state.tgChatId = '';
+          state.tgSubgroup = '';
           localStorage.removeItem('tgChatId');
+          localStorage.removeItem('tgSubgroup');
         }
       }).catch(() => {});
     }

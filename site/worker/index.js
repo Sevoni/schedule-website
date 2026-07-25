@@ -963,10 +963,8 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
   if (diffs.length > 0) {
     try {
-      const text = formatScheduleDiffBroadcast(group, diffs);
-      // Не блокируем ответ клиенту ожиданием Telegram (он может висеть 10-30с
-  // из-за недоступности api.telegram.org из-под CF в РФ). Шлём в фоне.
-  notifyGroupBg(env, group, text);
+      const buildText = buildScheduleDiffText(group, diffs);
+      notifyGroupFilteredBg(env, group, buildText);
     } catch (e) {
       console.log('schedule notify skipped:', e.message);
     }
@@ -1048,7 +1046,7 @@ async function handleAddHw(request, env, corsHeaders) {
   existing.push(item);
   await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
 
-  notifyGroupBg(env, group, formatHwMessage('add', group, item, null));
+  notifyGroupFilteredBg(env, group, buildHwText('add', group, item, null));
   await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item }, corsHeaders);
@@ -1099,7 +1097,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
   existing[idx] = item;
   await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
 
-  notifyGroupBg(env, group, formatHwMessage('update', group, item, prev));
+  notifyGroupFilteredBg(env, group, buildHwText('update', group, item, prev));
   await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
@@ -1200,7 +1198,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   await store.put(key, JSON.stringify(filtered), { expirationTtl: 21600000 });
 
   if (removed) {
-    notifyGroupBg(env, group, formatHwMessage('delete', group, removed, null));
+    notifyGroupFilteredBg(env, group, buildHwText('delete', group, removed, null));
   }
   await purgeGroupCdnCache(env, group);
 
@@ -1719,10 +1717,9 @@ function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
 // ════════════════════════════════════════════════════════════════
 //
 // KV keys:
-//   tg:chat:{group}            -> chatId (строка) — текущая привязка группы
+//   tg:subs:{group}            -> JSON [{ chatId, subgroup }, ...] — подписчики + подгруппа
 //   tg:groups:{chatId}         -> JSON [group,...] — индекс для рассылки по chat
-//   tg:pending:{chatId}        -> timestamp последней выданной команды /start
-//                                (используется только лог-вспомогательно)
+//   tg:chat:{group}            -> chatId (строка) — LEGACY, мигрируется в tg:subs:
 //
 // Лимиты Telegram: text до 4096 символов, messages не чаще ~30/сек.
 // Используем sendMessage с disable_web_page_preview=true.
@@ -1737,8 +1734,6 @@ async function tgApi(env, method, payload) {
   }
   try {
     console.log('[tg] tgApi ->', method, 'chat_id=', payload && payload.chat_id, 'textLen=', payload && payload.text ? payload.text.length : 0);
-      // Таймаут 8с: Telegram API из-под CF в РФ часто недоступен/тормозит,
-      // не держим запрос вечно (особенно в фоновом режиме через waitUntil).
       const resp = await fetch(`${TG_API_BASE}/bot${token}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1758,42 +1753,48 @@ async function tgApi(env, method, payload) {
   }
 }
 
-// Отправка текста всем подписчикам группы (обычно один chat_id).
-// Читает список подписчиков группы (много chat_id на одну группу).
-// Поддерживает миграцию старого ключа tg:chat:{group} (один chat_id) →
-// превращаем в список из одного элемента.
+// Возвращает [{ chatId, subgroup }, ...] для группы.
+// Миграция: старый формат ["chatId"] → [{ chatId, subgroup: "any" }].
 async function getGroupSubscribers(env, group) {
   const store = createStore(env);
   const raw = await store.get(`tg:subs:${group}`, { type: 'json' });
-  console.log('[tg] getGroupSubscribers', group, '=> raw=', JSON.stringify(raw));
-  if (Array.isArray(raw)) return raw;
-
-  // Миграция: старый одиночный ключ.
-  const old = await store.get(`tg:chat:${group}`);
-  if (old) {
-    const list = [old];
-    await store.put(`tg:subs:${group}`, JSON.stringify(list));
-    await store.delete(`tg:chat:${group}`);
-    console.log('[tg] migrated old tg:chat for', group, '=>', JSON.stringify(list));
-    return list;
+  if (!raw) {
+    // Проверяем ключ tg:chat:{group} (очень старый формат).
+    const old = await store.get(`tg:chat:${group}`);
+    if (old) {
+      const list = [{ chatId: String(old), subgroup: 'any' }];
+      await store.put(`tg:subs:${group}`, JSON.stringify(list));
+      await store.delete(`tg:chat:${group}`);
+      return list;
+    }
+    return [];
   }
-  console.log('[tg] getGroupSubscribers', group, '=> EMPTY (no subs)');
-  return [];
+  if (!Array.isArray(raw)) return [];
+  // Миграция: массив строк → массив объектов.
+  if (raw.length && typeof raw[0] === 'string') {
+    const migrated = raw.map(id => ({ chatId: String(id), subgroup: 'any' }));
+    await store.put(`tg:subs:${group}`, JSON.stringify(migrated));
+    return migrated;
+  }
+  return raw;
 }
 
-async function addGroupSubscriber(env, group, chatId) {
+async function addGroupSubscriber(env, group, chatId, subgroup) {
   const store = createStore(env);
   const list = await getGroupSubscribers(env, group);
-  if (!list.includes(chatId)) {
-    list.push(chatId);
-    await store.put(`tg:subs:${group}`, JSON.stringify(list));
+  const existing = list.find(s => String(s.chatId) === String(chatId));
+  if (existing) {
+    if (subgroup) existing.subgroup = subgroup;
+  } else {
+    list.push({ chatId: String(chatId), subgroup: subgroup || 'any' });
   }
+  await store.put(`tg:subs:${group}`, JSON.stringify(list));
 }
 
 async function removeGroupSubscriber(env, group, chatId) {
   const store = createStore(env);
   const list = await getGroupSubscribers(env, group);
-  const filtered = list.filter(c => String(c) !== String(chatId));
+  const filtered = list.filter(s => String(s.chatId) !== String(chatId));
   if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered));
   else await store.delete(`tg:subs:${group}`);
 }
@@ -1817,7 +1818,6 @@ function notifyGroupBg(env, group, text, opts = {}) {
 
 // Рассылает сообщение всем подписчикам группы (chat_id изолированы друг от друга).
 async function notifyGroup(env, group, text, opts = {}) {
-  const store = createStore(env);
   if (!env.DB || !env.TELEGRAM_BOT_TOKEN) {
     console.log('[tg] notifyGroup early return: DB=', !!env.DB, 'token=', !!env.TELEGRAM_BOT_TOKEN);
     return;
@@ -1829,17 +1829,16 @@ async function notifyGroup(env, group, text, opts = {}) {
   }
   console.log('[tg] notifyGroup: sending to', subs.length, 'subs for', group, 'textLen=', text ? text.length : 0);
 
-  // Длинные сообщения (> 4096) дробим по переводам.
   const chunks = splitForTg(text, 4000);
-  for (const chatId of subs) {
+  for (const sub of subs) {
     for (const c of chunks) {
       const res = await tgApi(env, 'sendMessage', {
-        chat_id: chatId,
+        chat_id: sub.chatId,
         text: c,
         parse_mode: opts.parseMode || 'HTML',
         disable_web_page_preview: true,
       });
-      console.log('[tg] notifyGroup: sendMessage to', chatId, '=>', JSON.stringify(res).slice(0, 150));
+      console.log('[tg] notifyGroup: sendMessage to', sub.chatId, '=>', JSON.stringify(res).slice(0, 150));
     }
   }
 }
@@ -1863,12 +1862,82 @@ function splitForTg(text, maxLen) {
   return out;
 }
 
+// ── Фильтрация уведомлений по подгруппе ─────────────────────────
+
+function matchesSubgroup(pref, itemSubgroup) {
+  if (pref === 'any') return true;
+  if (!itemSubgroup || itemSubgroup === 'any') return true;
+  return pref === itemSubgroup;
+}
+
+// Рассылка с персональной фильтрацией: buildText(chatId, subgroup) → string | null.
+async function notifyGroupFiltered(env, group, buildText) {
+  if (!env.DB || !env.TELEGRAM_BOT_TOKEN) return;
+  const subs = await getGroupSubscribers(env, group);
+  if (!subs.length) return;
+  for (const sub of subs) {
+    const text = await buildText(sub.chatId, sub.subgroup);
+    if (!text) continue;
+    const chunks = splitForTg(text, 4000);
+    for (const c of chunks) {
+      await tgApi(env, 'sendMessage', {
+        chat_id: sub.chatId,
+        text: c,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
+    }
+  }
+}
+
+function notifyGroupFilteredBg(env, group, buildText) {
+  const p = notifyGroupFiltered(env, group, buildText).catch((e) =>
+    console.log('[tg] notifyFiltered skipped:', e && e.message)
+  );
+  if (currentCtx && typeof currentCtx.waitUntil === 'function') {
+    currentCtx.waitUntil(p);
+  }
+  return p;
+}
+
+// Генератор текста для diff расписания, фильтрованный по подгруппе.
+function buildScheduleDiffText(group, diffs) {
+  return async function (chatId, pref) {
+    const filteredWeeks = [];
+    for (const w of diffs) {
+      const filteredLines = [];
+      for (const line of w.lines) {
+        const pairMatch = line.match(/^  [➕➖] (.+)$/);
+        if (pairMatch) {
+          const pairText = pairMatch[1];
+          const subMatch = pairText.match(/ · подгруппа (\d)/);
+          const pairSubgroup = subMatch ? subMatch[1] : '';
+          if (!matchesSubgroup(pref, pairSubgroup)) continue;
+        }
+        filteredLines.push(line);
+      }
+      const hasPairs = filteredLines.some(l => l.startsWith('  '));
+      if (hasPairs) filteredWeeks.push({ weekLabel: w.weekLabel, lines: filteredLines });
+    }
+    if (!filteredWeeks.length) return null;
+    return formatScheduleDiffBroadcast(group, filteredWeeks);
+  };
+}
+
+// Генератор текста для ДЗ, фильтрованный по подгруппе.
+function buildHwText(action, group, hw, prevHw) {
+  return async function (chatId, pref) {
+    if (!matchesSubgroup(pref, hw.subgroup)) return null;
+    return formatHwMessage(action, group, hw, prevHw);
+  };
+}
+
 // ── POST /api/tg/webhook ────────────────────────────────────────
 // Telegram шлёт обновления бота на этот путь (setWebhook).
 // Поддерживаемые команды:
-//   /start            — приветствие + выдаёт chat_id
-//   /chat_id          — повторно выдаёт chat_id
-//   /stop             — отвязывает chat_id от всех групп
+//   /sub <group>       — подписаться на группу (инлайн-кнопки подгруппы)
+//   /stop              — отвязывает chat_id от всех групп
+//   /status            — показывает текущую подписку
 
 // ── POST /api/tg/set-webhook ──────────────────────────────────
 // Ставит webhook Telegram на этот же Worker, вызывая Telegram API
@@ -1921,6 +1990,44 @@ async function handleTgWebhook(request, env) {
   let update;
   try { update = await request.json(); } catch { return new Response('ok', { status: 200 }); }
 
+  // ── Callback query (инлайн-кнопки выбора подгруппы) ──
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const chatId = String(cq.message && cq.message.chat && cq.message.chat.id);
+    const data = cq.data || '';
+    // data = "sub_any:GROUP" | "sub_1:GROUP" | "sub_2:GROUP"
+    const cbMatch = data.match(/^sub_(any|\d):(.+)$/);
+    if (cbMatch && chatId) {
+      const subgroup = cbMatch[1] === 'any' ? 'any' : cbMatch[1];
+      const group = normalizeGroup(cbMatch[2]);
+      if (group) {
+        // Сохраняем подписку + subgroup в tg:subs:{group}
+        await addGroupSubscriber(env, group, chatId, subgroup);
+        // Обновляем обратный индекс tg:groups:{chatId}
+        const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+        if (!groupsRaw.includes(group)) {
+          groupsRaw.push(group);
+          await store.put(`tg:groups:${chatId}`, JSON.stringify(groupsRaw));
+        }
+
+        const subLabel = subgroup === 'any' ? 'обе подгруппы' : `подгруппа ${subgroup}`;
+        await tgApi(env, 'sendMessage', {
+          chat_id: chatId,
+          text: `✅ Подписка на группу <b>${escTg(group)}</b> (<i>${escTg(subLabel)}</i>) оформлена!\n\nУведомления придут при изменениях расписания и новых ДЗ.\n\nКоманды:\n/status — статус подписки\n/stop — отписаться`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        });
+        // Отвечаем на callback, чтобы убрать "часики" на кнопке.
+        await tgApi(env, 'answerCallbackQuery', { callback_query_id: cq.id });
+        return new Response('ok', { status: 200 });
+      }
+    }
+    // Неизвестный callback — просто отвечаем.
+    await tgApi(env, 'answerCallbackQuery', { callback_query_id: cq.id });
+    return new Response('ok', { status: 200 });
+  }
+
+  // ── Обычные сообщения ──
   const msg = update.message || update.edited_message;
   if (!msg || !msg.chat) return new Response('ok', { status: 200 });
 
@@ -1928,47 +2035,110 @@ async function handleTgWebhook(request, env) {
   const text = (msg.text || '').trim();
   const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
-  // В групповых чатах отвечаем ТОЛЬКО на команды, чтобы не засорять чат.
-  const isCommand = /^\/(start|chat_id|stop)(@\w+)?$/i.test(text);
-  if (isGroup && !isCommand) return new Response('ok', { status: 200 });
+  // В групповых чатах игнорируем.
+  if (isGroup) return new Response('ok', { status: 200 });
 
   try {
-    if (/^\/start(@\w+)?$/i.test(text) || /^\/chat_id(@\w+)?$/i.test(text)) {
-      const scopeNote = isGroup
-        ? 'Это <b>групповой чат</b>. Все участники этого чата получат уведомления, если привязать этот chat_id к группе расписания.'
-        : 'Это личный чат. Уведомления будут приходить только тебе.';
-      const lines = [
-        '👋 Привет! Это бот расписания СыктГУ.',
-        '',
-        scopeNote,
-        '',
-        'Чтобы получать уведомления об изменениях расписания и новых ДЗ:',
-        '',
-        '<b>1.</b> Скопируй этот chat_id:',
-        '',
-        `<code>${chatId}</code>`,
-        '',
-        '<b>2.</b> Открой сайт расписания → ⚙️ Настройки → раздел Telegram, вставь chat_id и нажми «Привязать».',
-        '',
-        'После этого сюда будут приходить уведомления о новых и изменённых ДЗ, а также об изменениях в расписании твоей группы.',
-      ];
+    // /start — приветствие
+    if (/^\/start(@\w+)?$/i.test(text)) {
       await tgApi(env, 'sendMessage', {
         chat_id: chatId,
-        text: lines.join('\n'),
+        text: [
+          '👋 Привет! Это бот расписания СыктГУ.',
+          '',
+          'Чтобы получать уведомления об изменениях расписания и новых ДЗ:',
+          '',
+          'Напиши <code>/sub</code> и номер группы.',
+          'Например: <code>/sub 131-ИБо</code>',
+          '',
+          'После этого выбери подгруппу — и всё готово!',
+          '',
+          'Команды:',
+          '/sub &lt;группа&gt; — подписаться',
+          '/status — статус подписки',
+          '/stop — отписаться',
+        ].join('\n'),
         parse_mode: 'HTML',
         disable_web_page_preview: true,
       });
+    // /sub <group> — подписка
+    } else if (/^\/sub(@\w+)?\s+(.+)$/i.test(text)) {
+      const groupName = RegExp.$2.trim();
+      const group = normalizeGroup(groupName);
+      if (!group) {
+        await tgApi(env, 'sendMessage', {
+          chat_id: chatId,
+          text: '❌ Не удалось распознать название группы. Проверь и попробуй ещё раз.',
+        });
+        return new Response('ok', { status: 200 });
+      }
+      // Проверяем, уже ли подписан.
+      const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+      if (groupsRaw.includes(group)) {
+        const subs = await getGroupSubscribers(env, group);
+        const existing = subs.find(s => String(s.chatId) === chatId);
+        const pref = existing ? existing.subgroup : 'any';
+        const subLabel = pref === 'any' ? 'обе подгруппы' : `подгруппа ${pref}`;
+        await tgApi(env, 'sendMessage', {
+          chat_id: chatId,
+          text: `⚠️ Ты уже подписан на группу <b>${escTg(group)}</b> (<i>${escTg(subLabel)}</i>).\n\nСначала отпиши: <code>/stop</code>, потом снова <code>/sub ${escTg(group)}</code>.`,
+          parse_mode: 'HTML',
+        });
+        return new Response('ok', { status: 200 });
+      }
+      // Показываем инлайн-кнопки выбора подгруппы.
+      await tgApi(env, 'sendMessage', {
+        chat_id: chatId,
+        text: `Выбери подгруппу для группы <b>${escTg(group)}</b>:`,
+        parse_mode: 'HTML',
+        reply_markup: JSON.stringify({
+          inline_keyboard: [
+            [{ text: 'Обе подгруппы', callback_data: `sub_any:${group}` }],
+            [{ text: 'Подгруппа 1', callback_data: `sub_1:${group}` }],
+            [{ text: 'Подгруппа 2', callback_data: `sub_2:${group}` }],
+          ],
+        }),
+      });
+    // /stop — отписка от всего
     } else if (/^\/stop(@\w+)?$/i.test(text)) {
       await unbindChat(env, chatId);
       await tgApi(env, 'sendMessage', {
         chat_id: chatId,
-        text: '❌ Этот чат отписан от всех уведомлений. Чтобы снова получать — нажми /start.',
+        text: '❌ Ты отписан от всех уведомлений.\n\nЧтобы снова подписаться: <code>/sub</code> <group>',
+        parse_mode: 'HTML',
       });
-    } else if (text && !isGroup) {
-      // В личке подсказываем команды на любой прочий текст.
+    // /status — текущая подписка
+    } else if (/^\/status(@\w+)?$/i.test(text)) {
+      const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+      if (!groupsRaw.length) {
+        await tgApi(env, 'sendMessage', {
+          chat_id: chatId,
+          text: 'ℹ️ Ты не подписан ни на одну группу.\n\nНапиши <code>/sub</code> и номер группы.',
+          parse_mode: 'HTML',
+        });
+      } else {
+        const lines = ['📋 Твои подписки:'];
+        for (const g of groupsRaw) {
+          const subs = await getGroupSubscribers(env, g);
+          const existing = subs.find(s => String(s.chatId) === chatId);
+          const pref = existing ? existing.subgroup : 'any';
+          const subLabel = pref === 'any' ? 'обе подгруппы' : `подгруппа ${pref}`;
+          lines.push(`• <b>${escTg(g)}</b> — ${escTg(subLabel)}`);
+        }
+        lines.push('', '/stop — отписаться от всего');
+        await tgApi(env, 'sendMessage', {
+          chat_id: chatId,
+          text: lines.join('\n'),
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        });
+      }
+    // Прочий текст — подсказка
+    } else if (text && !text.startsWith('/')) {
       await tgApi(env, 'sendMessage', {
         chat_id: chatId,
-        text: 'Доступные команды: /start (получить chat_id), /stop (отписаться).',
+        text: 'Напиши <code>/sub</code> и номер группы, чтобы подписаться.\nНапример: <code>/sub 131-ИБо</code>',
+        parse_mode: 'HTML',
       });
     }
   } catch (e) {
@@ -1981,10 +2151,8 @@ async function unbindChat(env, chatId) {
   const store = createStore(env);
   const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
   for (const g of groupsRaw) {
-    // Чистим старый одиночный ключ, если он указывал на этот chat.
     const cur = await store.get(`tg:chat:${g}`);
     if (String(cur) === String(chatId)) await store.delete(`tg:chat:${g}`);
-    // И удаляем chat из списка подписчиков группы.
     await removeGroupSubscriber(env, g, chatId);
   }
   await store.delete(`tg:groups:${chatId}`);
@@ -2049,10 +2217,10 @@ async function handleTgUnsubscribe(request, env, corsHeaders) {
     await store.delete(`tg:subs:${group}`);
     await store.delete(`tg:chat:${group}`); // на случай старого ключа
     for (const c of subs) {
-      const groupsRaw = await store.get(`tg:groups:${String(c)}`, { type: 'json' }) || [];
+      const groupsRaw = await store.get(`tg:groups:${String(c.chatId)}`, { type: 'json' }) || [];
       const filtered = groupsRaw.filter(g => g !== group);
-      if (filtered.length) await store.put(`tg:groups:${String(c)}`, JSON.stringify(filtered));
-      else await store.delete(`tg:groups:${String(c)}`);
+      if (filtered.length) await store.put(`tg:groups:${String(c.chatId)}`, JSON.stringify(filtered));
+      else await store.delete(`tg:groups:${String(c.chatId)}`);
     }
   } else if (chatId) {
     await unbindChat(env, String(chatId));
@@ -2073,12 +2241,13 @@ async function handleTgStatus(request, env, corsHeaders) {
   const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
   const chatId = url.searchParams.get('chatId') || '';
   const subs = await getGroupSubscribers(env, group);
-  const isSub = chatId ? subs.some(c => String(c) === String(chatId)) : false;
+  const existing = chatId ? subs.find(s => String(s.chatId) === String(chatId)) : null;
   return jsonResponse({
-    subscribed: isSub,
-    chatId: isSub ? chatId : null,
+    subscribed: !!existing,
+    chatId: existing ? chatId : null,
     subscribersCount: subs.length,
     botUsername: env.TG_BOT_USERNAME || '',
+    subgroup: existing ? existing.subgroup : null,
   }, corsHeaders);
 }
 

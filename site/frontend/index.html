@@ -128,16 +128,11 @@
         <div class="tg-section">
           <h3><svg class="icon icon-h3"><use href="#icon-send"></use></svg> Telegram-уведомления</h3>
           <div id="tgStatus" class="tg-status">Проверка…</div>
-          <ol class="tg-instructions">
-            <li>Открой бота: <a id="tgBotLink" href="#" target="_blank" rel="noopener">ссылка</a></li>
-            <li>Напиши ему <code>/start</code> и скопируй присланный <b>chat_id</b></li>
-            <li>Вставь chat_id ниже и нажми «Привязать»</li>
-          </ol>
-          <label>
-            Chat ID
-            <input type="text" id="tgChatIdInput" placeholder="например 123456789">
-          </label>
-          <div id="tgMsg" class="tg-msg hidden"></div>
+          <p class="tg-hint">
+            Напиши боту <a id="tgBotLink" href="#" target="_blank" rel="noopener">@kampussgubot</a>
+            команду <code>/sub</code> и номер группы, затем выбери подгруппу.
+            <code>/stop</code> — отписаться.
+          </p>
           <div id="tgActions" class="tg-actions"></div>
         </div>
 
