@@ -298,6 +298,31 @@ function setupAnimations() {
 }
 
 let editingHwId = null;
+let originalHwFields = null;
+
+function getHwFormValues() {
+  const sel = document.getElementById('hwSubject');
+  const isCustom = sel.value === '__custom__';
+  const subject = isCustom
+    ? document.getElementById('hwSubjectCustom').value.trim()
+    : decodePairValue(sel.value).subject;
+  const pairType = document.getElementById('hwPairType').value;
+  const subgroup = document.getElementById('hwSubgroup').value || 'any';
+  const task = document.getElementById('hwTask').value.trim();
+  const author = document.getElementById('hwAuthor').value.trim();
+  const modeRadio = document.querySelector('input[name="hwDueMode"]:checked');
+  const dueMode = modeRadio ? modeRadio.value : 'date';
+  const dueDate = calState.selectedDate;
+  return { subject, pairType, subgroup, task, author, dueMode, dueDate };
+}
+
+function updateSaveBtnState() {
+  const btn = document.getElementById('saveHomework');
+  if (!originalHwFields) { btn.disabled = false; return; }
+  const current = getHwFormValues();
+  const changed = Object.keys(originalHwFields).some(k => originalHwFields[k] !== current[k]);
+  btn.disabled = !changed;
+}
 
 // Множество id ДЗ, отмеченных пользователем как выполненные (локально, per-группа).
 // Хранится в localStorage — при очистке браузера отметки сбрасываются.
@@ -2693,6 +2718,7 @@ function renderCalendar(year, month, selectedDateStr) {
       el.classList.add('selected');
       document.getElementById('hwDateSelected').textContent = formatDateDisplay(dateStr);
       calState.selectedDate = dateStr;
+      updateSaveBtnState();
     };
   });
 }
@@ -2878,6 +2904,7 @@ function setupHomeworkModal() {
       } else {
         dateWrap.classList.add('hidden');
       }
+      updateSaveBtnState();
     };
   });
 
@@ -2983,6 +3010,7 @@ function setupHomeworkModal() {
         state.homework.push(result.item);
       }
       editingHwId = null;
+      originalHwFields = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
       resetDeleteState();
@@ -3036,6 +3064,7 @@ function setupHomeworkModal() {
       await apiDelete('/api/hw', { id, group: state.group });
       state.homework = state.homework.filter(h => h.id !== id);
       editingHwId = null;
+      originalHwFields = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
       closeModal(modal);
@@ -3051,6 +3080,7 @@ function setupHomeworkModal() {
   // Сбрасываем состояние удаления при любом закрытии модалки
   document.getElementById('closeHomework').onclick = () => {
     editingHwId = null;
+    originalHwFields = null;
     resetDeleteState();
     closeModal(modal);
   };
@@ -3058,6 +3088,7 @@ function setupHomeworkModal() {
   modal.onclick = (e) => {
     if (e.target === modal) {
       editingHwId = null;
+      originalHwFields = null;
       resetDeleteState();
       closeModal(modal);
     }
@@ -3237,7 +3268,10 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
     }
 
     updateSubgroupVisibility(existingHw.subgroup);
+    originalHwFields = getHwFormValues();
+    saveBtn.disabled = true;
   } else if (preSubject) {
+    originalHwFields = null;
     const match = loadedSubjects.find(s => s.subject.toLowerCase() === preSubject.toLowerCase());
     const todayMatch = todayPairs.find(p => {
       if (p.subject.toLowerCase() !== preSubject.toLowerCase()) return false;
@@ -3303,6 +3337,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
     // авто-выбираем подгруппу сегодняшнего занятия (или переданную с кнопки «+»).
     updateSubgroupVisibility(preSubgroup);
   } else {
+    originalHwFields = null;
     sel.value = todayPairs.length ? encodePairValue(todayPairs[0].subject, todayPairs[0].type, (todayPairs[0].subgroup || '').replace(/\D/g, '') || undefined) : (allItems.length ? allItems[0].subject : '__custom__');
     if (sel.value !== '__custom__') {
       customWrap.classList.add('hidden');
@@ -3342,6 +3377,14 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
     // Подгруппы
     updateSubgroupVisibility(preSubgroup);
   }
+
+  const watchEls = [sel, document.getElementById('hwPairType'),
+    document.getElementById('hwSubgroup'), document.getElementById('hwTask'),
+    document.getElementById('hwAuthor'), document.getElementById('hwSubjectCustom')];
+  watchEls.forEach(el => {
+    el.addEventListener('input', updateSaveBtnState);
+    el.addEventListener('change', updateSaveBtnState);
+  });
 
   openModal(modal, originEl);
   collapseSelected();
