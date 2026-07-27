@@ -5,6 +5,12 @@ const DEFAULT_GROUP = '131-ибо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
 const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 
+function fetchTimeout(url, opts = {}, timeoutMs = 30000) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), timeoutMs);
+  return fetch(url, { ...opts, signal: c.signal }).finally(() => clearTimeout(t));
+}
+
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
@@ -206,7 +212,7 @@ function getAuthToken() {
 // Вызывается при переключении группы, если есть сохранённый токен для этой группы.
 async function revalidateInviteToken(token, group) {
   try {
-    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+    const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
@@ -413,7 +419,7 @@ async function consumeInviteTokenFromUrl() {
   if (!token) return;
 
   try {
-    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+    const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token }),
@@ -464,7 +470,7 @@ async function becomeOwner(code, opts = {}) {
   const silent = opts.silent !== false; // по умолчанию показываем toast
   if (!code) return false;
   try {
-    const resp = await fetch(state.apiBase + '/api/invite/create', {
+    const resp = await fetchTimeout(state.apiBase + '/api/invite/create', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1399,7 +1405,7 @@ async function fetchWeeksFromCampus(group) {
   formData.set('num_group', group);
   formData.set('searchdata', 'ИСКАТЬ');
 
-  const resp = await fetch(CAMPUS_URL, {
+  const resp = await fetchTimeout(CAMPUS_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
     body: formData.toString(),
@@ -1452,7 +1458,7 @@ async function fetchScheduleFromCampus(group, weekCode) {
     formData.set('searchdata', 'ИСКАТЬ');
   }
 
-  const resp = await fetch(CAMPUS_URL, {
+  const resp = await fetchTimeout(CAMPUS_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
     body: formData.toString(),
@@ -1521,7 +1527,7 @@ async function fetchClassroomFromCampus(room) {
     const formData = new URLSearchParams();
     formData.set('num_aud', room);
     formData.set('searchdata', 'ИСКАТЬ');
-    const resp = await fetch(CAMPUS_CLASSROOM_URL, {
+    const resp = await fetchTimeout(CAMPUS_CLASSROOM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
       body: formData.toString(),
@@ -1749,7 +1755,7 @@ function invalidateWriterAccess(reason) {
 // Вызывает /api/invite/verify, если токен невалиден/отозван/не для этой группы — удаляет.
 async function revalidateInviteToken(token, group) {
   try {
-    const resp = await fetch(state.apiBase + '/api/invite/verify', {
+    const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
@@ -1775,7 +1781,7 @@ async function apiFetch(path, params = {}) {
   const headers = {};
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
-  const resp = await fetch(url.toString(), { headers });
+  const resp = await fetchTimeout(url.toString(), { headers });
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error('API ' + resp.status);
@@ -1787,7 +1793,7 @@ async function apiPost(path, body) {
   const headers = { 'Content-Type': 'application/json' };
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
-  const resp = await fetch(state.apiBase + path, {
+  const resp = await fetchTimeout(state.apiBase + path, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -1808,7 +1814,7 @@ async function apiDelete(path, params = {}) {
   const headers = {};
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
-  const resp = await fetch(url.toString(), { method: 'DELETE', headers });
+  const resp = await fetchTimeout(url.toString(), { method: 'DELETE', headers });
   const data = await resp.json();
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();
@@ -1821,7 +1827,7 @@ async function apiPut(path, body) {
   const headers = { 'Content-Type': 'application/json' };
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
-  const resp = await fetch(state.apiBase + path, {
+  const resp = await fetchTimeout(state.apiBase + path, {
     method: 'PUT',
     headers,
     body: JSON.stringify(body),

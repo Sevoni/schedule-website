@@ -180,6 +180,31 @@ async function getMany(db, logger, keys, opts = {}) {
   });
 }
 
+// batchGet(items) — пакетное чтение N ключей одним вызовом db.batch().
+// items: массив { key, type?: 'json' }. Возвращает массив значений
+// в том же порядке (null для отсутствующих/протухших ключей).
+// Все SELECT выполняются одним round-trip к D1 — критично для
+// холодного старта при медленном соединении.
+async function batchGet(db, logger, items) {
+  if (!items || items.length === 0) return [];
+  return logger.wrap('get', `batchGet(${items.length})`, async () => {
+    const now = nowMs();
+    const stmts = items.map(({ key }) =>
+      db.prepare('SELECT value, expires_at FROM kv WHERE key = ?').bind(key)
+    );
+    const results = await db.batch(stmts);
+    return results.map((r, i) => {
+      const row = r.results?.[0];
+      if (!row) return null;
+      if (row.expires_at != null && row.expires_at <= now) return null;
+      if (items[i].type === 'json') {
+        try { return JSON.parse(row.value); } catch { return null; }
+      }
+      return row.value;
+    });
+  });
+}
+
 // batch(operations) — пакетная запись/чтение через D1 db.batch().
 // operations: массив подготовленных stmt (db.prepare(...).bind(...)).
 // Возвращает результаты. Используется для замены цикла из N put().
@@ -220,6 +245,7 @@ function createStore(env) {
     list: (opts) => list(db, logger, opts),
     listValues: (opts) => listValues(db, logger, opts),
     getMany: (keys, opts) => getMany(db, logger, keys, opts),
+    batchGet: (items) => batchGet(db, logger, items),
     batch: (operations) => batch(db, logger, operations),
     cleanupExpired: () => cleanupExpired(db, logger),
   };

@@ -660,38 +660,26 @@ async function handleBootstrap(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  // Параллельно читаем weeks, hw, subjects, campusUpdatedAt и расписания.
+  // Одним batch-запросом читаем все ключи: weeks, hw, subjects,
+  // campus-updated и расписания. Один round-trip к D1 вместо 5.
   const semester = currentSemesterKey();
-  const parallel = [
-    store.get(`weeks:${group}`, { type: 'json' }),
-    store.get(`hw:${group}`, { type: 'json' }),
-    store.get(`subjects:${group}:${semester}`, { type: 'json' }),
-    store.get(`campus-updated:${group}`),
+  const schedKeys = weeks.map((w) => `schedule:${group}:${w}`);
+  const items = [
+    { key: `weeks:${group}`, type: 'json' },
+    { key: `hw:${group}`, type: 'json' },
+    { key: `subjects:${group}:${semester}`, type: 'json' },
+    { key: `campus-updated:${group}` },
+    ...schedKeys.map((k) => ({ key: k, type: 'json' })),
   ];
-  if (weeks.length > 0) {
-    const schedKeys = weeks.map((w) => `schedule:${group}:${w}`);
-    parallel.push(store.getMany(schedKeys, { type: 'json' }));
-  } else {
-    parallel.push(Promise.resolve(null));
-  }
-
-  const [weeksData, hwData, subjectsData, campusUpdatedAt, schedResult] = await Promise.all(parallel);
+  const [weeksData, hwData, subjectsData, campusUpdatedAt, ...schedValues] = await store.batchGet(items);
 
   const schedules = {};
-  if (schedResult && Array.isArray(schedResult.entries)) {
-    const prefix = `schedule:${group}:`;
-    for (const e of schedResult.entries) {
-      if (e.value == null) continue;
-      const weekCode = e.key.slice(prefix.length);
-      schedules[weekCode] = e.value;
+  for (let i = 0; i < weeks.length; i++) {
+    if (schedValues[i] != null) {
+      schedules[weeks[i]] = schedValues[i];
     }
   }
 
-  // subjects может прийти в трёх видах:
-  //   - null/[]  → в БД пусто
-  //   - старый формат (без поля subgroups) → фронт сам триггерит recomput
-  //   - актуальный формат
-  // Здесь ничего не нормализуем — отдаём как есть, фронтенд сам решает.
   return jsonResponse({
     weeks: weeksData || [],
     schedules,
