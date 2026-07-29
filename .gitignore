@@ -1,3 +1,10 @@
 .wrangler/
 node_modules/
 .dev.vars
+site\.wrangler
+site/.wrangler/cache/cf.json
+site/.wrangler/cache/pages.json
+site/.wrangler/cache/wrangler-account.json
+site/.wrangler/state/v3/cache/miniflare-CacheObject/metadata.sqlite
+site/.wrangler/state/v3/cache/miniflare-CacheObject/metadata.sqlite-shm
+site/.wrangler/state/v3/cache/miniflare-CacheObject/metadata.sqlite-wal

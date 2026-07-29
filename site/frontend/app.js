@@ -4169,6 +4169,47 @@ function fallbackCopy(text, done) {
   done(false);
 }
 
+// Rubber‑band overscroll (iOS‑like bounce)
+(function(){
+  var el = document.querySelector('.container') || document.body;
+  var offset = 0, raf = null;
+  var DAMP = 0.35, DECAY = 0.82, THR = 0.5;
+
+  function atTop(){ return window.scrollY <= 0; }
+  function atBottom(){
+    return window.scrollY >= document.documentElement.scrollHeight - window.innerHeight - 1;
+  }
+  function spring(){
+    offset *= DECAY;
+    el.style.transform = offset ? 'translateY('+offset+'px)' : '';
+    if(Math.abs(offset) < THR){ el.style.transform = ''; offset = 0; raf = null; }
+    else raf = requestAnimationFrame(spring);
+  }
+  function push(dy){
+    offset += dy * DAMP;
+    el.style.transform = 'translateY('+offset+'px)';
+    if(!raf) raf = requestAnimationFrame(spring);
+  }
+
+  window.addEventListener('wheel', function(e){
+    if((atTop() && e.deltaY < 0) || (atBottom() && e.deltaY > 0)){
+      push(-e.deltaY); e.preventDefault();
+    }
+  }, {passive:false});
+
+  var ty = 0;
+  window.addEventListener('touchstart', function(e){ ty = e.touches[0].clientY; }, {passive:true});
+  window.addEventListener('touchmove', function(e){
+    var dy = e.touches[0].clientY - ty;
+    if((atTop() && dy > 0) || (atBottom() && dy < 0)){ push(dy * 0.5); e.preventDefault(); }
+    ty = e.touches[0].clientY;
+  }, {passive:false});
+  window.addEventListener('touchend', function(){
+    if(raf) cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(spring);
+  });
+})();
+
 function escHtml(str) {
   const d = document.createElement('div');
   d.textContent = str || '';

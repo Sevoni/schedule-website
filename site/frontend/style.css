@@ -53,7 +53,9 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  overflow-x: clip;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: none;
   scrollbar-width: none;
   transition: background 0.25s ease, color 0.25s ease;
 }
@@ -63,6 +65,7 @@ body::-webkit-scrollbar { display: none; }
   max-width: 600px;
   margin: 0 auto;
   padding: 16px;
+  padding-bottom: 24px;
 }
 
 .icon {
@@ -1293,16 +1296,10 @@ header {
     margin-top: 0;
     border-top: none;
     padding-top: 0;
-    position: sticky;
-    top: 16px;
-    max-height: calc(100vh - 32px);
-    overflow-y: auto;
-    scrollbar-width: none;
+    position: static;
+    margin-top: 20px;
   }
-  #homeworkSection::-webkit-scrollbar {
-    display: none;
-  }
-  .homework-header { position: sticky; top: 0; background: var(--bg); padding-bottom: 0; margin-bottom: 14px; align-items: flex-start; }
+  .homework-header { padding-bottom: 0; margin-bottom: 14px; align-items: flex-start; }
   .day-header { margin-top: 0; }
 }
 
