@@ -1297,6 +1297,10 @@ header {
     top: 16px;
     max-height: calc(100vh - 32px);
     overflow-y: auto;
+    scrollbar-width: none;
+  }
+  #homeworkSection::-webkit-scrollbar {
+    display: none;
   }
   .homework-header { position: sticky; top: 0; background: var(--bg); padding-bottom: 0; margin-bottom: 14px; align-items: flex-start; }
   .day-header { margin-top: 0; }

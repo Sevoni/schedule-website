@@ -2446,8 +2446,12 @@ function updateSyncUI(status, errorMsg) {
     el.innerHTML = '<span class="sync-icon"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span> ' + new Date().toLocaleTimeString('ru');
     el.className = 'sync-status ok';
   } else if (status === 'error') {
-    el.innerHTML = '<span class="sync-icon"><svg class="icon" style="width:16px;height:16px"><use href="#icon-x-circle"></use></svg></span> Ошибка. <button onclick="syncAll(null,{forceSync:true})" class="sync-retry">Повторить</button>';
+    el.innerHTML = '<span class="sync-icon"><svg class="icon" style="width:16px;height:16px"><use href="#icon-x-circle"></use></svg></span> Ошибка. <button id="syncRetryBtn" class="sync-retry">Повторить</button>';
     el.className = 'sync-status error';
+    // Навешиваем обработчик через addEventListener (а не через inline onclick),
+    // чтобы строгая CSP (script-src 'self') не блокировала кнопку.
+    const retryBtn = el.querySelector('#syncRetryBtn');
+    if (retryBtn) retryBtn.addEventListener('click', () => syncAll(null, { forceSync: true }));
   }
 }
 

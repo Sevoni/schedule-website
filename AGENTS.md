@@ -67,6 +67,7 @@ Set via `npx wrangler secret put <NAME>`:
 |---|---|
 | `OWNER_CODE` | Owner role auth. Any string. Without it, no first invite link can be created. |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather. Enables TG notifications. |
+| `TG_WEBHOOK_SECRET` | Optional but recommended. Random string (1–256 chars) that Telegram sends back in the `X-Telegram-Bot-Api-Secret-Token` header on every webhook update. Without it, `/api/tg/webhook` accepts forged POSTs. Set the **same** value here and pass it to `npm run set-webhook` via `TG_WEBHOOK_SECRET` env var so the script includes `secret_token` in the `setWebhook` call. |
 
 Generate OWNER_CODE: `python generate_owner_code.py` (or `--write-dev` to write to `.dev.vars`).
 

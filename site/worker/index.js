@@ -21,6 +21,11 @@ export default {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      // Security headers (применяются ко всем /api/* ответам).
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      'X-Frame-Options': 'DENY',
+      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
     };
 
     if (method === 'OPTIONS') {
@@ -107,14 +112,6 @@ export default {
         return await handleSyncFromCampus(request, env, corsHeaders);
       }
 
-      // ── Auth endpoints ───────────────────────────────────
-      if (path === '/api/auth' && method === 'POST') {
-        return await handleAuth(request, env, corsHeaders);
-      }
-      if (path === '/api/group/register' && method === 'POST') {
-        return await handleGroupRegister(request, env, corsHeaders);
-      }
-
       // ── Invite endpoints (writer/owner only) ────────────
       if (path === '/api/invite/create' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -143,12 +140,6 @@ export default {
       // ── Telegram bot endpoints ──────────────────────────
       if (path === '/api/tg/webhook' && method === 'POST') {
         return await handleTgWebhook(request, env);
-      }
-      if (path === '/api/tg/set-webhook' && method === 'POST') {
-        return await handleTgSetWebhook(request, env, corsHeaders);
-      }
-      if (path === '/api/tg/subscribe' && method === 'POST') {
-        return await handleTgSubscribe(request, env, corsHeaders);
       }
       if (path === '/api/tg/unsubscribe' && method === 'POST') {
         return await handleTgUnsubscribe(request, env, corsHeaders);
@@ -267,73 +258,6 @@ async function requireWriter(request, env, corsHeaders) {
   return null; // ок
 }
 
-// ── POST /api/auth ─────────────────────────────────────────────
-// Body: { group, password }
-// Returns: { token, group }
-
-async function handleAuth(request, env, corsHeaders) {
-  const store = createStore(env);
-  if (!env.DB) {
-    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
-  }
-
-  const { group: _group, password } = await request.json();
-  const group = normalizeGroup(_group);
-
-  if (!group || !password) {
-    return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
-  }
-
-  const stored = await store.get(`group-pwd:${group}`);
-  if (!stored) {
-    return jsonResponse({ error: 'Group not registered' }, corsHeaders, 404);
-  }
-
-  // Compare passwords
-  const hash = await sha256(password);
-  if (hash !== stored) {
-    return jsonResponse({ error: 'Wrong password' }, corsHeaders, 401);
-  }
-
-  // Create token
-  const token = btoa(JSON.stringify({ group, ts: Date.now() }));
-  return jsonResponse({ token, group }, corsHeaders);
-}
-
-// ── POST /api/group/register ───────────────────────────────────
-// Body: { group, password }
-// Creates a new group with a password. First-time only.
-// If group already exists, requires the old password to change it.
-
-async function handleGroupRegister(request, env, corsHeaders) {
-  const store = createStore(env);
-  if (!env.DB) {
-    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
-  }
-
-  const { group: _group, password } = await request.json();
-  const group = normalizeGroup(_group);
-
-  if (!group || !password) {
-    return jsonResponse({ error: 'Missing group or password' }, corsHeaders, 400);
-  }
-
-  if (password.length < 4) {
-    return jsonResponse({ error: 'Password must be at least 4 characters' }, corsHeaders, 400);
-  }
-
-  const existing = await store.get(`group-pwd:${group}`);
-  if (existing) {
-    return jsonResponse({ error: 'Group already registered' }, corsHeaders, 409);
-  }
-
-  const hash = await sha256(password);
-  await store.put(`group-pwd:${group}`, hash);
-
-  // Auto-login: return token
-  const token = btoa(JSON.stringify({ group, ts: Date.now() }));
-  return jsonResponse({ ok: true, token, group }, corsHeaders);
-}
 
 // ── Приглашения ────────────────────────────────────────────────
 //
@@ -547,13 +471,22 @@ async function handleInviteRename(request, env, corsHeaders) {
   return jsonResponse({ ok: true, id, label: newLabel || '' }, corsHeaders);
 }
 
-// ── SHA-256 hash helper ────────────────────────────────────────
+// ── Constant-time string comparison ────────────────────────────
+// Защищает от timing-атак при сравнении секретов (TG_WEBHOOK_SECRET и т.п.).
+// Возвращает true, если строки равны. Длина сравнивается в постоянное время
+// не идеально, но для секрета фиксированной длины этого достаточно.
 
-async function sha256(message) {
-  const msgBuffer = new TextEncoder().encode(message);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+function timingSafeEqualStr(a, b) {
+  const sa = String(a == null ? '' : a);
+  const sb = String(b == null ? '' : b);
+  const ea = new TextEncoder().encode(sa);
+  const eb = new TextEncoder().encode(sb);
+  // Используем crypto.subtle через XOR-аккумулятор, чтобы не зависеть от
+  // раннего выхода при первом несовпадении.
+  let diff = ea.length ^ eb.length;
+  const len = Math.min(ea.length, eb.length);
+  for (let i = 0; i < len; i++) diff |= ea[i] ^ eb[i];
+  return diff === 0;
 }
 
 // ── GET /api/schedule?group=...&week=... ────────────────────────
@@ -1927,54 +1860,24 @@ function buildHwText(action, group, hw, prevHw) {
 //   /stop              — отвязывает chat_id от всех групп
 //   /status            — показывает текущую подписку
 
-// ── POST /api/tg/set-webhook ──────────────────────────────────
-// Ставит webhook Telegram на этот же Worker, вызывая Telegram API
-// ИЗНУТРИ Cloudflare (там api.telegram.org доступен, в отличие от
-// локальной машины в РФ). Токен берётся из секрета env.TELEGRAM_BOT_TOKEN.
-// Можно защитить переменной окружения TG_WEBHOOK_KEY (передаётся в body.key
-// или заголовке x-webhook-key); если не задана — эндпоинт открыт (webhook
-// URL публичен по природе, вреда от вызова нет — просто переставит на тот же путь).
-
-async function handleTgSetWebhook(request, env, corsHeaders) {
-  if (!env.TELEGRAM_BOT_TOKEN) {
-    return jsonResponse({ error: 'TELEGRAM_BOT_TOKEN not set' }, corsHeaders, 500);
-  }
-
-  const key = env.TG_WEBHOOK_KEY;
-  if (key) {
-    const body = await request.json().catch(() => ({}));
-    const provided = body.key || request.headers.get('x-webhook-key') || '';
-    if (provided !== key) {
-      return jsonResponse({ error: 'Forbidden' }, corsHeaders, 403);
-    }
-  }
-
-  // Строим URL webhook на основе origin текущего запроса.
-  const origin = new URL(request.url).origin;
-  const webhookUrl = `${origin}/api/tg/webhook`;
-
-  const res = await tgApi(env, 'setWebhook', {
-    url: webhookUrl,
-    drop_pending_updates: true,
-  });
-
-  let info = null;
-  if (res.ok) {
-    const infoResp = await tgApi(env, 'getWebhookInfo', {});
-    info = infoResp.result || null;
-  }
-
-  return jsonResponse({
-    ok: res.ok,
-    setWebhook: res.result || res.error || null,
-    webhookUrl,
-    info,
-  }, corsHeaders);
-}
-
 async function handleTgWebhook(request, env) {
   const store = createStore(env);
   if (!env.DB) return new Response('ok', { status: 200 });
+
+  // Защита от подделки updates: Telegram при setWebhook с secret_token
+  // шлёт заголовок X-Telegram-Bot-Api-Secret-Token на каждый запрос.
+  // Если секрет задан — сравниваем constant-time. Если не задан — webhook
+  // открытый (обратная совместимость), но логируем предупреждение.
+  if (env.TG_WEBHOOK_SECRET) {
+    const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+    if (!timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET)) {
+      console.log('[tg] webhook rejected: bad secret_token');
+      return new Response('Unauthorized', { status: 401 });
+    }
+  } else {
+    console.log('[tg] WARNING: TG_WEBHOOK_SECRET not set — webhook accepts forged updates');
+  }
+
   let update;
   try { update = await request.json(); } catch { return new Response('ok', { status: 200 }); }
 
@@ -2146,45 +2049,14 @@ async function unbindChat(env, chatId) {
   await store.delete(`tg:groups:${chatId}`);
 }
 
-// ── POST /api/tg/subscribe ─────────────────────────────────────
-// Body: { group, chatId }  — привязывает chat_id к группе текущего пользователя.
-
-async function handleTgSubscribe(request, env, corsHeaders) {
-  const store = createStore(env);
-  if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
-  const body = await request.json().catch(() => ({}));
-  const { group: _group, chatId } = body;
-  const group = normalizeGroup(_group);
-  if (!group || !chatId) return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
-  const chatIdStr = String(chatId).replace(/[^\d-]/g, '');
-  if (!chatIdStr) return jsonResponse({ error: 'Invalid chatId' }, corsHeaders, 400);
-
-  // Проверим, что chat_id реально существует у бота: отправим тихий probe.
-  // Если токена нет — пропускаем проверку (dev-режим).
-  if (env.TELEGRAM_BOT_TOKEN) {
-    const probe = await tgApi(env, 'sendMessage', {
-      chat_id: chatIdStr,
-      text: '✅chat_id привязан к группе ' + group + '. Теперь тут будут уведомления!',
-      disable_web_page_preview: true,
-    });
-    if (!probe.ok) {
-      return jsonResponse({
-        error: 'Не удалось отправить сообщение в этот chat_id. Убедись, что ты написал боту /start.',
-      }, corsHeaders, 400);
-    }
-  }
-
-  await addGroupSubscriber(env, group, chatIdStr);
-  const groupsRaw = await store.get(`tg:groups:${chatIdStr}`, { type: 'json' }) || [];
-  if (!groupsRaw.includes(group)) {
-    groupsRaw.push(group);
-    await store.put(`tg:groups:${chatIdStr}`, JSON.stringify(groupsRaw));
-  }
-  return jsonResponse({ ok: true, group, chatId: chatIdStr }, corsHeaders);
-}
-
 // ── POST /api/tg/unsubscribe ───────────────────────────────────
 // Body: { group } | { chatId } | { group, chatId }
+//
+// Режим { group, chatId } и { chatId } — публичные (используются кнопкой
+// «Отвязать» во фронте: пользователь отвязывает свой chat_id).
+// Режим { group } без chatId отвязывает ВСЕХ подписчиков группы (массовая
+// отписка) — требует writer/owner для этой группы, чтобы аноним не мог
+// выключить уведомления всей группы.
 
 async function handleTgUnsubscribe(request, env, corsHeaders) {
   const store = createStore(env);
@@ -2200,7 +2072,9 @@ async function handleTgUnsubscribe(request, env, corsHeaders) {
     if (filtered.length) await store.put(`tg:groups:${String(chatId)}`, JSON.stringify(filtered));
     else await store.delete(`tg:groups:${String(chatId)}`);
   } else if (group) {
-    // Отвязываем все чаты от группы (удаляем весь список подписчиков).
+    // Опасный режим: отвязываем ВСЕ чаты от группы. Требуем writer/owner.
+    const guard = await requireWriter(request, env, corsHeaders);
+    if (guard) return guard;
     const subs = await getGroupSubscribers(env, group);
     await store.delete(`tg:subs:${group}`);
     await store.delete(`tg:chat:${group}`); // на случай старого ключа
@@ -2245,9 +2119,9 @@ async function handleTgStatus(request, env, corsHeaders) {
 
 function escTg(s) {
   return String(s == null ? '' : s)
-    .replace(/&/g, '&')
-    .replace(/</g, '<')
-    .replace(/>/g, '>');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 const TG_PAIR_TYPES = {
