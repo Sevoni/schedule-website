@@ -4191,15 +4191,26 @@ function fallbackCopy(text, done) {
     if(!raf) raf = requestAnimationFrame(spring);
   }
 
+  function insideOpenModal(target){
+    if(!target || target.closest) return target.closest('.modal.is-open');
+    return null;
+  }
+
   window.addEventListener('wheel', function(e){
+    if(insideOpenModal(e.target)) return;
     if((atTop() && e.deltaY < 0) || (atBottom() && e.deltaY > 0)){
       push(-e.deltaY); e.preventDefault();
     }
   }, {passive:false});
 
   var ty = 0;
-  window.addEventListener('touchstart', function(e){ ty = e.touches[0].clientY; }, {passive:true});
+  window.addEventListener('touchstart', function(e){
+    if(insideOpenModal(e.target)) { ty = null; return; }
+    ty = e.touches[0].clientY;
+  }, {passive:true});
   window.addEventListener('touchmove', function(e){
+    if(insideOpenModal(e.target)) { ty = null; return; }
+    if(ty == null) return;
     var dy = e.touches[0].clientY - ty;
     if((atTop() && dy > 0) || (atBottom() && dy < 0)){ push(dy * 0.5); e.preventDefault(); }
     ty = e.touches[0].clientY;
