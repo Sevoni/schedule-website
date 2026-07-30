@@ -1,0 +1,41 @@
+name: Парсинг расписания campus.syktsu.ru
+
+on:
+  workflow_dispatch:
+    inputs:
+      group:
+        description: 'Группа (например 131-ИБо)'
+        required: true
+        default: '131-ИБо'
+        type: string
+      week:
+        description: 'Номер недели (оставьте пустым для всех)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Установка зависимостей
+        run: npm install
+        working-directory: campus-parser-action
+
+      - name: Парсинг расписания
+        run: node parser.js "${{ inputs.group }}" "${{ inputs.week }}"
+        working-directory: campus-parser-action
+
+      - name: Сохранение результата
+        uses: actions/upload-artifact@v4
+        with:
+          name: schedule-${{ inputs.group }}
+          path: campus-parser-action/*.json
+          if-no-files-found: ignore

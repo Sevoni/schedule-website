@@ -1,0 +1,6 @@
+{
+  "name": "campus-parser-action",
+  "private": true,
+  "description": "Парсер расписания с campus.syktsu.ru для GitHub Actions",
+  "engines": { "node": ">=18" }
+}
