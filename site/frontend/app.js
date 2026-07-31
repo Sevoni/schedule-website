@@ -969,8 +969,16 @@ async function backgroundSync(campusIndices, dbMap) {
 //  - Вперёд, дальше чем на +2 от текущей: из БД, параллельно обновляем из кампуса.
 //  - Вперёд в пределах текущая/+2: эти недели уже должны быть загружены из БД
 //    при открытии; если по какой-то причине нет — берём из кампуса и пишем в БД.
+// Счётчик поколений запросов loadSchedule: защита от гонки при быстром
+// перелистывании. Каждый вызов захватывает reqSeq; после каждого await
+// проверяем isStale() — если пользователь уже переключил неделю дальше,
+// устаревший запрос отменяет отрисовку, чтобы не перезаписать экран.
+let scheduleReqSeq = 0;
+
 async function loadSchedule(targetIdx, direction) {
   if (targetIdx < 0 || targetIdx >= state.weeks.length) return;
+  const reqSeq = ++scheduleReqSeq;
+  const isStale = () => reqSeq !== scheduleReqSeq;
   state.currentWeekIdx = targetIdx;
   // Направление для анимации сдвига: 'next' (вправо) / 'prev' (влево).
   if (direction) animateSchedule(direction);
@@ -1030,6 +1038,10 @@ async function loadSchedule(targetIdx, direction) {
     dbData = null;
   }
 
+  // Пока ждали /api/schedules, пользователь мог переключить неделю дальше —
+  // тогда устаревший запрос не должен рисовать свой результат.
+  if (isStale()) return;
+
   if (dbData) {
     state.schedule = dbData;
     applyScheduleHeader();
@@ -1053,9 +1065,11 @@ async function loadSchedule(targetIdx, direction) {
       if (hasPairs) {
         await uploadSchedulesToBackend([{ weekCode: w.value, data: campusData }]);
       }
-      state.schedule = campusData;
       state.scheduleCache[w.value] = campusData;
       saveSchedToCache(state.scheduleCache);
+      // Пока тянули кампус, неделя могла смениться — не рисуем устаревшее.
+      if (isStale()) return;
+      state.schedule = campusData;
       applyScheduleHeader();
       renderDayTabs();
       return;
@@ -1064,6 +1078,13 @@ async function loadSchedule(targetIdx, direction) {
     }
   }
 
+  // Пока шли кампусные запросы, неделя могла смениться — устаревший запрос
+  // не должен выводить «Нет данных» поверх уже отрисованной другой недели.
+  if (isStale()) return;
+
+  state.schedule = { group: state.group, weekStart: '', weekEnd: '', days: {} };
+  state.selectedDay = null;
+  document.getElementById('dayTabs').innerHTML = '';
   content.innerHTML = '<div class="no-pairs">Нет данных для этой недели.</div>';
   applyScheduleHeader();
 }
