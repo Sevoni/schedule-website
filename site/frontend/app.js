@@ -2281,6 +2281,7 @@ function renderDayTabs() {
     tab.title = day + ' (' + state.schedule.days[day].date + ')';
 
     tab.onclick = () => {
+      if (day === state.selectedDay) return;
       const prevDay = state.selectedDay;
       state.selectedDay = day;
       document.querySelectorAll('.day-tab').forEach(t => t.classList.remove('active'));
