@@ -5,10 +5,8 @@ const DEFAULT_GROUP = '131-ибо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
 const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 
-function fetchTimeout(url, opts = {}, timeoutMs = 30000) {
-  const c = new AbortController();
-  const t = setTimeout(() => c.abort(), timeoutMs);
-  return fetch(url, { ...opts, signal: c.signal }).finally(() => clearTimeout(t));
+function fetchTimeout(url, opts = {}) {
+  return fetch(url, opts);
 }
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
@@ -881,6 +879,32 @@ async function loadInitialSchedules() {
   const cur = findRealCurrentIdx();
   state.currentWeekIdx = cur;
 
+  // Если реальной текущей недели нет ни в БД, ни в кеше — качаем её с кампуса,
+  // чтобы остаться на текущей неделе. Если кампус недоступен или неделя пустая —
+  // остаёмся на текущей неделе с надписью «нет данных» (без перекидывания на другую).
+  const curWeek = state.weeks[cur];
+  if (curWeek && !state.scheduleCache[curWeek.value] && state.campusEnabled) {
+    try {
+      const campusData = await fetchScheduleFromCampus(state.group, curWeek.value);
+      const hasPairs = campusData.days && Object.values(campusData.days).some(d => d.pairs && d.pairs.length > 0);
+      if (hasPairs) {
+        // Пишем в БД только если есть права writer — reader не должен ловить 403.
+        if (isWriter()) {
+          await uploadSchedulesToBackend([{ weekCode: curWeek.value, data: campusData }]);
+        }
+        state.scheduleCache[curWeek.value] = campusData;
+        saveSchedToCache(state.scheduleCache);
+        state.schedule = campusData;
+        applyScheduleHeader();
+        renderWeekNav();
+        renderDayTabs();
+        return;
+      }
+    } catch (e) {
+      console.warn('[loadInitial] campus fetch failed:', e.message);
+    }
+  }
+
   function renderFromCache() {
     const curWeek = state.weeks[state.currentWeekIdx];
     if (curWeek && state.scheduleCache[curWeek.value]) {
@@ -889,22 +913,19 @@ async function loadInitialSchedules() {
       renderDayTabs();
       return true;
     }
-    const fallbackIdx = indices.find(i => state.scheduleCache[state.weeks[i].value]);
-    if (fallbackIdx !== undefined) {
-      state.currentWeekIdx = fallbackIdx;
-      const w = state.weeks[fallbackIdx];
-      state.schedule = state.scheduleCache[w.value];
-      applyScheduleHeader();
-      renderDayTabs();
-      return true;
-    }
+    // Никогда не перекидываем пользователя на другую неделю: остаёмся на текущей,
+    // а «нет данных» рисуется ниже (сохранённая текущая неделя + надпись).
     return false;
   }
 
   const renderedFromDb = renderFromCache();
 
   if (!renderedFromDb) {
-      content.innerHTML = '<div class="no-pairs">Нет данных. Нажмите кнопку синхронизации в шапке.</div>';
+    state.schedule = { group: state.group, weekStart: '', weekEnd: '', days: {} };
+    state.selectedDay = null;
+    document.getElementById('dayTabs').innerHTML = '';
+    content.innerHTML = '<div class="no-pairs">Нет данных для этой недели. Нажмите кнопку синхронизации в шапке.</div>';
+    applyScheduleHeader();
   }
 
   // Синхронизацию кампуса (syncAll) запускает loadData() — в одном месте,
