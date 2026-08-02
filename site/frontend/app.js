@@ -1779,6 +1779,16 @@ function parseScheduleHTML(html) {
 
 // ── API helpers ───────────────────────────────────────────────
 
+// Показывает toast о превышении лимита запросов (HTTP 429 от Воркера).
+// retryAfter — секунды до конца окна (из заголовка Retry-After), может быть 0.
+function rateLimitToast(retryAfter) {
+  const sec = parseInt(retryAfter, 10) || 0;
+  const msg = sec > 0
+    ? `Слишком много запросов. Повторите через ${sec} сек.`
+    : 'Слишком много запросов. Повторите чуть позже.';
+  showToast(msg, 'warn');
+}
+
 // Если сервер вернул 403 при наличии writer-токена — токен стал
 // невалиден (ссылка отозвана / неверный). Сбрасываем права и
 // переключаем UI в режим «только чтение».
@@ -1824,6 +1834,10 @@ async function apiFetch(path, params = {}) {
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(url.toString(), { headers });
+  if (resp.status === 429) {
+    rateLimitToast(resp.headers.get('Retry-After'));
+    throw new Error('Слишком много запросов');
+  }
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error('API ' + resp.status);
@@ -1840,6 +1854,10 @@ async function apiPost(path, body) {
     headers,
     body: JSON.stringify(body),
   });
+  if (resp.status === 429) {
+    rateLimitToast(resp.headers.get('Retry-After'));
+    throw new Error('Слишком много запросов');
+  }
   const data = await resp.json();
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();
@@ -1857,6 +1875,10 @@ async function apiDelete(path, params = {}) {
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(url.toString(), { method: 'DELETE', headers });
+  if (resp.status === 429) {
+    rateLimitToast(resp.headers.get('Retry-After'));
+    throw new Error('Слишком много запросов');
+  }
   const data = await resp.json();
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();
@@ -1874,6 +1896,10 @@ async function apiPut(path, body) {
     headers,
     body: JSON.stringify(body),
   });
+  if (resp.status === 429) {
+    rateLimitToast(resp.headers.get('Retry-After'));
+    throw new Error('Слишком много запросов');
+  }
   const data = await resp.json();
   if (!resp.ok) {
     if (resp.status === 403 && auth) invalidateWriterAccess();

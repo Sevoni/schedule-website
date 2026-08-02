@@ -41,6 +41,18 @@ export default {
     // убивая висящий fetch при завершении handler'а.
     currentCtx = context;
 
+    // ── Rate limiting (защита от спама) ──────────────────
+    // Применяется ко всем запросам до маршрутизации. Возвращает Response(429)
+    // при превышении лимита или null — тогда выполняем обычный маршрут.
+    // Использует D1 через store._db для атомарного инкремента счётчика.
+    // При недоступности D1 — fail-open (пропускаем), чтобы не положить сайт.
+    try {
+      const limited = await applyRateLimits(store, request, path, method, corsHeaders);
+      if (limited) return limited;
+    } catch (rlErr) {
+      console.log('[ratelimit] check failed (fail-open):', rlErr.message);
+    }
+
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
@@ -2272,4 +2284,118 @@ function formatHwMessage(action, group, hw, prevHw) {
     `<b>${subject}${tp}${sub}</b>`,
     delTask,
   ].filter(Boolean).join('\n');
+}
+
+// ════════════════════════════════════════════════════════════════
+// ── Rate limiting (защита от спама запросами) ───────────────────
+// ════════════════════════════════════════════════════════════════
+//
+// Реализовано поверх существующей D1-таблицы kv (TTL через expires_at,
+// авто-очистка cron'ом в 04:23 UTC через store.cleanupExpired()).
+// Алгоритм: fixed-window counter. Ключ счётчика включает окно:
+//   rl:<kind>:<id>:<windowStart>
+// где windowStart = Math.floor(now / windowSec*1000). При смене окна
+// счётчик автоматически начинает заново (новый ключ), старый протухает.
+//
+// Лимиты (окно 60 сек):
+//   global  — 120/мин по IP, на ВСЕ запросы. Легитимный writer-burst
+//             ~5-8 запросов при sync => запас 15×. Читатель ~1-3.
+//   verify  — 10/мин по IP, на публичные POST /api/invite/verify,
+//             /api/invite/create (D1-read oracle / owner-код).
+//   tg      — 60/мин по IP, на POST /api/tg/webhook.
+//   unsub   — 10/мин по IP, на публичный POST /api/tg/unsubscribe
+//             (любой может отписать произвольный chatId).
+
+// Извлекает IP клиента из каноничного заголовка Cloudflare.
+// cf-connecting-ip ставится CF на каждом запросе к Worker.
+function getClientIp(request) {
+  return (request.headers.get('cf-connecting-ip') || '').trim();
+}
+
+// Атомарно инкрементирует счётчик и проверяет лимит.
+// Возвращает { limited: false } или { limited: true, retryAfter: <сек> }.
+// При ошибке D1 — fail-open (возвращает { limited: false }).
+async function checkRateLimit(store, id, kind, limit, windowSec) {
+  if (!store || !store._db || !id) return { limited: false };
+  const now = Date.now();
+  const windowStart = Math.floor(now / (windowSec * 1000));
+  const key = `rl:${kind}:${id}:${windowStart}`;
+  const expiresAt = now + (windowSec + 60) * 1000; // +60 сек запас на TTL
+
+  // UPSERT с атомарным инкрементом. value храним как TEXT (как всё в kv).
+  // ON CONFLICT — CAST для превращения строки в INTEGER и обратно.
+  await store._db
+    .prepare(
+      `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, '1', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+         expires_at = excluded.expires_at,
+         updated_at = excluded.updated_at`
+    )
+    .bind(key, expiresAt, now)
+    .run();
+
+  // Читаем актуальный счётчик после инкремента.
+  const row = await store._db
+    .prepare('SELECT value FROM kv WHERE key = ?')
+    .bind(key)
+    .first();
+  const count = row ? parseInt(row.value, 10) : 1;
+
+  if (count > limit) {
+    // Сколько секунд до конца окна.
+    const windowEndMs = (windowStart + 1) * windowSec * 1000;
+    const retryAfter = Math.max(1, Math.ceil((windowEndMs - now) / 1000));
+    return { limited: true, retryAfter };
+  }
+  return { limited: false };
+}
+
+// Формирует 429-ответ с понятным сообщением и Retry-After.
+// corsHeaders нужны, чтобы фронтенд (другой origin) мог прочитать тело.
+function rateLimitResponse(corsHeaders, retryAfter) {
+  const headers = {
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Retry-After': String(retryAfter || 5),
+  };
+  return new Response(
+    JSON.stringify({
+      error: 'Слишком много запросов. Попробуйте через несколько секунд.',
+      retryAfter: retryAfter || 5,
+    }),
+    { status: 429, headers }
+  );
+}
+
+// Единая точка применения лимитов. Возвращает Response(429) или null.
+// Вызывается из fetch() после OPTIONS, до маршрутизации.
+async function applyRateLimits(store, request, path, method, corsHeaders) {
+  const ip = getClientIp(request);
+  if (!ip) return null; // без IP не лимитируем (не должно случаться за CF)
+
+  // 1) Глобальный IP-лимит на ВСЕ запросы.
+  const global = await checkRateLimit(store, ip, 'global', 120, 60);
+  if (global.limited) return rateLimitResponse(corsHeaders, global.retryAfter);
+
+  // 2) Точечные лимиты на публичные POST (поверх глобального).
+  if (method === 'POST') {
+    // Чувствительные: invite verify/create — публичные, D1-read oracle.
+    if (path === '/api/invite/verify' || path === '/api/invite/create') {
+      const rl = await checkRateLimit(store, ip, 'verify', 10, 60);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+    }
+    // TG webhook — публичный, шлёт исходящие в Telegram.
+    if (path === '/api/tg/webhook') {
+      const rl = await checkRateLimit(store, ip, 'tg', 60, 60);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+    }
+    // TG unsubscribe — публичный (любой может отписать chatId).
+    if (path === '/api/tg/unsubscribe') {
+      const rl = await checkRateLimit(store, ip, 'unsub', 10, 60);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+    }
+  }
+
+  return null;
 }
