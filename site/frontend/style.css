@@ -549,24 +549,44 @@ header {
   margin-top: 2px;
 }
 
-.hw-show-more {
-  background: none;
-  border: none;
-  color: var(--accent);
-  cursor: pointer;
-  font-size: 0.75rem;
+.hw-markup-hint {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 4px;
+  line-height: 1.5;
+}
+
+.hw-markup-hint code {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   padding: 0 4px;
+  font-size: 0.9em;
+}
+
+/* Кликабельный текст длинного ДЗ (усечённый, ведёт в окно просмотра) */
+.hw-view-link {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0 2px;
+  margin: 0 -2px;
+  transition: background 0.15s;
+}
+
+.hw-view-link:hover {
+  background: rgba(108, 140, 255, 0.1);
+}
+
+.hw-open-hint {
+  color: var(--accent);
   text-decoration: underline;
-  flex-shrink: 0;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  margin-left: 2px;
 }
 
-.hw-full[hidden] {
-  display: none;
-}
-
-.hw-short-collapsed {
-  display: none;
-}
+/* ── Окно просмотра ДЗ: стили вынесены в конец файла,
+      чтобы перекрывать базовые .modal-content / .modal-body ── */
 
 .pair-hw-due {
   flex-shrink: 0;
@@ -1754,3 +1774,173 @@ header {
   font-size: 0.9rem;
 }
 .start-page-error.hidden { display: none; }
+
+/* ---- Окно просмотра ДЗ (в конце файла — перекрывает базовые .modal-content/.modal-body) ---- */
+
+.hw-view-content {
+  max-width: 900px;
+}
+
+.hw-view-body {
+  gap: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.hw-view-task {
+  font-family: Georgia, 'Times New Roman', Times, serif;
+  font-size: 1.1rem;
+  line-height: 1.7;
+  color: var(--text);
+  word-break: break-word;
+  min-width: 0;
+}
+
+.hw-view-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.hw-view-chip {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.hw-view-chip-due {
+  color: var(--orange);
+  border-color: var(--orange);
+}
+
+.hw-view-task p {
+  margin: 0 0 10px;
+}
+
+.hw-view-task p:last-child {
+  margin-bottom: 0;
+}
+
+.hw-view-task h3,
+.hw-view-task h4,
+.hw-view-task h5,
+.hw-view-task h6 {
+  margin: 14px 0 8px;
+  line-height: 1.35;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.hw-view-task h3 {
+  font-size: 1.25rem;
+}
+
+.hw-view-task h4 {
+  font-size: 1.12rem;
+}
+
+.hw-view-task h5 {
+  font-size: 1.05rem;
+}
+
+.hw-view-task h6 {
+  font-size: 0.95rem;
+}
+
+.hw-view-task ul,
+.hw-view-task ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.hw-view-task li {
+  margin: 3px 0;
+}
+
+.hw-view-task strong {
+  color: var(--text);
+}
+
+.hw-view-task code {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 0.92em;
+  font-family: Consolas, Menlo, monospace;
+}
+
+.hw-view-task pre.hw-code {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0 0 10px;
+}
+
+.hw-view-task pre.hw-code code {
+  background: none;
+  border: none;
+  padding: 0;
+  white-space: pre;
+}
+
+.hw-view-task a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.hw-table-wrap {
+  overflow-x: auto;
+  margin: 0 0 10px;
+}
+
+.hw-view-task table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+.hw-view-task th,
+.hw-view-task td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.hw-view-task th {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.hw-view-footer {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.hw-view-footer .btn-secondary:hover {
+  color: var(--green);
+  background: rgba(74, 222, 128, 0.12);
+  border-color: var(--green);
+}
+
+#hwViewEdit:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+  border-color: var(--text);
+}
+
+.hw-view-footer .btn-secondary.active {
+  background: var(--green);
+  color: #062c1a;
+  border-color: var(--green);
+}

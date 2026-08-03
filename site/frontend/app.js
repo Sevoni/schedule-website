@@ -2391,7 +2391,7 @@ function renderDaySchedule(day) {
           }
           const done = doneHwIds.has(hw.id);
           const dueText = (hw.author ? escHtml(hw.author) : '');
-          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание')}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
+          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание', hw.id)}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
 
@@ -2429,7 +2429,7 @@ function renderDaySchedule(day) {
        ${pairsHtml}
      </div>`;
 
-   attachShowMore(content);
+   attachHwViewLinks(content);
 
     content.querySelectorAll('.pair-add-hw').forEach(btn => {
     btn.onclick = (e) => {
@@ -2697,39 +2697,211 @@ function getHwForPair(subject, pairType, dayDate, pairSubgroup) {
   });
 }
 
-function hwTaskMarkup(task, fallback) {
-  const full = task || fallback || '';
-  if (full.length <= 120) {
-    return `<span class="hw-text"><span class="hw-short">${escHtml(full)}</span></span>`;
+// Убирает токены разметки из текста — для карточек/превью (только чистый текст).
+function stripMarkdown(src) {
+  let t = String(src || '');
+  t = t.replace(/```[\s\S]*?```/g, ''); // блочный код
+  const out = [];
+  for (const line of t.split('\n')) {
+    const tr = line.trim();
+    if (tr.includes('|')) {
+      // разделитель таблицы |---|---| — целиком удаляем
+      if (/^[\s:|\-]+$/.test(tr)) continue;
+      out.push(tr.replace(/^\|/, '').replace(/\|$/, '').split('|').map(s => s.trim()).join(' '));
+      continue;
+    }
+    out.push(line);
   }
-  return `<span class="hw-text">`
-    + `<span class="hw-short">${escHtml(full.slice(0, 120))}… </span>`
-    + `<span class="hw-full" hidden>${escHtml(full)}</span>`
-    + `<button type="button" class="hw-show-more">показать полностью</button>`
+  t = out.join('\n');
+  t = t.replace(/^\s{0,3}#{1,6}\s+/gm, '');          // заголовки
+  t = t.replace(/^\s{0,3}([-*+]|\d+\.)\s+/gm, '');    // пункты списков
+  t = t.replace(/\*\*([^*]+)\*\*/g, '$1');            // жирный
+  t = t.replace(/\*([^*\n]+)\*/g, '$1');              // курсив
+  t = t.replace(/`([^`\n]+)`/g, '$1');                // код
+  t = t.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');      // ссылки
+  t = t.replace(/[ \t]+$/gm, '');
+  t = t.replace(/\n{3,}/g, '\n\n');
+  return t.trim();
+}
+
+// Мини-разметка → HTML. Вход СНАЧАЛА экранируется (escHtml),
+// затем парсятся только наши токены — рендер чужого HTML невозможен.
+function mdInline(t) {
+  return t
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) => {
+      const u = url.trim();
+      if (/^(https?:\/\/|mailto:|\/|#)/i.test(u)) {
+        return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
+      }
+      return m;
+    });
+}
+
+function mdTable(lines) {
+  const splitRow = (s) => {
+    let r = s.trim();
+    if (r.startsWith('|')) r = r.slice(1);
+    if (r.endsWith('|')) r = r.slice(0, -1);
+    return r.split('|').map(c => c.trim());
+  };
+  const head = splitRow(lines[0]);
+  const body = lines.slice(2).filter(l => l.trim()).map(splitRow);
+  let h = '<div class="hw-table-wrap"><table><thead><tr>'
+    + head.map(c => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+  h += body.map(r => '<tr>' + r.map(c => '<td>' + mdInline(c) + '</td>').join('') + '</tr>').join('');
+  return h + '</tbody></table></div>';
+}
+
+function mdBlocks(text) {
+  let html = '';
+  for (const b of text.split(/\n{2,}/)) {
+    const lines = b.split('\n').map(l => l.trim());
+    if (!b.trim()) continue;
+    // Таблица: первая строка с |, вторая — разделитель |---|---|
+    if (lines.length >= 2 && lines[0].includes('|')
+      && lines[1].includes('-') && /^[\s:|\-]+$/.test(lines[1])) {
+      html += mdTable(lines);
+      continue;
+    }
+    // Списки
+    if (lines.every(l => /^([-*+]|\d+\.)\s/.test(l))) {
+      const ordered = /^\d+\.\s/.test(lines[0]);
+      html += '<' + (ordered ? 'ol' : 'ul') + '>'
+        + lines.map(l => '<li>' + mdInline(l.replace(/^([-*+]|\d+\.)\s+/, '')) + '</li>').join('')
+        + '</' + (ordered ? 'ol' : 'ul') + '>';
+      continue;
+    }
+    // Обычный текст с переносами; заголовки (#, ##, ...) рендерятся на любой строке
+    let para = [];
+    const flush = () => {
+      const t = para.join('<br>');
+      if (t.trim()) html += '<p>' + mdInline(t) + '</p>';
+      para = [];
+    };
+    for (const line of lines) {
+      const hm = line.match(/^(#{1,6})\s+(.*)$/);
+      if (hm) {
+        flush();
+        const tag = 'h' + Math.min(hm[1].length + 2, 6);
+        html += '<' + tag + '>' + mdInline(hm[2]) + '</' + tag + '>';
+      } else {
+        para.push(line);
+      }
+    }
+    flush();
+  }
+  return html;
+}
+
+function hwMarkdownToHtml(src) {
+  const esc = escHtml(String(src || ''));
+  let html = '';
+  let idx = 0;
+  const re = /```([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(esc)) !== null) {
+    html += mdBlocks(esc.slice(idx, m.index));
+    html += '<pre class="hw-code"><code>' + m[1].replace(/^\n/, '').replace(/\n$/, '') + '</code></pre>';
+    idx = m.index + m[0].length;
+  }
+  html += mdBlocks(esc.slice(idx));
+  return html;
+}
+
+function hwTaskMarkup(task, fallback, hwId) {
+  const clean = stripMarkdown(task || fallback || '');
+  if (clean.length <= 120) {
+    return `<span class="hw-text">${escHtml(clean)}</span>`;
+  }
+  return `<span class="hw-text hw-view-link" data-hw-id="${escHtml(hwId || '')}" title="Открыть задание">`
+    + `${escHtml(clean.slice(0, 120))}… <span class="hw-open-hint">открыть</span>`
     + `</span>`;
 }
 
-function attachShowMore(container) {
-  container.querySelectorAll('.hw-show-more').forEach(btn => {
-    btn.addEventListener('click', (e) => {
+// Окно просмотра ДЗ с отрендеренной разметкой
+let hwViewingId = null;
+
+function openHwViewer(hwId, originEl) {
+  const hw = state.homework.find(h => h.id === hwId);
+  if (!hw) return;
+  hwViewingId = hwId;
+  const modal = document.getElementById('hwViewModal');
+
+  const typeName = hw.pairType && hw.pairType !== 'any' ? (PAIR_TYPE_NAMES[hw.pairType] || hw.pairType) : '';
+  const subLabel = hw.subgroup && hw.subgroup !== 'any' ? 'подгруппа ' + hw.subgroup : '';
+  let dueLabel = '';
+  if (hw.dueDate) dueLabel = 'Срок: ' + hw.dueDate;
+  else if (hw.dueMode === 'nextPair') dueLabel = 'Следующая пара';
+
+  const chips = [];
+  if (typeName) chips.push('<span class="hw-view-chip">' + escHtml(typeName) + '</span>');
+  if (subLabel) chips.push('<span class="hw-view-chip">' + escHtml(subLabel) + '</span>');
+  if (dueLabel) chips.push('<span class="hw-view-chip hw-view-chip-due">' + escHtml(dueLabel) + '</span>');
+  if (hw.author) chips.push('<span class="hw-view-chip">' + escHtml(hw.author) + '</span>');
+
+  modal.querySelector('.modal-header h2').textContent = hw.subject || 'Задание';
+  document.getElementById('hwViewMeta').innerHTML = chips.join('');
+  document.getElementById('hwViewTask').innerHTML = hwMarkdownToHtml(hw.task);
+
+  const doneBtn = document.getElementById('hwViewDone');
+  const editBtn = document.getElementById('hwViewEdit');
+  if (isWriter()) {
+    editBtn.classList.remove('hidden');
+  } else {
+    editBtn.classList.add('hidden');
+  }
+
+  function renderDoneBtn() {
+    const now = doneHwIds.has(hw.id);
+    doneBtn.classList.toggle('active', now);
+    doneBtn.textContent = now ? 'Выполнено' : 'Отметить выполненным';
+  }
+  renderDoneBtn();
+
+  doneBtn.onclick = () => {
+    if (doneHwIds.has(hw.id)) {
+      doneHwIds.delete(hw.id);
+    } else {
+      doneHwIds.add(hw.id);
+    }
+    saveDoneHw();
+    renderDoneBtn();
+    renderHomework();
+    if (state.selectedDay) renderDaySchedule(state.selectedDay);
+  };
+
+  editBtn.onclick = () => {
+    closeModal(modal);
+    openHwModal(null, null, null, hw, editBtn);
+  };
+
+  document.getElementById('closeHwView').onclick = () => closeModal(modal);
+  modal.onclick = (e) => {
+    if (e.target === modal) closeModal(modal);
+  };
+
+  openModal(modal, originEl);
+}
+
+// Клик по усечённому тексту длинного ДЗ → окно просмотра
+function attachHwViewLinks(container) {
+  container.querySelectorAll('.hw-view-link').forEach(el => {
+    el.addEventListener('click', (e) => {
       e.stopPropagation();
-      const root = btn.closest('.hw-text');
-      if (!root) return;
-      const full = root.querySelector('.hw-full');
-      const short = root.querySelector('.hw-short');
-      const expanded = full.hasAttribute('hidden');
-      if (expanded) {
-        full.removeAttribute('hidden');
-        if (short) short.classList.add('hw-short-collapsed');
-        btn.textContent = 'скрыть';
-      } else {
-        full.setAttribute('hidden', '');
-        if (short) short.classList.remove('hw-short-collapsed');
-        btn.textContent = 'показать полностью';
-      }
+      if (el.dataset.hwId) openHwViewer(el.dataset.hwId, el);
     });
   });
 }
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const view = document.getElementById('hwViewModal');
+    if (view && !view.classList.contains('hidden')) closeModal(view);
+  }
+});
 
 // ── Calendar widget ──────────────────────────────────────────
 
@@ -3612,18 +3784,18 @@ function renderHomework() {
       <div class="hw-card ${cardClass}">
         <div class="hw-info">
           <div class="hw-subject">${subjectHtml}</div>
-          <div class="hw-task">${hwTaskMarkup(hw.task)}</div>
+           <div class="hw-task">${hwTaskMarkup(hw.task, '', hw.id)}</div>
            ${dueText ? `<div class="hw-due ${dueClass}">${dueText}</div>` : ''}
            ${authorHtml}
          </div>
-        ${isWriter() ? `<div class="hw-actions">
-          <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:18px;height:18px"><use href="#icon-check"></use></svg></button>
-          <button class="hw-edit" data-id="${hw.id}" title="Редактировать"><svg class="icon" style="width:18px;height:18px"><use href="#icon-pencil"></use></svg></button>
-        </div>` : ''}
+        <div class="hw-actions">
+            <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:18px;height:18px"><use href="#icon-check"></use></svg></button>
+            ${isWriter() ? `<button class="hw-edit" data-id="${hw.id}" title="Редактировать"><svg class="icon" style="width:18px;height:18px"><use href="#icon-pencil"></use></svg></button>` : ''}
+        </div>
       </div>`;
    }).join('');
 
-   attachShowMore(list);
+   attachHwViewLinks(list);
 
    list.querySelectorAll('.hw-done').forEach(btn => {
      btn.onclick = () => {
