@@ -2336,23 +2336,70 @@ function renderDayTabs() {
     tab.textContent = dayIdx >= 0 ? DAY_SHORT[dayIdx] : day.slice(0, 2);
     tab.title = day + ' (' + state.schedule.days[day].date + ')';
 
-    tab.onclick = () => {
-      if (day === state.selectedDay) return;
-      const prevDay = state.selectedDay;
-      state.selectedDay = day;
-      document.querySelectorAll('.day-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      // Направление сдвига зависит от порядка дня в неделе.
-      const dayKeys = Object.keys(state.schedule.days);
-      const dir = dayKeys.indexOf(day) >= dayKeys.indexOf(prevDay) ? 'next' : 'prev';
-      animateSchedule(dir);
-      renderDaySchedule(day);
-    };
+    tab.onclick = () => selectDay(day);
 
     tabs.appendChild(tab);
   });
 
   renderDaySchedule(state.selectedDay);
+}
+
+function selectDay(day) {
+  if (!state.schedule || !state.schedule.days[day]) return;
+  if (day === state.selectedDay) return;
+  const prevDay = state.selectedDay;
+  state.selectedDay = day;
+  document.querySelectorAll('.day-tab').forEach(t => t.classList.remove('active'));
+  const tabs = document.querySelectorAll('.day-tab');
+  const keys = Object.keys(state.schedule.days);
+  tabs[keys.indexOf(day)].classList.add('active');
+  // Направление сдвига зависит от порядка дня в неделе.
+  const dir = keys.indexOf(day) >= keys.indexOf(prevDay) ? 'next' : 'prev';
+  animateSchedule(dir);
+  renderDaySchedule(day);
+}
+
+// Горячие клавиши: ←/→ — недели, 1–6 — дни недели.
+function setupKeyboardShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    if (e.key === 'Escape') {
+      const view = document.getElementById('hwViewModal');
+      if (view && !view.classList.contains('hidden')) {
+        closeModal(view);
+        return;
+      }
+    }
+    const modalOpen = document.querySelector('.modal.is-open');
+    if (modalOpen) return;
+    if (e.key === 'ArrowLeft') {
+      const btn = document.getElementById('prevWeek');
+      if (btn && state.currentWeekIdx > 0) {
+        e.preventDefault();
+        btn.click();
+      }
+      return;
+    }
+    if (e.key === 'ArrowRight') {
+      const btn = document.getElementById('nextWeek');
+      if (btn && state.currentWeekIdx < state.weeks.length - 1) {
+        e.preventDefault();
+        btn.click();
+      }
+      return;
+    }
+    if (/^[1-6]$/.test(e.key)) {
+      if (!state.schedule || !state.schedule.days) return;
+      const keys = Object.keys(state.schedule.days);
+      const day = keys[Number(e.key) - 1];
+      if (day) {
+        e.preventDefault();
+        selectDay(day);
+      }
+    }
+  });
 }
 
 // Видима ли пара с учётом выбранного фильтра подгруппы.
@@ -2905,12 +2952,7 @@ function attachHwViewLinks(container) {
   });
 }
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    const view = document.getElementById('hwViewModal');
-    if (view && !view.classList.contains('hidden')) closeModal(view);
-  }
-});
+setupKeyboardShortcuts();
 
 // ── Calendar widget ──────────────────────────────────────────
 
