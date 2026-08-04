@@ -1655,7 +1655,9 @@ function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
 //   tg:chat:{group}            -> chatId (строка) — LEGACY, мигрируется в tg:subs:
 //
 // Лимиты Telegram: text до 4096 символов, messages не чаще ~30/сек.
-// Используем sendMessage с disable_web_page_preview=true.
+// Уведомления шлём через sendRichMessage (Bot API 10.1+, Rich Messages) с
+// Rich Markdown-форматированием вместо sendMessage + parse_mode=HTML.
+// При ошибке sendRichMessage — фолбэк на старый sendMessage.
 
 const TG_API_BASE = 'https://api.telegram.org';
 
@@ -1765,15 +1767,31 @@ async function notifyGroup(env, group, text, opts = {}) {
   const chunks = splitForTg(text, 4000);
   for (const sub of subs) {
     for (const c of chunks) {
-      const res = await tgApi(env, 'sendMessage', {
-        chat_id: sub.chatId,
-        text: c,
-        parse_mode: opts.parseMode || 'HTML',
-        disable_web_page_preview: true,
-      });
-      console.log('[tg] notifyGroup: sendMessage to', sub.chatId, '=>', JSON.stringify(res).slice(0, 150));
+      await sendTgRichMessage(env, sub.chatId, c, { parseMode: opts.parseMode || 'HTML' });
+      console.log('[tg] notifyGroup: send to', sub.chatId, 'ok');
     }
   }
+}
+
+// Единая точка отправки уведомления пользователю:
+// 1) sendRichMessage с Rich Markdown (новый формат Bot API 10.1+);
+// 2) если метод не поддержан — фолбэк на sendMessage с parse_mode=HTML.
+async function sendTgRichMessage(env, chatId, htmlText, opts = {}) {
+  const md = htmlToMarkdown(htmlText);
+  let res = await tgApi(env, 'sendRichMessage', {
+    chat_id: chatId,
+    rich_message: { markdown: md },
+  });
+  if (!res.ok) {
+    console.log('[tg] sendRichMessage failed, fallback to sendMessage:', JSON.stringify(res.error || res).slice(0, 200));
+    res = await tgApi(env, 'sendMessage', {
+      chat_id: chatId,
+      text: htmlText,
+      parse_mode: opts.parseMode || 'HTML',
+      disable_web_page_preview: true,
+    });
+  }
+  return res;
 }
 
 function splitForTg(text, maxLen) {
@@ -1795,6 +1813,39 @@ function splitForTg(text, maxLen) {
   return out;
 }
 
+// Экранирование пользовательского текста для Rich Markdown (GFM).
+// `*` и `_` НЕ экранируем — это markdown-разметка (жирный/курсив),
+// которую пользователь может вводить в тексте ДЗ. Непарные разделители
+// GFM оставляет как есть, поэтому одиночные звёздочки не ломают текст.
+function escMarkdown(s) {
+  return String(s).replace(/[\\`~\[\]]/g, (ch) => '\\' + ch);
+}
+
+// Конвертация нашей HTML-разметки (escTg + <b>/<i>/<code>) в Rich Markdown —
+// новый формат sendRichMessage (Bot API 10.1+). Rich Markdown совместим с
+// GitHub Flavored Markdown и дополнительно принимает HTML-теги, но для
+// красоты и читаемости переводим базовые теги в md-синтаксис.
+function htmlToMarkdown(html) {
+  const entities = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
+  const decode = (s) => s.replace(/&(amp|lt|gt|quot|#39);/g, (m) => entities[m] || m);
+  let out = '';
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf('<', i);
+    if (lt === -1) { out += escMarkdown(decode(html.slice(i))); break; }
+    out += escMarkdown(decode(html.slice(i, lt)));
+    const gt = html.indexOf('>', lt);
+    if (gt === -1) { out += html.slice(lt); break; }
+    const tag = html.slice(lt + 1, gt);
+    if (tag === 'b' || tag === '/b') out += '**';
+    else if (tag === 'i' || tag === '/i') out += '*';
+    else if (tag === 'code' || tag === '/code') out += '`';
+    else out += html.slice(lt, gt + 1); // незнакомый тег оставляем как есть
+    i = gt + 1;
+  }
+  return out;
+}
+
 // ── Фильтрация уведомлений по подгруппе ─────────────────────────
 
 function matchesSubgroup(pref, itemSubgroup) {
@@ -1813,12 +1864,7 @@ async function notifyGroupFiltered(env, group, buildText) {
     if (!text) continue;
     const chunks = splitForTg(text, 4000);
     for (const c of chunks) {
-      await tgApi(env, 'sendMessage', {
-        chat_id: sub.chatId,
-        text: c,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      });
+      await sendTgRichMessage(env, sub.chatId, c, { parseMode: 'HTML' });
     }
   }
 }

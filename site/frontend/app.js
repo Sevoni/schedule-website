@@ -381,6 +381,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupInviteSection();
   setupStartPage();
 
+  // Если группы нет в localStorage — сразу показываем стартовую страницу,
+  // чтобы не мелькало расписание группы по умолчанию из HTML, пока идут
+  // сетевые проверки ?token=/?owner= ниже.
+  const startPageShown = !state.group;
+  if (startPageShown) showStartPage();
+
   // Если в URL есть ?token=... — это переход по ссылке-приглашению.
   // Валидируем через бэкенд, при успехе сохраняем токен как writerToken.
   await consumeInviteTokenFromUrl();
@@ -399,12 +405,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
 
   // Если группы нет (нет в localStorage и не пришла из приглашения) —
-  // показываем стартовую страницу с выбором группы.
+  // остаёмся на стартовой странице с выбором группы.
   if (!state.group) {
-    showStartPage();
     refreshEditVisibility();
     return;
   }
+
+  // Группа могла прийти из ссылки-приглашения — убираем стартовую страницу.
+  if (startPageShown) hideStartPage();
 
   loadData();
   refreshEditVisibility();
@@ -571,6 +579,7 @@ function showStartPage() {
 function hideStartPage() {
   const el = document.getElementById('startPage');
   el.classList.add('fade-out');
+  document.documentElement.classList.remove('no-group');
   document.querySelector('.container').style.display = '';
   setTimeout(() => {
     el.classList.add('hidden');

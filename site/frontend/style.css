@@ -68,6 +68,10 @@ body::-webkit-scrollbar { display: none; }
   padding-bottom: 24px;
 }
 
+/* Контейнер скрыт до инициализации app.js, если у пользователя нет сохранённой
+   группы — чтобы не мелькало расписание по умолчанию при загрузке страницы. */
+html.no-group .container { display: none; }
+
 .icon {
   width: 20px;
   height: 20px;
