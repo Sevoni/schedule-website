@@ -44,10 +44,10 @@ let state = {
       return {};
     }
   })(),
-  // ownerCode — вводится в настройках. Если совпадает с env.OWNER_CODE, пользователь owner.
-  // Хранится отдельно, чтобы можно было «стать владельцем» без перезаписи writerToken.
-  ownerRole: localStorage.getItem('ownerRole') === '1',
-  ownerCode: localStorage.getItem('ownerCode') || '',
+  // ownerCode — никогда не хранится в localStorage/state: код владельца живёт
+  // в HttpOnly-cookie на сервере, JS его не знает. Поле оставлено для памяти.
+  ownerRole: false,
+  ownerCode: '',
   schedule: null,
   scheduleCache: {},
   weeks: [],
@@ -203,7 +203,9 @@ function isOwner() {
   return state.ownerRole;
 }
 function getAuthToken() {
-  return state.writerTokens[state.group] || (state.ownerRole ? state.ownerCode : '');
+  // Код владельца никогда не уходит в Bearer-заголовок: owner-запросы идут без
+  // него, а роль подтверждает HttpOnly-cookie, прикрепляемая браузером сама.
+  return state.writerTokens[state.group] || '';
 }
 
 // Ревалидация токена-приглашения при возврате в группу.
@@ -468,34 +470,26 @@ async function consumeOwnerCodeFromUrl() {
   return ok;
 }
 
-// Стать владельцем: пробует создать ссылку с Bearer = code. Бэкенд вернёт
-// ok, если code === env.OWNER_CODE (owner), иначе 403. При успехе сохраняем
-// code как writerToken для текущей группы + ownerRole=true. Возвращает Promise<boolean>.
+// Стать владельцем: отправляет код на /api/owner/login. Бэкенд вернёт ok,
+// если code === env.OWNER_CODE, и поставит HttpOnly-cookie (код JS не виден).
+// При успехе ownerRole=true. Возвращает Promise<boolean>.
 // Опционально показывает toast (silent=false) — для авто-claim из ссылки.
 async function becomeOwner(code, opts = {}) {
   const silent = opts.silent !== false; // по умолчанию показываем toast
   if (!code) return false;
   try {
-    const resp = await fetchTimeout(state.apiBase + '/api/invite/create', {
+    const resp = await fetchTimeout(state.apiBase + '/api/owner/login', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + code,
-      },
-      body: JSON.stringify({ group: state.group, dryRun: true }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.ok) {
-      state.writerTokens[state.group] = code;
       state.ownerRole = true;
-      state.ownerCode = code;
-      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
-      localStorage.setItem('ownerRole', '1');
-      localStorage.setItem('ownerCode', code);
+      state.ownerCode = '';
       const section = document.getElementById('inviteSection');
       if (section) section.classList.add('is-owner');
-      // Только подтверждаем права owner (dryRun), новую ссылку не создаём.
-      // Ссылку owner создаёт сам через кнопку «Создать ссылку-приглашение».
+      // Код уже не храним нигде, кроме серверной HttpOnly-cookie.
       showToast('Права владельца активированы', 'ok');
       refreshEditVisibility();
       if (setupInviteSection._loadInvites) setupInviteSection._loadInvites();
@@ -540,6 +534,7 @@ function refreshEditVisibility() {
 }
 
 // Заполняет блок «Ваша роль» в настройках (роль больше не показывается в шапке).
+// Для owner добавляет кнопку «Выйти из роли владельца» (сбрасывает HttpOnly-cookie).
 function renderRoleStatus() {
   const el = document.getElementById('roleStatus');
   if (!el) return;
@@ -558,7 +553,21 @@ function renderRoleStatus() {
   el.innerHTML =
     '<svg class="role-icon"><use href="#icon-' + icon + '"></use></svg>' +
     '<div><div class="role-label">' + role + '</div>' +
-    '<div class="role-desc">' + desc + '</div></div>';
+    '<div class="role-desc">' + desc + '</div>' +
+    (isOwner() ? '<button id="ownerLogoutBtn" class="btn-secondary role-action">Выйти из роли владельца</button>' : '') +
+    '</div>';
+  const logoutBtn = el.querySelector('#ownerLogoutBtn');
+  if (logoutBtn) {
+    logoutBtn.onclick = async () => {
+      try {
+        await apiPost('/api/owner/logout', {});
+      } catch (e) {
+        console.warn('owner logout error:', e.message);
+      }
+      state.ownerRole = false;
+      refreshEditVisibility();
+    };
+  }
   refreshIcons();
 }
 
@@ -753,6 +762,12 @@ async function bootstrapFromApi(opts = {}) {
     const params = { group: state.group };
     if (schedWeeks.length > 0) params.weeks = schedWeeks.join(',');
     const data = await apiFetch('/api/bootstrap', params);
+
+    // Роль владельца восстанавливается из HttpOnly-cookie: воркер сам сверяет
+    // cookie и отдаёт isOwner. JS код владельца не видит и не хранит.
+    const wasOwner = state.ownerRole;
+    state.ownerRole = data.isOwner === true;
+    if (state.ownerRole !== wasOwner) refreshEditVisibility();
 
     if (wantWeeks && Array.isArray(data.weeks) && data.weeks.length) {
       state.weeks = data.weeks;

@@ -1494,6 +1494,12 @@ header {
 .role-status.role-reader .role-icon { color: var(--text-dim); }
 .role-status .role-label { font-weight: 600; }
 .role-status .role-desc { color: var(--text-dim); font-size: 0.82rem; }
+.role-status .role-action {
+  display: block;
+  margin-top: 8px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
 
 .theme-radios {
   display: flex;

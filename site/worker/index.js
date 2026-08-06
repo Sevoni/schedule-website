@@ -56,19 +56,19 @@ export default {
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleStatus(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleStatus(request, env, corsHeaders));
       }
       if (path === '/api/schedule' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleGetSchedule(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSchedule(request, env, corsHeaders));
       }
       if (path === '/api/weeks' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleGetWeeks(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetWeeks(request, env, corsHeaders));
       }
       if (path === '/api/schedules' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleGetSchedules(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSchedules(request, env, corsHeaders));
       }
       if (path === '/api/bootstrap' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleBootstrap(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleBootstrap(request, env, corsHeaders));
       }
       if (path === '/api/upload' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -76,7 +76,7 @@ export default {
         return await handleUpload(request, env, corsHeaders);
       }
       if (path === '/api/subjects' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleGetSubjects(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSubjects(request, env, corsHeaders));
       }
       if (path === '/api/subjects' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -84,7 +84,7 @@ export default {
         return await handlePutSubjects(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'GET') {
-        return await cachedGet(request, corsHeaders, () => handleGetHw(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetHw(request, env, corsHeaders));
       }
       if (path === '/api/hw' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -129,6 +129,13 @@ export default {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
         return await handleInviteCreate(request, env, corsHeaders);
+      }
+      // ── Owner cookie login/logout (публичные) ──────────────
+      if (path === '/api/owner/login' && method === 'POST') {
+        return await handleOwnerLogin(request, env, corsHeaders);
+      }
+      if (path === '/api/owner/logout' && method === 'POST') {
+        return await handleOwnerLogout(request, env, corsHeaders);
       }
       if (path === '/api/invite/verify' && method === 'POST') {
         return await handleInviteVerify(request, env, corsHeaders);
@@ -200,34 +207,62 @@ const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
 //     * token === env.OWNER_CODE → owner (group из query/body)
 //     * inv:{token} в KV → writer (group из записи)
 //     * иначе null
-//   - без заголовка → null (аноним = reader)
+//   - без заголовка, но с валидной HttpOnly-cookie owner_code → owner (viaCookie).
+//     Cookie сверяется за постоянное время, D1 не трогается.
+//   - иначе null (аноним = reader)
 async function resolveAuth(request, env) {
   const store = createStore(env);
   if (!env.DB) return null;
 
   const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) {
+      // Owner: секретный код из env. Группу берём из query/body — за это
+      // отвечает вызывающий код.
+      if (env.OWNER_CODE && token === env.OWNER_CODE) {
+        return { role: 'owner', token };
+      }
 
-  const token = authHeader.slice(7).trim();
-  if (!token) return null;
-
-  // Owner: секретный код из env. Группу берём из query/body — за это
-  // отвечает вызывающий код.
-  if (env.OWNER_CODE && token === env.OWNER_CODE) {
-    return { role: 'owner', token };
+      // Writer: ищем inv:{token} в KV.
+      try {
+        const inv = await store.get(`inv:${token}`, { type: 'json' });
+        if (inv && inv.group) {
+          return { role: 'writer', token, group: normalizeGroup(inv.group) };
+        }
+      } catch (e) {
+        console.log('resolveAuth inv-read failed:', e.message);
+      }
+    }
+    return null;
   }
 
-  // Writer: ищем inv:{token} в KV.
-  try {
-    const inv = await store.get(`inv:${token}`, { type: 'json' });
-    if (inv && inv.group) {
-      return { role: 'writer', token, group: normalizeGroup(inv.group) };
-    }
-  } catch (e) {
-    console.log('resolveAuth inv-read failed:', e.message);
+  // Authorization отсутствует — пробуем HttpOnly-cookie owner_code.
+  // Код владельца JS не знает, D1 не затрагиваем.
+  if (ownerFromCookie(request, env)) {
+    return { role: 'owner', viaCookie: true };
   }
 
   return null;
+}
+
+// Извлекает код владельца из HttpOnly cookie `owner_code` и сверяет с
+// env.OWNER_CODE постоянным по времени сравнением (timingSafeEqualStr).
+// Cookie НЕ виден JavaScript'у — роль owner восстанавливается через него
+// автоматически на каждом запросе без повторного ввода кода.
+function ownerFromCookie(request, env) {
+  if (!env.OWNER_CODE) return false;
+  const cookieHeader = request.headers.get('Cookie');
+  if (!cookieHeader) return false;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() !== 'owner_code') continue;
+    let value = part.slice(eq + 1).trim();
+    try { value = decodeURIComponent(value); } catch (_) { /* оставляем как есть */ }
+    return timingSafeEqualStr(value, env.OWNER_CODE);
+  }
+  return false;
 }
 
 // Извлекает группу для owner из query (GET/DELETE) или body (POST/PUT).
@@ -281,10 +316,8 @@ async function requireWriter(request, env, corsHeaders) {
 // сам token для отзыва через UI не светим, но хранится внутри inv-by-group).
 
 // POST /api/invite/create
-// Body: { group, label?, dryRun? }. Требует owner. Для owner — group из body.
-// При dryRun=true — только проверяет права owner, НЕ создаёт ссылку
-// (используется для авто-claim'а владельца по ссылке ?owner=<code>).
-// Возвращает { link, id, token } (без dryRun) или { ok: true } (с dryRun).
+// Body: { group, label? }. Требует owner. Для owner — group из body.
+// Возвращает { link, id, token }.
 async function handleInviteCreate(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) {
@@ -299,13 +332,6 @@ async function handleInviteCreate(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const dryRun = body.dryRun === true || body.dryRun === 'true';
-
-  if (dryRun) {
-    // Только подтверждаем права owner, не создавая ссылку.
-    return jsonResponse({ ok: true }, corsHeaders);
-  }
-
   let group = normalizeGroup(body.group);
 
   // owner может создавать приглашения для любой группы.
@@ -337,6 +363,48 @@ async function handleInviteCreate(request, env, corsHeaders) {
   const link = `${origin}/?token=${token}`;
 
   return jsonResponse({ ok: true, link, id, token }, corsHeaders);
+}
+
+// POST /api/owner/login
+// Body: { code }. Публичный (без Bearer). Если code === env.OWNER_CODE
+// (постоянное по времени сравнение) — ставит HttpOnly-куку owner_code и
+// возвращает { ok: true }. Иначе 403. Cookie не видна JavaScript'у, но
+// прикрепляется браузером к каждому запросу на этот же сайт — роль owner
+// восстанавливается автоматически.
+const OWNER_COOKIE_TTL = 2592000; // 30 дней (сек)
+const OWNER_COOKIE_NAME = 'owner_code';
+
+async function handleOwnerLogin(request, env, corsHeaders) {
+  if (!env.OWNER_CODE) {
+    return jsonResponse({ error: 'OWNER_CODE not configured' }, corsHeaders, 500);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const code = (body.code || '').toString();
+  if (!code || !timingSafeEqualStr(code, env.OWNER_CODE)) {
+    return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
+  }
+
+  const headers = {
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    // HttpOnly — код недоступен JS (закрывает XSS-кражу из localStorage/URL).
+    // Secure — только по HTTPS. SameSite=Lax — кука шлётся на same-site запросы.
+    // Значение URL-кодируем: коды могут содержать символы, запрещённые в cookie.
+    'Set-Cookie': `${OWNER_COOKIE_NAME}=${encodeURIComponent(code)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${OWNER_COOKIE_TTL}`,
+  };
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+}
+
+// POST /api/owner/logout
+// Публичный. Удаляет куку owner_code. Роль owner сбрасывается в браузере.
+async function handleOwnerLogout(request, env, corsHeaders) {
+  const headers = {
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Set-Cookie': `${OWNER_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+  };
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
 }
 
 // POST /api/invite/verify
@@ -515,7 +583,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
   if (weekCode) {
     const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
-    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
 
@@ -534,7 +602,7 @@ async function handleGetWeeks(request, env, corsHeaders) {
   }
 
   const data = await store.get(`weeks:${group}`, { type: 'json' });
-  if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+  if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
   return jsonResponse({ error: 'No weeks data' }, corsHeaders, 404);
 }
 
@@ -569,7 +637,7 @@ async function handleGetSchedules(request, env, corsHeaders) {
     result[weekCode] = e.value;
   }
 
-  return jsonResponse(result, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+  return jsonResponse(result, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
 }
 
 // ── GET /api/bootstrap?group=...&weeks=w1,w2,... ────────────────
@@ -605,6 +673,12 @@ async function handleBootstrap(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
+  // Owner определяется по HttpOnly-cookie (без лишнего запроса к D1):
+  // фронтенд после перезагрузки восстанавливает роль из поля isOwner.
+  const auth = await resolveAuth(request, env);
+  const isOwner = !!(auth && auth.role === 'owner');
+  const isPrivate = isAuthRequest(request, env);
+
   // Одним batch-запросом читаем все ключи: weeks, hw, subjects,
   // campus-updated и расписания. Один round-trip к D1 вместо 5.
   const semester = currentSemesterKey();
@@ -631,7 +705,8 @@ async function handleBootstrap(request, env, corsHeaders) {
     hw: hwData || [],
     subjects: subjectsData || [],
     campusUpdatedAt: campusUpdatedAt || '',
-  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+    isOwner,
+  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate });
 }
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
@@ -935,7 +1010,7 @@ async function handleGetHw(request, env, corsHeaders) {
   // Writer'ы (Authorization) видят актуальное состояние (no-store), чтобы при
   // только что добавленном ДЗ и сразу же загруженном списке не получить
   // устаревший кеш из CDN.
-  return jsonResponse(data || [], corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+  return jsonResponse(data || [], corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
 }
 
 // ── POST /api/hw ───────────────────────────────────────────────
@@ -1166,7 +1241,7 @@ async function handleGetSubjects(request, env, corsHeaders) {
     }
   }
 
-  return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+  return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
 }
 
 // ── POST /api/subjects ─────────────────────────────────────────
@@ -1521,7 +1596,7 @@ async function handleStatus(request, env, corsHeaders) {
     lastSync: meta?.lastSync || null,
     lastWeek: meta?.lastWeek || null,
     campusUpdatedAt: campusUpdatedAt || null,
-  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request), isPrivate: !!(request.headers.get('Authorization') || '').startsWith('Bearer ') });
+  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
 }
 
 // ── Helper ─────────────────────────────────────────────────────
@@ -1536,9 +1611,21 @@ const CC_READER_GET  = 'public, max-age=60, s-maxage=300';
 const CC_WRITER_GET  = 'private, no-store';
 const CC_NO_STORE    = 'no-store';
 
-function cacheControlForGet(request) {
+function cacheControlForGet(request, env) {
   const auth = request.headers.get('Authorization');
-  return auth && auth.startsWith('Bearer ') ? CC_WRITER_GET : CC_READER_GET;
+  if (auth && auth.startsWith('Bearer ')) return CC_WRITER_GET;
+  // Owner с HttpOnly-cookie тоже приватный: bootstrap в этом случае несёт
+  // isOwner, и его нельзя пускать в публичный CDN-кеш.
+  if (ownerFromCookie(request, env)) return CC_WRITER_GET;
+  return CC_READER_GET;
+}
+
+// Есть ли у запроса аутентификация (writer/owner): Bearer-токен ИЛИ
+// валидная HttpOnly-cookie owner_code. Для таких ответов isPrivate=true:
+// Vary:Authorization + private, чтобы CDN не смешивал их с reader-кешем.
+function isAuthRequest(request, env) {
+  return (request.headers.get('Authorization') || '').startsWith('Bearer ') ||
+    ownerFromCookie(request, env);
 }
 
 // Инвалидация CDN-кеша для группы после записи. Удаляем кешированные GET-
@@ -1576,14 +1663,16 @@ async function purgeGroupCdnCache(env, group) {
 // Работает НЕЗАВИСИМО от Dashboard Cache Rules — гарантирует HIT для reader'ов
 // даже на кастомном домене Pages, где Cache Rule может не применяться.
 //
-// Для writer/owner (с токеном) кеш НЕ используется (private, no-store) — ответ
-// всегда свежий. Для reader (без токена) проверяем кеш, при промахе — бьём
-// воркер, кешируем ответ на TTL из Cache-Control (s-maxage).
+// Для writer/owner (с токеном или HttpOnly-cookie) кеш НЕ используется
+// (private, no-store) — ответ всегда свежий. Для reader (без токена)
+// проверяем кеш, при промахе — бьём воркер, кешируем ответ на TTL из
+// Cache-Control (s-maxage).
 //
 // Возвращает Response. Если caches API недоступен — просто вызывает builder().
-async function cachedGet(request, corsHeaders, builder) {
-  const auth = (request.headers.get('Authorization') || '').startsWith('Bearer ');
-  if (auth) {
+async function cachedGet(request, env, corsHeaders, builder) {
+  const hasBearer = (request.headers.get('Authorization') || '').startsWith('Bearer ');
+  const isOwnerCookie = ownerFromCookie(request, env);
+  if (hasBearer || isOwnerCookie) {
     // Writer/owner — без кеша.
     return builder();
   }
@@ -2429,8 +2518,10 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
 
   // 2) Точечные лимиты на публичные POST (поверх глобального).
   if (method === 'POST') {
-    // Чувствительные: invite verify/create — публичные, D1-read oracle.
-    if (path === '/api/invite/verify' || path === '/api/invite/create') {
+    // Чувствительные: invite verify/create и owner login/logout — публичные,
+    // D1-read oracle / оракул кода владельца.
+    if (path === '/api/invite/verify' || path === '/api/invite/create' ||
+        path === '/api/owner/login' || path === '/api/owner/logout') {
       const rl = await checkRateLimit(store, ip, 'verify', 10, 60);
       if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
     }

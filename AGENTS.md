@@ -87,15 +87,17 @@ Local secrets go in `site/.dev.vars` (gitignored).
 
 ### Auth (role-based access)
 
-`resolveAuth(request, env)` reads `Authorization: Bearer <token>`:
+`resolveAuth(request, env)` reads `Authorization: Bearer <token>` and, if absent, the **HttpOnly cookie `owner_code`**:
 
-- no header → **reader** (anonymous; group from query/body). GET only.
+- no header + no cookie → **reader** (anonymous; group from query/body). GET only.
 - token ∈ D1 `inv:{token}` → **writer** (group from the invite record). POST/PUT/DELETE.
-- token === `env.OWNER_CODE` → **owner** (writer + invite management for any group).
+- token === `env.OWNER_CODE` OR valid `owner_code` cookie (constant-time compare via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
 
 All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 
-- **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` on load → `becomeOwner()`.
+- **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `owner_code` cookie (30 days, `Secure; SameSite=Lax`). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend gets `ownerRole` back from `isOwner` field of `/api/bootstrap` (computed from the cookie server-side). Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
+- **Owner logout**: `POST /api/owner/logout` → clears the cookie (button in settings «Ваша роль»).
+- **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` on load → `becomeOwner()` → `POST /api/owner/login`.
 - **Invite link**: frontend reads `?token=<invToken>` on load, validates via `/api/invite/verify`, saves as writer token.
 - `INVITE_ORIGIN` (var) — canonical origin for invite links (`https://kampussgu.dpdns.org`).
 
@@ -144,6 +146,8 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | POST | `/api/sync-from-campus` | writer | Full sync: save + update subjects + recalc HW |
 | POST | `/api/invite/create` | writer | Create invite link |
 | POST | `/api/invite/verify` | — | Verify invite token → group (public) |
+| POST | `/api/owner/login` | — | Owner login: sets HttpOnly `owner_code` cookie (public, rate-limited) |
+| POST | `/api/owner/logout` | — | Owner logout: clears `owner_code` cookie (public, rate-limited) |
 | GET | `/api/invite?group=` | writer | List group invites |
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |
@@ -155,7 +159,7 @@ No `/api/auth`, `/api/group/register`, `/api/tg/subscribe` or `/api/tg/set-webho
 
 ## Rate limiting
 
-D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`), **tg 60** (`/api/tg/webhook`), **unsub 10** (`/api/tg/unsubscribe`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
+D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`), **unsub 10** (`/api/tg/unsubscribe`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
 
 ## Data model
 
