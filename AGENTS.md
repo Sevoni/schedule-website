@@ -9,13 +9,14 @@ Campus schedule viewer for Syktyvkar State University (campus.syktsu.ru). No bui
 ```
 site/
 ├── worker/
-│   ├── index.js              — Cloudflare Worker entry (~2400 lines)
-│   └── store.js              — D1 storage adapter, KV-compatible API (~230 lines)
+│   ├── index.js              — Cloudflare Worker entry (~2450 lines)
+│   └── store.js              — D1 storage adapter, KV-compatible API (~250 lines)
 ├── frontend/
-│   ├── index.html            — SPA shell
-│   ├── app.js                — main logic (~4150 lines)
+│   ├── index.html            — SPA shell (has ONE inline <script> — see CSP note)
+│   ├── app.js                — main logic (~4550 lines)
 │   ├── schedule-utils.js     — DEAD CODE (unused ES module, not imported)
 │   ├── style.css             — dark theme
+│   ├── _headers              — Pages security headers incl. CSP hash for inline script
 │   └── icons/                — SVG icons (door-open.svg)
 ├── migrations/
 │   └── 0001_init.sql         — D1 schema (kv table + expires index)
@@ -26,6 +27,8 @@ site/
 ├── wrangler.toml             — Worker + D1 + KV (legacy) + cron + routes
 └── .dev.vars                 — local secrets (OWNER_CODE, TELEGRAM_BOT_TOKEN)
 ```
+
+Reference HTML dumps for the campus parser live at the **repo root**, not in `site/`: `schedule4.html` and `Расписание аудитории.html`.
 
 ## Dev commands
 
@@ -80,6 +83,7 @@ Local secrets go in `site/.dev.vars` (gitignored).
 - **Cron** (`[triggers]` in wrangler.toml): daily cleanup of expired D1 rows.
 - **Route**: `kampussgu.dpdns.org/api/*` → Worker (custom domain). Static Pages on same domain.
 - **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
+- **CDN caching**: public GETs are manually cached via Cache API (`cachedGet` in `worker/index.js`): readers get `public, max-age=60, s-maxage=300` (CDN 5 min), writers `private, no-store`. After every write the worker purges that group's cached URLs (`purgeGroupCdnCache`). If you test with curl and see stale data, pass an `Authorization: Bearer` header (bypasses cache) or wait for purge.
 
 ### Auth (role-based access)
 
@@ -97,27 +101,32 @@ All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 
 ### D1 key patterns
 
-Same logical keys as old KV, now stored in D1 `kv` table with `expires_at`:
+Same logical keys as old KV, now stored in D1 `kv` table with `expires_at`. TTLs are passed as `expirationTtl` **in seconds** (see `store.js:put`). Note: schedule/weeks/hw/campus-updated all use `21600000` sec (≈250 days), NOT 7d as in the old KV era:
 
 | Key pattern | TTL | Description |
 |---|---|---|
-| `schedule:{group}:{weekCode}` | 7d | Weekly schedule data |
-| `weeks:{group}` | 7d | Weeks list |
-| `hw:{group}` | 30d | Homework array |
-| `group-pwd:{group}` | none | SHA-256 password hash |
-| `sync:meta` | 7d | Last sync metadata |
+| `schedule:{group}:{weekCode}` | 250d | Weekly schedule data |
+| `weeks:{group}` | 250d | Weeks list |
+| `hw:{group}` | 250d | Homework array |
+| `sync:meta` | 250d | Last sync metadata |
 | `subjects:{group}:{semester}` | 365d | Aggregated subjects for semester |
 | `subjects-week:{group}:{semester}:{weekCode}` | 365d | Per-week subject snapshots |
-| `campus-updated:{group}` | 7d | Campus update timestamp string |
+| `campus-updated:{group}` | 250d | Campus update timestamp string |
 | `inv:{token}` | 365d | Invite record `{ group, createdAt, label? }` |
 | `inv-by-group:{group}` | 365d | Array of `{ id, token, createdAt, label? }[]` |
-| `tg:sub:{group}:{chatId}` | none | TG subscriber `{ chatId, group, createdAt }` |
+| `tg:subs:{group}` | none | TG subscribers `[{ chatId, subgroup: 'any'\|'1'\|'2' }, ...]` |
+| `tg:groups:{chatId}` | none | Reverse index `[group, ...]` per chat |
+| `rl:{kind}:{ip}:{windowStart}` | ~120s | Rate-limit counters (see Rate limiting) |
+
+Legacy keys auto-migrated on read: `tg:chat:{group}` (single chatId string) → `tg:subs:{group}`. `group-pwd:{group}` is DEAD — the old password login (`/api/auth`) was removed; writer access is invite-token only.
+
+D1 access is logged per request as `[db-summary]` (count + total ms) — see `wrangler.toml` `LOG_DB` / `LOG_DB_VERBOSE` vars.
 
 ## API endpoints
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/api/status` | reader | KV health + last sync info |
+| GET | `/api/status` | reader | D1 health + last sync info |
 | GET | `/api/bootstrap` | reader | Combined: weeks + current schedule + subjects |
 | GET | `/api/schedule?group=&week=` | reader | Get one week's schedule |
 | GET | `/api/schedules?group=&weeks=` | reader | Get multiple weeks (batch) |
@@ -133,18 +142,20 @@ Same logical keys as old KV, now stored in D1 `kv` table with `expires_at`:
 | POST | `/api/hw/recalc` | writer | Recalc all nextPair dueDates |
 | POST | `/api/check-campus-update` | writer | Check if campus data changed |
 | POST | `/api/sync-from-campus` | writer | Full sync: save + update subjects + recalc HW |
-| POST | `/api/auth` | — | Login (group + password → token) |
-| POST | `/api/group/register` | — | Register new group with password |
 | POST | `/api/invite/create` | writer | Create invite link |
 | POST | `/api/invite/verify` | — | Verify invite token → group (public) |
 | GET | `/api/invite?group=` | writer | List group invites |
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |
-| POST | `/api/tg/webhook` | — | Telegram webhook receiver |
-| POST | `/api/tg/set-webhook` | writer | Set webhook URL on Telegram |
-| POST | `/api/tg/subscribe` | writer | Subscribe group chat to TG notifications |
-| POST | `/api/tg/unsubscribe` | writer | Unsubscribe chat |
+| POST | `/api/tg/webhook` | — | Telegram webhook receiver (bot commands + callbacks) |
+| POST | `/api/tg/unsubscribe` | — | Unsubscribe chat (public, rate-limited) |
 | GET | `/api/tg/status?group=&chatId=` | reader | Get subscription status |
+
+No `/api/auth`, `/api/group/register`, `/api/tg/subscribe` or `/api/tg/set-webhook` endpoints exist anymore — writer access is invite-token only, and TG subscriptions are managed **inside the bot itself** (webhook): `/sub <группа>` → inline keyboard to pick subgroup, `/stop`, `/status`.
+
+## Rate limiting
+
+D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`), **tg 60** (`/api/tg/webhook`), **unsub 10** (`/api/tg/unsubscribe`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
 
 ## Data model
 
@@ -192,6 +203,8 @@ The homework modal encodes `subject + type + subgroup` into `<select>` option va
 - No package manager lockfile — `node_modules` not tracked
 - No TypeScript, no bundler, no transpiler — plain JS
 - `schedule-utils.js` is dead code (ES module, not imported) — all its functions are duplicated inline in `app.js`
+- Hotkeys (`setupKeyboardShortcuts` in app.js): `←`/`→` switch weeks, `1`–`6` select day, `Esc` closes the HW view modal; ignored while typing in inputs/selects
+- CSP gotcha: `frontend/_headers` whitelists the ONE inline `<script>` in `index.html` (no-group class hack) by sha256 hash — if you change that inline script, recompute and update the hash in `_headers`, otherwise the site breaks
 - Отвечать пользователю только на русском языке
 
 ## Deploy

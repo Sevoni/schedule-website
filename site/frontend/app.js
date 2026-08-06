@@ -1401,7 +1401,9 @@ async function syncAll(anchorIdxOverride = null, opts = {}) {
     // если была реальная запись в БД, — иначе повторные открытия будут
     // брать устаревшие данные. Проще: пересохраняем новым состоянием.
     saveSchedToCache(state.scheduleCache);
-    saveSyncMeta(campusUpdatedAt);
+    // Если реальных изменений не было — сохраняем старую дату обновления
+    // кампуса, чтобы она не прыгала при мета-обновлениях без изменения расписания.
+    saveSyncMeta(syncRes.updated > 0 ? campusUpdatedAt : undefined);
   } catch (e) {
     updateSyncUI('error', e.message);
     if (!state.schedule) {

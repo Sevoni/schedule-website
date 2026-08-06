@@ -864,8 +864,11 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
       console.log('reaggregateSubjects skipped:', e.message);
     }
 
-    // Записываем дату обновления кампуса (если прислали)
-  if (campusUpdatedAt) {
+    // Записываем дату обновления кампуса ТОЛЬКО если реально изменилось
+    // расписание (updated.length > 0). Если кампус обновил мета-дату, но
+    // содержимое совпадает с нашим кешем — дату не трогаем.
+  const changed = updated.length > 0;
+  if (changed && campusUpdatedAt) {
     await store.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 21600000 });
   }
 
@@ -890,7 +893,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   await store.put('sync:meta', JSON.stringify({
     lastSync: new Date().toISOString(),
     lastWeek: 'batch',
-    campusUpdatedAt: campusUpdatedAt || null,
+    campusUpdatedAt: changed ? (campusUpdatedAt || null) : null,
   }), { expirationTtl: 21600000 });
 
   // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
