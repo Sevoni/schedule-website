@@ -25,9 +25,11 @@ if (!TOKEN) {
 }
 
 if (!SECRET) {
-  console.warn('⚠️  TG_WEBHOOK_SECRET не задан — webhook будет принимать запросы без проверки.');
-  console.warn('   Сгенерируйте секрет (1-256 символов) и задайте его одновременно здесь и в воркере:');
-  console.warn('   npx wrangler secret put TG_WEBHOOK_SECRET');
+  console.error('❌ TG_WEBHOOK_SECRET обязателен. Сгенерируйте секрет и задайте его:');
+  console.error('   1) npx wrangler secret put TG_WEBHOOK_SECRET');
+  console.error('   2) $env:TG_WEBHOOK_SECRET = "<тот же секрет>"');
+  console.error('   3) npm run set-webhook');
+  process.exit(1);
 }
 
 const webhookUrl = `${WORKER_URL}/api/tg/webhook`;

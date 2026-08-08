@@ -152,14 +152,13 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |
 | POST | `/api/tg/webhook` | — | Telegram webhook receiver (bot commands + callbacks) |
-| POST | `/api/tg/unsubscribe` | — | Unsubscribe chat (public, rate-limited) |
-| GET | `/api/tg/status?group=&chatId=` | reader | Get subscription status |
+| GET | `/api/tg/status?group=&chatId=` | reader | Get subscription status (subscribed + botUsername only) |
 
-No `/api/auth`, `/api/group/register`, `/api/tg/subscribe` or `/api/tg/set-webhook` endpoints exist anymore — writer access is invite-token only, and TG subscriptions are managed **inside the bot itself** (webhook): `/sub <группа>` → inline keyboard to pick subgroup, `/stop`, `/status`.
+No `/api/auth`, `/api/group/register`, `/api/tg/subscribe`, `/api/tg/unsubscribe` or `/api/tg/set-webhook` endpoints exist anymore — writer access is invite-token only, and TG subscriptions are managed **inside the bot itself** (webhook): `/sub <группа>` → inline keyboard to pick subgroup, `/status`. Unsubscribe is only via `/stop` in the bot (chatId comes from the signed webhook update, not from the client).
 
 ## Rate limiting
 
-D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`), **unsub 10** (`/api/tg/unsubscribe`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
+D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
 
 ## Data model
 

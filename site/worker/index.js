@@ -7,6 +7,98 @@ function normalizeGroup(g) {
   return (g || '').trim().toLowerCase();
 }
 
+// ── Валидация/санитизация данных при заливке (defense in depth) ─────────
+// Фронтенд экранирует вывод (escHtml), но writer'ы присылают произвольный
+// JSON. Здесь «мягко» приводим поля к ожидаемой форме: строки обрезаем и
+// удаляем управляющие символы, не-строковые значения отбрасываем, лишние
+// ключи выкидываем. Злонамеренная разметка <img onerror=...> переживает
+// заливку, но рендерится как текст (фронт скейпит), а источник в базе —
+// без исполняемых тегов.
+
+function sanitizeString(v, maxLen = 200) {
+  if (typeof v === 'number') v = String(v);
+  if (typeof v !== 'string') return '';
+  return v.slice(0, maxLen).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+}
+
+const SCHEDULE_PAIR_KEYS = ['subject', 'teacher', 'room', 'type', 'subgroup', 'num', 'time'];
+
+function sanitizePair(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
+  const out = {};
+  for (const k of SCHEDULE_PAIR_KEYS) {
+    if (p[k] === undefined || p[k] === null) continue;
+    if (k === 'num') {
+      const n = parseInt(p[k], 10);
+      if (Number.isFinite(n) && n >= 1 && n <= 8) out[k] = n;
+      continue;
+    }
+    if (k === 'time') {
+      const t = sanitizeString(p[k], 10);
+      if (/^\d{1,2}:\d{2}$/.test(t)) out[k] = t;
+      continue;
+    }
+    const s = sanitizeString(p[k]);
+    if (s !== '') out[k] = s;
+  }
+  return out;
+}
+
+function sanitizeDay(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const out = {};
+  if (d.date != null) out.date = sanitizeString(d.date, 40);
+  out.pairs = Array.isArray(d.pairs)
+    ? d.pairs.map(sanitizePair).filter((x) => x !== null)
+    : [];
+  return out;
+}
+
+// Защита от прототип-загрязнения: не берём служебные ключи дней.
+const RESERVED_DAY_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function sanitizeScheduleData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  const out = {};
+  if (data.group != null) out.group = sanitizeString(data.group, 100);
+  if (data.weekStart != null) out.weekStart = sanitizeString(data.weekStart, 40);
+  if (data.weekEnd != null) out.weekEnd = sanitizeString(data.weekEnd, 40);
+  out.days = {};
+  if (data.days && typeof data.days === 'object' && !Array.isArray(data.days)) {
+    for (const [dayName, dayData] of Object.entries(data.days)) {
+      if (RESERVED_DAY_KEYS.has(dayName)) continue;
+      const clean = sanitizeDay(dayData);
+      if (clean) out.days[sanitizeString(dayName, 40)] = clean;
+    }
+  }
+  return out;
+}
+
+function sanitizeWeeks(weeks) {
+  if (!Array.isArray(weeks)) return null;
+  return weeks
+    .map((w) => {
+      if (!w || typeof w !== 'object' || Array.isArray(w)) return null;
+      const out = {};
+      if (w.value != null) out.value = sanitizeString(w.value, 60);
+      if (w.text != null) out.text = sanitizeString(w.text, 250);
+      return Object.keys(out).length ? out : null;
+    })
+    .filter((w) => w !== null);
+}
+
+function sanitizeHwFields(body) {
+  const out = {};
+  for (const k of ['subject', 'author']) {
+    if (body[k] != null) out[k] = sanitizeString(body[k], k === 'subject' ? 200 : 100);
+  }
+  if (body.task != null) out.task = sanitizeString(body.task, 5000);
+  if (body.pairType != null) out.pairType = sanitizeString(body.pairType, 20);
+  if (body.subgroup != null) out.subgroup = sanitizeString(body.subgroup, 10);
+  if (body.dueDate != null) out.dueDate = sanitizeString(body.dueDate, 40);
+  return out;
+}
+
 // Текущий request context (для ctx.waitUntil фоновых уведомлений).
 // Устанавливается в начале fetch и используется в notifyGroupBg.
 let currentCtx = null;
@@ -160,9 +252,6 @@ export default {
       if (path === '/api/tg/webhook' && method === 'POST') {
         return await handleTgWebhook(request, env);
       }
-      if (path === '/api/tg/unsubscribe' && method === 'POST') {
-        return await handleTgUnsubscribe(request, env, corsHeaders);
-      }
       if (path === '/api/tg/status' && method === 'GET') {
         return await handleTgStatus(request, env, corsHeaders);
       }
@@ -220,7 +309,7 @@ async function resolveAuth(request, env) {
     if (token) {
       // Owner: секретный код из env. Группу берём из query/body — за это
       // отвечает вызывающий код.
-      if (env.OWNER_CODE && token === env.OWNER_CODE) {
+      if (env.OWNER_CODE && timingSafeEqualStr(token, env.OWNER_CODE)) {
         return { role: 'owner', token };
       }
 
@@ -239,19 +328,21 @@ async function resolveAuth(request, env) {
 
   // Authorization отсутствует — пробуем HttpOnly-cookie owner_code.
   // Код владельца JS не знает, D1 не затрагиваем.
-  if (ownerFromCookie(request, env)) {
+  if (await ownerFromCookie(request, env)) {
     return { role: 'owner', viaCookie: true };
   }
 
   return null;
 }
 
-// Извлекает код владельца из HttpOnly cookie `owner_code` и сверяет с
-// env.OWNER_CODE постоянным по времени сравнением (timingSafeEqualStr).
+// Извлекает хэш владельца из HttpOnly cookie `owner_code` и сверяет с
+// SHA-256(env.OWNER_CODE) постоянным по времени сравнением (timingSafeEqualStr).
 // Cookie НЕ виден JavaScript'у — роль owner восстанавливается через него
 // автоматически на каждом запросе без повторного ввода кода.
-function ownerFromCookie(request, env) {
+async function ownerFromCookie(request, env) {
   if (!env.OWNER_CODE) return false;
+  const expected = await getOwnerCodeHash(env);
+  if (!expected) return false;
   const cookieHeader = request.headers.get('Cookie');
   if (!cookieHeader) return false;
   for (const part of cookieHeader.split(';')) {
@@ -260,7 +351,7 @@ function ownerFromCookie(request, env) {
     if (part.slice(0, eq).trim() !== 'owner_code') continue;
     let value = part.slice(eq + 1).trim();
     try { value = decodeURIComponent(value); } catch (_) { /* оставляем как есть */ }
-    return timingSafeEqualStr(value, env.OWNER_CODE);
+    return timingSafeEqualStr(value, expected);
   }
   return false;
 }
@@ -298,7 +389,7 @@ async function requireWriter(request, env, corsHeaders) {
   }
   if (auth.role === 'writer') {
     const targetGroup = await groupFromBodyOrQuery(request);
-    if (targetGroup && auth.group !== targetGroup) {
+    if (!targetGroup || auth.group !== targetGroup) {
       return jsonResponse({ error: 'Forbidden: group mismatch' }, corsHeaders, 403);
     }
   }
@@ -385,13 +476,15 @@ async function handleOwnerLogin(request, env, corsHeaders) {
     return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
   }
 
+  // В куку кладём не сам код, а его SHA-256 хэш (base64url): утечка куки
+  // больше не раскрывает секрет владельца и не даёт вечной компрометации.
+  const ownerHash = await getOwnerCodeHash(env);
   const headers = {
     ...corsHeaders,
     'Content-Type': 'application/json',
     // HttpOnly — код недоступен JS (закрывает XSS-кражу из localStorage/URL).
     // Secure — только по HTTPS. SameSite=Lax — кука шлётся на same-site запросы.
-    // Значение URL-кодируем: коды могут содержать символы, запрещённые в cookie.
-    'Set-Cookie': `${OWNER_COOKIE_NAME}=${encodeURIComponent(code)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${OWNER_COOKIE_TTL}`,
+    'Set-Cookie': `${OWNER_COOKIE_NAME}=${ownerHash}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${OWNER_COOKIE_TTL}`,
   };
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
 }
@@ -569,6 +662,23 @@ function timingSafeEqualStr(a, b) {
   return diff === 0;
 }
 
+// SHA-256 хэш OWNER_CODE (base64url) с кэшем на время жизни контекста.
+// Пересчитывается только при смене значения env.OWNER_CODE.
+let ownerCodeHashCache = { code: null, hash: null };
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  let bin = '';
+  for (const b of new Uint8Array(buf)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function getOwnerCodeHash(env) {
+  if (!env.OWNER_CODE) return '';
+  if (ownerCodeHashCache.code !== env.OWNER_CODE) {
+    ownerCodeHashCache = { code: env.OWNER_CODE, hash: await sha256Hex(env.OWNER_CODE) };
+  }
+  return ownerCodeHashCache.hash;
+}
+
 // ── GET /api/schedule?group=...&week=... ────────────────────────
 
 async function handleGetSchedule(request, env, corsHeaders) {
@@ -583,7 +693,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
   if (weekCode) {
     const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
-    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
 
@@ -602,7 +712,7 @@ async function handleGetWeeks(request, env, corsHeaders) {
   }
 
   const data = await store.get(`weeks:${group}`, { type: 'json' });
-  if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+  if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
   return jsonResponse({ error: 'No weeks data' }, corsHeaders, 404);
 }
 
@@ -637,7 +747,7 @@ async function handleGetSchedules(request, env, corsHeaders) {
     result[weekCode] = e.value;
   }
 
-  return jsonResponse(result, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+  return jsonResponse(result, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── GET /api/bootstrap?group=...&weeks=w1,w2,... ────────────────
@@ -677,7 +787,7 @@ async function handleBootstrap(request, env, corsHeaders) {
   // фронтенд после перезагрузки восстанавливает роль из поля isOwner.
   const auth = await resolveAuth(request, env);
   const isOwner = !!(auth && auth.role === 'owner');
-  const isPrivate = isAuthRequest(request, env);
+  const isPrivate = await isAuthRequest(request, env);
 
   // Одним batch-запросом читаем все ключи: weeks, hw, subjects,
   // campus-updated и расписания. Один round-trip к D1 вместо 5.
@@ -706,7 +816,7 @@ async function handleBootstrap(request, env, corsHeaders) {
     subjects: subjectsData || [],
     campusUpdatedAt: campusUpdatedAt || '',
     isOwner,
-  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate });
+  }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate });
 }
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
@@ -725,9 +835,13 @@ async function handleUpload(request, env, corsHeaders) {
     if (!group || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
-    await store.put(`weeks:${group}`, JSON.stringify(weeks), { expirationTtl: 21600000 });
+    const cleanWeeks = sanitizeWeeks(weeks);
+    if (!cleanWeeks) {
+      return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
+    }
+    await store.put(`weeks:${group}`, JSON.stringify(cleanWeeks), { expirationTtl: 21600000 });
     await purgeGroupCdnCache(env, group);
-    return jsonResponse({ ok: true, type: 'weeks', count: weeks.length }, corsHeaders);
+    return jsonResponse({ ok: true, type: 'weeks', count: cleanWeeks.length }, corsHeaders);
   }
 
   if (type === 'schedule') {
@@ -736,13 +850,17 @@ async function handleUpload(request, env, corsHeaders) {
     if (!group || !data) {
       return jsonResponse({ error: 'Missing group or data' }, corsHeaders, 400);
     }
-
-    const key = weekCode ? `schedule:${group}:${weekCode}` : `schedule:${group}:current`;
-    await store.put(key, JSON.stringify(data), { expirationTtl: 21600000 });
+    const cleanData = sanitizeScheduleData(data);
+    if (!cleanData) {
+      return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
+    }
+    const cleanWeekCode = sanitizeString(weekCode, 60);
+    const key = cleanWeekCode ? `schedule:${group}:${cleanWeekCode}` : `schedule:${group}:current`;
+    await store.put(key, JSON.stringify(cleanData), { expirationTtl: 21600000 });
 
     await store.put('sync:meta', JSON.stringify({
       lastSync: new Date().toISOString(),
-      lastWeek: weekCode || 'current',
+      lastWeek: cleanWeekCode || 'current',
     }), { expirationTtl: 21600000 });
 
     try {
@@ -751,7 +869,7 @@ async function handleUpload(request, env, corsHeaders) {
       console.log('subjects update skipped:', e.message);
     }
 
-    return jsonResponse({ ok: true, type: 'schedule', group, weekCode }, corsHeaders);
+    return jsonResponse({ ok: true, type: 'schedule', group, weekCode: cleanWeekCode }, corsHeaders);
   }
 
   if (type === 'schedule-batch') {
@@ -767,20 +885,23 @@ async function handleUpload(request, env, corsHeaders) {
 
     for (const { weekCode, data } of schedules) {
       if (!weekCode || !data) continue;
-      validWeekCodes.push(weekCode);
+      const cleanWeekCode = sanitizeString(weekCode, 60);
+      const cleanData = sanitizeScheduleData(data);
+      if (!cleanWeekCode || !cleanData) continue;
+      validWeekCodes.push(cleanWeekCode);
 
-      const existing = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+      const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
       const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
-      const newStr = JSON.stringify(stripComparable(data));
+      const newStr = JSON.stringify(stripComparable(cleanData));
 
       if (existingStr !== newStr) {
-        await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 21600000 });
-        updated.push(weekCode);
+        await store.put(`schedule:${group}:${cleanWeekCode}`, JSON.stringify(cleanData), { expirationTtl: 21600000 });
+        updated.push(cleanWeekCode);
 
           // Инкрементально обновим список предметов этой недели (собираем stmt
           // для пакетной записи после цикла, вместо N последовательных put).
           try {
-            const stmt = addSubjectsFromWeekStmt(env, group, weekCode, data);
+            const stmt = addSubjectsFromWeekStmt(env, group, cleanWeekCode, cleanData);
             if (stmt) subjectStmts.push(stmt);
           } catch (e) {
             console.log('addSubjectsFromWeek skipped:', e.message);
@@ -889,10 +1010,13 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
   for (const { weekCode, data } of schedules) {
     if (!weekCode || !data) continue;
+    const cleanWeekCode = sanitizeString(weekCode, 60);
+    const cleanData = sanitizeScheduleData(data);
+    if (!cleanWeekCode || !cleanData) continue;
 
-    const existing = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
+    const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
     const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
-    const newStr = JSON.stringify(stripComparable(data));
+    const newStr = JSON.stringify(stripComparable(cleanData));
 
     if (existingStr !== newStr) {
       const isNewWeek = !existing;
@@ -902,20 +1026,20 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
       // считаем «изменением» и не шлём про неё уведомление.
       if (!isNewWeek) {
         try {
-          const d = diffScheduleWeek(stripComparable(existing), stripComparable(data));
+          const d = diffScheduleWeek(stripComparable(existing), stripComparable(cleanData));
           if (d) diffs.push(d);
         } catch (e) {
           console.log('diffScheduleWeek skipped:', e.message);
         }
       }
 
-      await store.put(`schedule:${group}:${weekCode}`, JSON.stringify(data), { expirationTtl: 21600000 });
-      updated.push(weekCode);
+      await store.put(`schedule:${group}:${cleanWeekCode}`, JSON.stringify(cleanData), { expirationTtl: 21600000 });
+      updated.push(cleanWeekCode);
 
       // Инкрементально обновляем список предметов этой недели (собираем stmt
       // для пакетной записи после цикла, вместо N последовательных put).
       try {
-        const stmt = addSubjectsFromWeekStmt(env, group, weekCode, data);
+        const stmt = addSubjectsFromWeekStmt(env, group, cleanWeekCode, cleanData);
         if (stmt) subjectStmts.push(stmt);
       } catch (e) {
         console.log('addSubjectsFromWeek skipped:', e.message);
@@ -1010,7 +1134,7 @@ async function handleGetHw(request, env, corsHeaders) {
   // Writer'ы (Authorization) видят актуальное состояние (no-store), чтобы при
   // только что добавленном ДЗ и сразу же загруженном списке не получить
   // устаревший кеш из CDN.
-  return jsonResponse(data || [], corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+  return jsonResponse(data || [], corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── POST /api/hw ───────────────────────────────────────────────
@@ -1033,15 +1157,17 @@ async function handleAddHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Invalid dueMode' }, corsHeaders, 400);
   }
 
+  const clean = sanitizeHwFields(body);
+
   const item = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    subject,
-    pairType: pairType || 'any',
-    subgroup: subgroup || 'any',
-    task: task || '',
+    subject: clean.subject || '',
+    pairType: clean.pairType || 'any',
+    subgroup: clean.subgroup || 'any',
+    task: clean.task || '',
     dueMode,
-    dueDate: dueDate || '',
-    author: author || '',
+    dueDate: clean.dueDate || '',
+    author: clean.author || '',
     createdAt: new Date().toISOString(),
   };
 
@@ -1089,20 +1215,21 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   const prev = existing[idx];
+  const clean = sanitizeHwFields(body);
   const item = {
     ...prev,
-    subject: body.subject != null ? body.subject : prev.subject,
-    pairType: body.pairType != null ? body.pairType : prev.pairType,
-    subgroup: body.subgroup != null ? body.subgroup : prev.subgroup,
-    task: body.task != null ? body.task : prev.task,
+    subject: clean.subject != null ? clean.subject : prev.subject,
+    pairType: clean.pairType != null ? clean.pairType : prev.pairType,
+    subgroup: clean.subgroup != null ? clean.subgroup : prev.subgroup,
+    task: clean.task != null ? clean.task : prev.task,
     dueMode: body.dueMode != null ? body.dueMode : prev.dueMode,
-    author: body.author != null ? body.author : prev.author,
+    author: clean.author != null ? clean.author : prev.author,
   };
 
   if (item.dueMode === 'nextPair') {
     item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(prev.createdAt), item.subgroup);
   } else {
-    item.dueDate = body.dueDate || '';
+    item.dueDate = clean.dueDate != null ? clean.dueDate : prev.dueDate;
   }
 
   existing[idx] = item;
@@ -1159,7 +1286,7 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
     const prev = existing[idx];
     // Только dueDate пока поддерживаем — пересчёт nextPair использует только
     // дату. Если понадобится менять другие поля — расширить здесь.
-    const newDate = upd.dueDate === undefined ? prev.dueDate : upd.dueDate;
+    const newDate = upd.dueDate === undefined ? prev.dueDate : sanitizeString(upd.dueDate, 40);
     if (newDate !== prev.dueDate) {
       existing[idx] = { ...prev, dueDate: newDate };
       updated.push(existing[idx]);
@@ -1195,10 +1322,10 @@ async function handleDeleteHw(request, env, corsHeaders) {
 
   const url = new URL(request.url);
   const id = url.searchParams.get('id');
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
 
-  if (!id) {
-    return jsonResponse({ error: 'Missing id' }, corsHeaders, 400);
+  if (!id || !group) {
+    return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
   const key = `hw:${group}`;
@@ -1241,7 +1368,7 @@ async function handleGetSubjects(request, env, corsHeaders) {
     }
   }
 
-  return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+  return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── POST /api/subjects ─────────────────────────────────────────
@@ -1279,7 +1406,11 @@ async function handleRecalcHw(request, env, corsHeaders) {
   }
 
   const body = await request.json().catch(() => ({}));
-  const group = normalizeGroup(body.group) || env.DEFAULT_GROUP || '131-ИБо';
+  const group = normalizeGroup(body.group);
+
+  if (!group) {
+    return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
+  }
 
   const result = await recalcHomeworkForGroup(env, group);
   if (result && result.changed) {
@@ -1596,7 +1727,7 @@ async function handleStatus(request, env, corsHeaders) {
     lastSync: meta?.lastSync || null,
     lastWeek: meta?.lastWeek || null,
     campusUpdatedAt: campusUpdatedAt || null,
-  }, corsHeaders, 200, { cacheControl: cacheControlForGet(request, env), isPrivate: isAuthRequest(request, env) });
+  }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── Helper ─────────────────────────────────────────────────────
@@ -1611,21 +1742,21 @@ const CC_READER_GET  = 'public, max-age=60, s-maxage=300';
 const CC_WRITER_GET  = 'private, no-store';
 const CC_NO_STORE    = 'no-store';
 
-function cacheControlForGet(request, env) {
+async function cacheControlForGet(request, env) {
   const auth = request.headers.get('Authorization');
   if (auth && auth.startsWith('Bearer ')) return CC_WRITER_GET;
   // Owner с HttpOnly-cookie тоже приватный: bootstrap в этом случае несёт
   // isOwner, и его нельзя пускать в публичный CDN-кеш.
-  if (ownerFromCookie(request, env)) return CC_WRITER_GET;
+  if (await ownerFromCookie(request, env)) return CC_WRITER_GET;
   return CC_READER_GET;
 }
 
 // Есть ли у запроса аутентификация (writer/owner): Bearer-токен ИЛИ
 // валидная HttpOnly-cookie owner_code. Для таких ответов isPrivate=true:
 // Vary:Authorization + private, чтобы CDN не смешивал их с reader-кешем.
-function isAuthRequest(request, env) {
+async function isAuthRequest(request, env) {
   return (request.headers.get('Authorization') || '').startsWith('Bearer ') ||
-    ownerFromCookie(request, env);
+    await ownerFromCookie(request, env);
 }
 
 // Инвалидация CDN-кеша для группы после записи. Удаляем кешированные GET-
@@ -1671,7 +1802,7 @@ async function purgeGroupCdnCache(env, group) {
 // Возвращает Response. Если caches API недоступен — просто вызывает builder().
 async function cachedGet(request, env, corsHeaders, builder) {
   const hasBearer = (request.headers.get('Authorization') || '').startsWith('Bearer ');
-  const isOwnerCookie = ownerFromCookie(request, env);
+  const isOwnerCookie = await ownerFromCookie(request, env);
   if (hasBearer || isOwnerCookie) {
     // Writer/owner — без кеша.
     return builder();
@@ -2016,16 +2147,15 @@ async function handleTgWebhook(request, env) {
 
   // Защита от подделки updates: Telegram при setWebhook с secret_token
   // шлёт заголовок X-Telegram-Bot-Api-Secret-Token на каждый запрос.
-  // Если секрет задан — сравниваем constant-time. Если не задан — webhook
-  // открытый (обратная совместимость), но логируем предупреждение.
-  if (env.TG_WEBHOOK_SECRET) {
-    const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
-    if (!timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET)) {
-      console.log('[tg] webhook rejected: bad secret_token');
-      return new Response('Unauthorized', { status: 401 });
-    }
-  } else {
-    console.log('[tg] WARNING: TG_WEBHOOK_SECRET not set — webhook accepts forged updates');
+  // Секрет обязателен — без него webhook отключён (503), подделки не принимаются.
+  if (!env.TG_WEBHOOK_SECRET) {
+    console.error('[tg] FATAL: TG_WEBHOOK_SECRET not set — webhook disabled');
+    return new Response('Webhook misconfigured: TG_WEBHOOK_SECRET is required', { status: 503 });
+  }
+  const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+  if (!timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET)) {
+    console.log('[tg] webhook rejected: bad secret_token');
+    return new Response('Unauthorized', { status: 401 });
   }
 
   let update;
@@ -2199,52 +2329,11 @@ async function unbindChat(env, chatId) {
   await store.delete(`tg:groups:${chatId}`);
 }
 
-// ── POST /api/tg/unsubscribe ───────────────────────────────────
-// Body: { group } | { chatId } | { group, chatId }
-//
-// Режим { group, chatId } и { chatId } — публичные (используются кнопкой
-// «Отвязать» во фронте: пользователь отвязывает свой chat_id).
-// Режим { group } без chatId отвязывает ВСЕХ подписчиков группы (массовая
-// отписка) — требует writer/owner для этой группы, чтобы аноним не мог
-// выключить уведомления всей группы.
-
-async function handleTgUnsubscribe(request, env, corsHeaders) {
-  const store = createStore(env);
-  if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
-  const body = await request.json().catch(() => ({}));
-  const { group: _group, chatId } = body;
-  const group = normalizeGroup(_group);
-
-  if (group && chatId) {
-    await removeGroupSubscriber(env, group, chatId);
-    const groupsRaw = await store.get(`tg:groups:${String(chatId)}`, { type: 'json' }) || [];
-    const filtered = groupsRaw.filter(g => g !== group);
-    if (filtered.length) await store.put(`tg:groups:${String(chatId)}`, JSON.stringify(filtered));
-    else await store.delete(`tg:groups:${String(chatId)}`);
-  } else if (group) {
-    // Опасный режим: отвязываем ВСЕ чаты от группы. Требуем writer/owner.
-    const guard = await requireWriter(request, env, corsHeaders);
-    if (guard) return guard;
-    const subs = await getGroupSubscribers(env, group);
-    await store.delete(`tg:subs:${group}`);
-    await store.delete(`tg:chat:${group}`); // на случай старого ключа
-    for (const c of subs) {
-      const groupsRaw = await store.get(`tg:groups:${String(c.chatId)}`, { type: 'json' }) || [];
-      const filtered = groupsRaw.filter(g => g !== group);
-      if (filtered.length) await store.put(`tg:groups:${String(c.chatId)}`, JSON.stringify(filtered));
-      else await store.delete(`tg:groups:${String(c.chatId)}`);
-    }
-  } else if (chatId) {
-    await unbindChat(env, String(chatId));
-  } else {
-    return jsonResponse({ error: 'Missing group or chatId' }, corsHeaders, 400);
-  }
-  return jsonResponse({ ok: true }, corsHeaders);
-}
-
 // ── GET /api/tg/status?group=...&chatId=... ─────────────────────
-// Возвращает { subscribed, chatId } — подписан ли ПЕРЕДАННЫЙ chatId
+// Возвращает { subscribed, botUsername } — подписан ли ПЕРЕДАННЫЙ chatId
 // к этой группе (изоляция: каждый пользователь видит только свой статус).
+// Отписка — только командой /stop в боте (webhook), где chatId берётся
+// из самого апдейта Telegram (подписанного secret_token).
 
 async function handleTgStatus(request, env, corsHeaders) {
   const store = createStore(env);
@@ -2256,10 +2345,7 @@ async function handleTgStatus(request, env, corsHeaders) {
   const existing = chatId ? subs.find(s => String(s.chatId) === String(chatId)) : null;
   return jsonResponse({
     subscribed: !!existing,
-    chatId: existing ? chatId : null,
-    subscribersCount: subs.length,
     botUsername: env.TG_BOT_USERNAME || '',
-    subgroup: existing ? existing.subgroup : null,
   }, corsHeaders);
 }
 
@@ -2441,8 +2527,6 @@ function formatHwMessage(action, group, hw, prevHw) {
 //   verify  — 10/мин по IP, на публичные POST /api/invite/verify,
 //             /api/invite/create (D1-read oracle / owner-код).
 //   tg      — 60/мин по IP, на POST /api/tg/webhook.
-//   unsub   — 10/мин по IP, на публичный POST /api/tg/unsubscribe
-//             (любой может отписать произвольный chatId).
 
 // Извлекает IP клиента из каноничного заголовка Cloudflare.
 // cf-connecting-ip ставится CF на каждом запросе к Worker.
@@ -2450,35 +2534,44 @@ function getClientIp(request) {
   return (request.headers.get('cf-connecting-ip') || '').trim();
 }
 
+// Дебаунс предупреждений о fail-open (не чаще раза в 30 сек), чтобы не заливать логи.
+let lastRlWarnTime = 0;
+function warnRlFailOpen(kind, id) {
+  const now = Date.now();
+  if (now - lastRlWarnTime < 30000) return;
+  lastRlWarnTime = now;
+  console.warn(`[ratelimit] no db (${kind}:${id}) — fail-open, лимиты отключены`);
+}
+
 // Атомарно инкрементирует счётчик и проверяет лимит.
 // Возвращает { limited: false } или { limited: true, retryAfter: <сек> }.
 // При ошибке D1 — fail-open (возвращает { limited: false }).
 async function checkRateLimit(store, id, kind, limit, windowSec) {
-  if (!store || !store._db || !id) return { limited: false };
+  if (!store || !store._db || !id) {
+    warnRlFailOpen(kind, id);
+    return { limited: false };
+  }
   const now = Date.now();
   const windowStart = Math.floor(now / (windowSec * 1000));
   const key = `rl:${kind}:${id}:${windowStart}`;
   const expiresAt = now + (windowSec + 60) * 1000; // +60 сек запас на TTL
 
-  // UPSERT с атомарным инкрементом. value храним как TEXT (как всё в kv).
-  // ON CONFLICT — CAST для превращения строки в INTEGER и обратно.
-  await store._db
+  // Один атомарный запрос: UPSERT + RETURNING post-image счётчика.
+  // Гонки нет: SQLite сериализует запись, RETURNING возвращает значение ПОСЛЕ инкремента.
+  // value храним как TEXT (как всё в kv), поэтому ON CONFLICT — CAST,
+  // а RETURNING CAST(value AS INTEGER) AS count возвращает уже число.
+  const row = await store._db
     .prepare(
       `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, '1', ?, ?)
        ON CONFLICT(key) DO UPDATE SET
          value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
          expires_at = excluded.expires_at,
-         updated_at = excluded.updated_at`
+         updated_at = excluded.updated_at
+       RETURNING CAST(value AS INTEGER) AS count`
     )
     .bind(key, expiresAt, now)
-    .run();
-
-  // Читаем актуальный счётчик после инкремента.
-  const row = await store._db
-    .prepare('SELECT value FROM kv WHERE key = ?')
-    .bind(key)
     .first();
-  const count = row ? parseInt(row.value, 10) : 1;
+  const count = row ? row.count : 1;
 
   if (count > limit) {
     // Сколько секунд до конца окна.
@@ -2528,11 +2621,6 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
     // TG webhook — публичный, шлёт исходящие в Telegram.
     if (path === '/api/tg/webhook') {
       const rl = await checkRateLimit(store, ip, 'tg', 60, 60);
-      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
-    }
-    // TG unsubscribe — публичный (любой может отписать chatId).
-    if (path === '/api/tg/unsubscribe') {
-      const rl = await checkRateLimit(store, ip, 'unsub', 10, 60);
       if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
     }
   }

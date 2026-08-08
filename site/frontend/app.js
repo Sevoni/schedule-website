@@ -2212,7 +2212,7 @@ function renderWeekNav() {
   if (w) {
     const paren = w.text.indexOf(' (');
     if (paren >= 0) {
-      label.innerHTML = `<span>${w.text.slice(0, paren)}</span><span class="week-dates">${w.text.slice(paren + 1)}</span>`;
+      label.innerHTML = `<span>${escHtml(w.text.slice(0, paren))}</span><span class="week-dates">${escHtml(w.text.slice(paren + 1))}</span>`;
     } else {
       label.textContent = w.text;
     }
@@ -2476,8 +2476,8 @@ function renderDaySchedule(day) {
         <div class="pair-card${p.subgroup ? ' has-subgroup' : ''}">
           <div class="pair-top">
             <div style="display:flex;align-items:center;gap:8px;">
-              <span class="pair-num">${p.num}</span>
-              <span class="pair-time">${p.time}</span>
+              <span class="pair-num">${escHtml(p.num)}</span>
+              <span class="pair-time">${escHtml(p.time)}</span>
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
@@ -2496,8 +2496,8 @@ function renderDaySchedule(day) {
    content.innerHTML = `
      <div class="day-schedule">
        <div class="day-header">
-         ${day}
-         <span class="day-date">${dayData.date}</span>
+         ${escHtml(day)}
+         <span class="day-date">${escHtml(dayData.date)}</span>
        </div>
        ${pairsHtml}
      </div>`;
@@ -3826,15 +3826,15 @@ function renderHomework() {
       if (diff < 0) {
         cardClass = 'overdue';
         dueClass = 'overdue';
-        dueText = 'Просрочено (' + hw.dueDate + ')';
+        dueText = 'Просрочено (' + escHtml(hw.dueDate) + ')';
       } else if (diff === 0) {
         cardClass = 'due-soon';
         dueText = 'Сегодня!';
       } else if (diff <= 2) {
         cardClass = 'due-soon';
-        dueText = 'Через ' + diff + ' дн. (' + hw.dueDate + ')';
+        dueText = 'Через ' + diff + ' дн. (' + escHtml(hw.dueDate) + ')';
       } else {
-        dueText = hw.dueDate;
+        dueText = escHtml(hw.dueDate);
       }
     } else if (hw.dueMode === 'nextPair') {
       dueText = 'Следующая пара';
@@ -3890,7 +3890,6 @@ function renderHomework() {
 function setupTgSection() {
   const statusEl = document.getElementById('tgStatus');
   const linkEl = document.getElementById('tgBotLink');
-  const actionsEl = document.getElementById('tgActions');
 
   if (state.tgBotUsername) {
     linkEl.href = 'https://t.me/' + state.tgBotUsername;
@@ -3912,34 +3911,7 @@ function setupTgSection() {
     }
   }
 
-  function renderTgButtons() {
-    actionsEl.innerHTML = '';
-    if (state.tgChatId) {
-      const unsub = document.createElement('button');
-      unsub.className = 'btn-secondary';
-      unsub.textContent = 'Отвязать';
-      unsub.onclick = doUnsubscribe;
-      actionsEl.appendChild(unsub);
-    }
-  }
-
-  async function doUnsubscribe() {
-    if (!state.tgChatId) return;
-    try {
-      await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
-      state.tgChatId = '';
-      state.tgSubgroup = '';
-      localStorage.removeItem('tgChatId');
-      localStorage.removeItem('tgSubgroup');
-      renderTgStatus();
-      renderTgButtons();
-    } catch (e) {
-      console.log('tg unsubscribe error:', e);
-    }
-  }
-
   renderTgStatus();
-  renderTgButtons();
 }
 setupTgSection._refresh = function () {
   const statusEl = document.getElementById('tgStatus');
@@ -3953,26 +3925,6 @@ setupTgSection._refresh = function () {
   } else {
     statusEl.innerHTML = '<svg class="icon inline-icon"><use href="#icon-info"></use></svg> Уведомления не настроены';
     statusEl.className = 'tg-status';
-  }
-  const actionsEl = document.getElementById('tgActions');
-  if (actionsEl) {
-    actionsEl.innerHTML = '';
-    if (state.tgChatId) {
-      const unsub = document.createElement('button');
-      unsub.className = 'btn-secondary';
-      unsub.textContent = 'Отвязать';
-      unsub.onclick = async () => {
-        try {
-          await apiPost('/api/tg/unsubscribe', { group: state.group, chatId: state.tgChatId });
-          state.tgChatId = '';
-          state.tgSubgroup = '';
-          localStorage.removeItem('tgChatId');
-          localStorage.removeItem('tgSubgroup');
-          setupTgSection._refresh();
-        } catch (e) { console.log('tg unsubscribe error:', e); }
-      };
-      actionsEl.appendChild(unsub);
-    }
   }
 };
 
@@ -4236,10 +4188,9 @@ function setupSettingsModal() {
         linkEl.textContent = '@' + state.tgBotUsername;
       }
       if (res.subscribed) {
-        state.tgChatId = res.chatId || state.tgChatId;
-        state.tgSubgroup = res.subgroup || 'any';
+        state.tgChatId = state.tgChatId || '';
         localStorage.setItem('tgChatId', state.tgChatId);
-        localStorage.setItem('tgSubgroup', state.tgSubgroup);
+        localStorage.setItem('tgSubgroup', state.tgSubgroup || 'any');
         const subLabel = state.tgSubgroup === '1' ? 'подгруппа 1'
           : state.tgSubgroup === '2' ? 'подгруппа 2'
           : 'обе подгруппы';
@@ -4369,10 +4320,8 @@ function setupSettingsModal() {
     if (groupChanged) {
       apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
         if (res.subscribed) {
-          state.tgChatId = res.chatId || '';
-          state.tgSubgroup = res.subgroup || 'any';
-          localStorage.setItem('tgChatId', state.tgChatId);
-          localStorage.setItem('tgSubgroup', state.tgSubgroup);
+          localStorage.setItem('tgChatId', state.tgChatId || '');
+          localStorage.setItem('tgSubgroup', state.tgSubgroup || 'any');
         } else {
           state.tgChatId = '';
           state.tgSubgroup = '';
