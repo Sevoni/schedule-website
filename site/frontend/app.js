@@ -9,13 +9,27 @@ function fetchTimeout(url, opts = {}) {
   return fetch(url, opts);
 }
 
+// Удаляет перечисленные ключи из query-строки URL, не трогая остальные.
+// Используется для синхронной зачистки токенов (?token=, ?owner=) из адресной
+// строки сразу после их чтения — до сетевых запросов (безопасность).
+function clearUrlParams(keysToRemove) {
+  const params = new URLSearchParams(location.search);
+  let changed = false;
+  for (const k of keysToRemove) {
+    if (params.has(k)) { params.delete(k); changed = true; }
+  }
+  if (!changed) return;
+  const rest = params.toString();
+  history.replaceState(null, '', location.pathname + (rest ? '?' + rest : ''));
+}
+
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
 // ── State ─────────────────────────────────────────────────────
 
 let state = {
-  apiBase: localStorage.getItem('apiBase') || DEFAULT_API,
+  apiBase: DEFAULT_API,
   group: (localStorage.getItem('group') || '').toLowerCase(),
   // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
   campusEnabled: localStorage.getItem('campusEnabled') !== '0',
@@ -420,11 +434,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   refreshEditVisibility();
 });
 
-// Проверяет ?token= в URL, валидирует, сохраняет writerToken per-group, чистит URL.
+// Проверяет ?token= (или #invite=) в URL, валидирует, сохраняет writerToken
+// per-group, чистит URL. Поддерживаются оба формата ссылок:
+//   - старые/розданные:  /?token=<invToken>
+//   - новые:             /#invite=<invToken>  (hash не попадает в логи серверов)
 async function consumeInviteTokenFromUrl() {
-  const params = new URLSearchParams(location.search);
-  const token = params.get('token');
+  let token = new URLSearchParams(location.search).get('token');
+  let fromHash = false;
+  if (!token) {
+    const hashMatch = (location.hash || '').match(/^#invite=([^&]+)/);
+    if (hashMatch) { token = decodeURIComponent(hashMatch[1]); fromHash = true; }
+  }
   if (!token) return;
+
+  // Чистим URL ДО сетевой верификации: токен не должен висеть в адресной
+  // строке ни секунды (история браузера, скриншоты, логи расширений).
+  if (fromHash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  } else {
+    clearUrlParams(['token']);
+  }
 
   try {
     const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
@@ -452,21 +481,19 @@ async function consumeInviteTokenFromUrl() {
   } catch (e) {
     showToast('Не удалось проверить ссылку: ' + e.message, 'warn');
   }
-
-  // Чистим URL, чтобы токен не висел в адресной строке и не шарился.
-  history.replaceState(null, '', location.pathname);
 }
 
 // Проверяет ?owner=<code> в URL, валидирует через бэкенд, сохраняет как
 // owner-токен. Чистит URL. Возвращает true, если успешно стали owner.
 async function consumeOwnerCodeFromUrl() {
-  const params = new URLSearchParams(location.search);
-  const code = (params.get('owner') || '').trim();
+  const code = (new URLSearchParams(location.search).get('owner') || '').trim();
   if (!code) return false;
 
+  // Чистим URL ДО сетевой верификации, в любом случае (успех или нет —
+  // код не должен висеть в адресной строке ни секунды).
+  clearUrlParams(['owner']);
+
   const ok = await becomeOwner(code, { silent: false });
-  // Чистим URL в любом случае (успех или нет — код не должен висеть в строке).
-  history.replaceState(null, '', location.pathname);
   return ok;
 }
 
@@ -501,6 +528,26 @@ async function becomeOwner(code, opts = {}) {
   } catch (e) {
     if (!silent) showToast('Ошибка активации владельца: ' + e.message, 'warn');
     return false;
+  }
+}
+
+// Восстановление роли владельца после перезагрузки страницы. JS не видит
+// HttpOnly-cookie owner_code, поэтому роль приходит с сервера через лёгкий
+// /api/owner/status (без обращения к D1). Без этого вызова права owner
+// пропадали бы при загрузке из тёплых клиентских кешей, когда /api/bootstrap
+// не дёргается вовсе. При ошибке сети роль оставляем как есть — следующий
+// bootstrap/действие всё равно вернёт актуальное значение.
+async function restoreOwnerRole() {
+  try {
+    const resp = await fetchTimeout(state.apiBase + '/api/owner/status', {
+      headers: { 'Cache-Control': 'no-store' },
+    });
+    const data = await resp.json().catch(() => ({}));
+    const wasOwner = state.ownerRole;
+    state.ownerRole = data.isOwner === true;
+    if (state.ownerRole !== wasOwner) refreshEditVisibility();
+  } catch (e) {
+    console.warn('[restoreOwnerRole] network error:', e.message);
   }
 }
 
@@ -617,6 +664,7 @@ function setupStartPage() {
     }
     errEl.classList.add('hidden');
     const normalizedGroup = group.toLowerCase();
+    if (normalizedGroup !== state.group) resetSyncMetaForGroup();
     state.group = normalizedGroup;
     localStorage.setItem('group', normalizedGroup);
     applyGroupDisplay(normalizedGroup);
@@ -649,6 +697,11 @@ function setupStartPage() {
 
 async function loadData() {
   try {
+    // Роль владельца живёт только в HttpOnly-cookie, которую JS не видит.
+    // Восстанавливаем её отдельным лёгким запросом: при тёплых клиентских
+    // кешах /api/bootstrap не вызывается, и без этого права owner после
+    // перезагрузки страницы пропадали бы.
+    await restoreOwnerRole();
     state.scheduleCache = {};
     applyGroupDisplay(state.group);
 
@@ -1217,6 +1270,20 @@ function saveSyncMeta(campusUpdatedAt) {
   if (campusUpdatedAt) state.campusUpdatedAt = campusUpdatedAt;
   localStorage.setItem('lastSyncAt', state.lastSyncAt);
   localStorage.setItem('campusUpdatedAt', state.campusUpdatedAt);
+}
+
+// Сброс меты синхронизации при смене группы: даты старой группы не должны
+// отображаться для новой, пока она не синхронизировалась (и не подтянулась
+// свежая мета из /api/status либо bootstrap).
+function resetSyncMetaForGroup() {
+  state.lastSyncAt = '';
+  state.campusUpdatedAt = '';
+  localStorage.removeItem('lastSyncAt');
+  localStorage.removeItem('campusUpdatedAt');
+  const ls = document.getElementById('lastSyncInfo');
+  if (ls) ls.textContent = '—';
+  const cu = document.getElementById('campusUpdatedInfo');
+  if (cu) cu.textContent = '—';
 }
 
 // ── Sync (кнопка обновления) ──────────────────────────────────
@@ -1959,6 +2026,7 @@ async function uploadSchedulesToBackend(schedules) {
 //  - иначе 0.
 function findRealCurrentIdx() {
   const today = new Date();
+  if (today.getDay() === 0) today.setDate(today.getDate() + 1);
   let lastPast = -1;
   for (let i = 0; i < state.weeks.length; i++) {
     const w = state.weeks[i];
@@ -2329,7 +2397,9 @@ function renderDayTabs() {
   tabs.innerHTML = '';
 
   const days = Object.keys(state.schedule.days);
-  const todayName = DAY_NAMES[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+  const effNow = new Date();
+  if (effNow.getDay() === 0) effNow.setDate(effNow.getDate() + 1);
+  const todayName = DAY_NAMES[effNow.getDay() === 0 ? 6 : effNow.getDay() - 1];
 
   let defaultDay = days[0];
   for (const d of days) {
@@ -4279,6 +4349,15 @@ function setupSettingsModal() {
     const newGroup = rawGroup.toLowerCase();
     const groupChanged = newGroup.toLowerCase() !== state.group;
 
+    // Смена группы: сбрасываем даты «последняя синхронизация» и «обновлено на
+    // кампусе» старой группы, чтобы для новой группы не показывались чужое
+    // время. syncMetaLoaded=false — при следующем открытии настроек /api/status
+    // запросит мету уже для новой группы.
+    if (groupChanged) {
+      resetSyncMetaForGroup();
+      syncMetaLoaded = false;
+    }
+
     state.group = newGroup.toLowerCase();
     localStorage.setItem('group', state.group);
     closeModal(modal);
@@ -4374,7 +4453,7 @@ function copyInviteLink(el) {
     showToast('Нет токена для копирования', 'warn');
     return;
   }
-  const origin = (state.apiBase || 'https://kampussgu.dpdns.org').replace(/\/api\/?$/, '').replace(/\/+$/, '');
+  const origin = DEFAULT_API.replace(/\/api\/?$/, '').replace(/\/+$/, '');
   const link = origin + '/?token=' + encodeURIComponent(token);
 
   function done(ok) {

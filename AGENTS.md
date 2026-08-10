@@ -9,11 +9,11 @@ Campus schedule viewer for Syktyvkar State University (campus.syktsu.ru). No bui
 ```
 site/
 ├── worker/
-│   ├── index.js              — Cloudflare Worker entry (~2450 lines)
+│   ├── index.js              — Cloudflare Worker entry (~2900 lines)
 │   └── store.js              — D1 storage adapter, KV-compatible API (~250 lines)
 ├── frontend/
 │   ├── index.html            — SPA shell (has ONE inline <script> — see CSP note)
-│   ├── app.js                — main logic (~4550 lines)
+│   ├── app.js                — main logic (~4600 lines)
 │   ├── schedule-utils.js     — DEAD CODE (unused ES module, not imported)
 │   ├── style.css             — dark theme
 │   ├── _headers              — Pages security headers incl. CSP hash for inline script
@@ -41,6 +41,14 @@ npm run set-webhook  # set Telegram webhook on deployed Worker
 ```
 
 No install step needed — only `wrangler` is a devDependency.
+
+> ⚠️ **Локальный тест НЕ РАБОТАЕТ — не запускать!** `npm run dev` (wrangler dev) и
+> `npx wrangler d1 execute schedule-db --local` на этой машине не поднимают валидный
+> смоук-тест (процесс зависает / тест не проходит). Единственный рабочий путь
+> проверки изменений — `npm run deploy` и проверка на проде через публичные
+> GET-эндпоинты (`curl https://kampussgu.dpdns.org/api/status?group=131-ибo`,
+> `/api/bootstrap`, `/api/schedule`, `/api/weeks`). Запись (writer-эндпоинты)
+> на проде без продового writer-токена не проверить — только read-проверка.
 
 ## Storage: D1 (primary), KV (legacy)
 
@@ -70,7 +78,7 @@ Set via `npx wrangler secret put <NAME>`:
 |---|---|
 | `OWNER_CODE` | Owner role auth. Any string. Without it, no first invite link can be created. |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather. Enables TG notifications. |
-| `TG_WEBHOOK_SECRET` | Optional but recommended. Random string (1–256 chars) that Telegram sends back in the `X-Telegram-Bot-Api-Secret-Token` header on every webhook update. Without it, `/api/tg/webhook` accepts forged POSTs. Set the **same** value here and pass it to `npm run set-webhook` via `TG_WEBHOOK_SECRET` env var so the script includes `secret_token` in the `setWebhook` call. |
+| `TG_WEBHOOK_SECRET` | **Required.** Random string (1–256 chars) that Telegram sends back in the `X-Telegram-Bot-Api-Secret-Token` header on every webhook update. Without it the worker returns 503 on `/api/tg/webhook` and `set-webhook.js` refuses to run — Telegram rejects updates only if this header doesn't match. Set the **same** value here and pass it to `npm run set-webhook` via `TG_WEBHOOK_SECRET` env var so the script includes `secret_token` in the `setWebhook` call. |
 
 Generate OWNER_CODE: `python generate_owner_code.py` (or `--write-dev` to write to `.dev.vars`).
 
@@ -82,7 +90,7 @@ Local secrets go in `site/.dev.vars` (gitignored).
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
 - **Cron** (`[triggers]` in wrangler.toml): daily cleanup of expired D1 rows.
 - **Route**: `kampussgu.dpdns.org/api/*` → Worker (custom domain). Static Pages on same domain.
-- **CORS**: Worker returns `Access-Control-Allow-Origin: *`.
+- **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` (always) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based).
 - **CDN caching**: public GETs are manually cached via Cache API (`cachedGet` in `worker/index.js`): readers get `public, max-age=60, s-maxage=300` (CDN 5 min), writers `private, no-store`. After every write the worker purges that group's cached URLs (`purgeGroupCdnCache`). If you test with curl and see stale data, pass an `Authorization: Bearer` header (bypasses cache) or wait for purge.
 
 ### Auth (role-based access)
@@ -91,14 +99,14 @@ Local secrets go in `site/.dev.vars` (gitignored).
 
 - no header + no cookie → **reader** (anonymous; group from query/body). GET only.
 - token ∈ D1 `inv:{token}` → **writer** (group from the invite record). POST/PUT/DELETE.
-- token === `env.OWNER_CODE` OR valid `owner_code` cookie (constant-time compare via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
+- token === `env.OWNER_CODE` OR valid `owner_code` cookie (constant-time compare of SHA-256 hash via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
 
 All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 
-- **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `owner_code` cookie (30 days, `Secure; SameSite=Lax`). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend gets `ownerRole` back from `isOwner` field of `/api/bootstrap` (computed from the cookie server-side). Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
+- **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `owner_code` cookie (30 days, `Secure; SameSite=Lax`). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend restores `ownerRole` on every load via a lightweight `GET /api/owner/status` (computed from the cookie server-side, no D1) — this runs at the start of `loadData()` because the cache-only fast path (warm localStorage caches) skips `/api/bootstrap` entirely. `isOwner` is also returned in `/api/bootstrap`. Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
 - **Owner logout**: `POST /api/owner/logout` → clears the cookie (button in settings «Ваша роль»).
 - **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` on load → `becomeOwner()` → `POST /api/owner/login`.
-- **Invite link**: frontend reads `?token=<invToken>` on load, validates via `/api/invite/verify`, saves as writer token.
+- **Invite link**: new links use hash fragment `#invite=<token>` (avoids server logs/history/caches); legacy `?token=<invToken>` still parsed. Frontend reads it on load, validates via `/api/invite/verify`, saves as writer token. Quirk: the copy-button in the invite list (`copyInviteLink`) still rebuilds `?token=` URLs while the worker returns `#invite=` — both work, don't "fix" either side.
 - `INVITE_ORIGIN` (var) — canonical origin for invite links (`https://kampussgu.dpdns.org`).
 
 ### D1 key patterns
@@ -110,10 +118,9 @@ Same logical keys as old KV, now stored in D1 `kv` table with `expires_at`. TTLs
 | `schedule:{group}:{weekCode}` | 250d | Weekly schedule data |
 | `weeks:{group}` | 250d | Weeks list |
 | `hw:{group}` | 250d | Homework array |
-| `sync:meta` | 250d | Last sync metadata |
 | `subjects:{group}:{semester}` | 365d | Aggregated subjects for semester |
 | `subjects-week:{group}:{semester}:{weekCode}` | 365d | Per-week subject snapshots |
-| `campus-updated:{group}` | 250d | Campus update timestamp string |
+| `campus-updated:{group}` | 250d | Per-group meta JSON `{ campusUpdatedAt, lastSync, lastWeek }` (legacy string migrates on read via `parseCampusMeta`) |
 | `inv:{token}` | 365d | Invite record `{ group, createdAt, label? }` |
 | `inv-by-group:{group}` | 365d | Array of `{ id, token, createdAt, label? }[]` |
 | `tg:subs:{group}` | none | TG subscribers `[{ chatId, subgroup: 'any'\|'1'\|'2' }, ...]` |
@@ -148,6 +155,7 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | POST | `/api/invite/verify` | — | Verify invite token → group (public) |
 | POST | `/api/owner/login` | — | Owner login: sets HttpOnly `owner_code` cookie (public, rate-limited) |
 | POST | `/api/owner/logout` | — | Owner logout: clears `owner_code` cookie (public, rate-limited) |
+| GET | `/api/owner/status` | — | Owner role check: `{ isOwner }` from HttpOnly cookie / Bearer (public, no D1, always `private, no-store`) |
 | GET | `/api/invite?group=` | writer | List group invites |
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |

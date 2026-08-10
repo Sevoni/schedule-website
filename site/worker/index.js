@@ -7,6 +7,45 @@ function normalizeGroup(g) {
   return (g || '').trim().toLowerCase();
 }
 
+// Разбор мета-записи группы `campus-updated:{group}`.
+// Новый формат — JSON { campusUpdatedAt, lastSync, lastWeek } (все строки или
+// null). Легаси-формат — голая строка даты кампуса (без JSON) — мигрируется
+// на лету: возвращаем объект только с campusUpdatedAt, остальные поля null.
+// Первая же запись после обновления перепишет ключ в JSON.
+function parseCampusMeta(raw) {
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw);
+    if (j && typeof j === 'object') {
+      return {
+        campusUpdatedAt: j.campusUpdatedAt || null,
+        lastSync: j.lastSync || null,
+        lastWeek: j.lastWeek || null,
+      };
+    }
+  } catch (e) { /* не JSON — легаси-строка, обрабатываем ниже */ }
+  return { campusUpdatedAt: raw, lastSync: null, lastWeek: null };
+}
+
+// ── Валидация формата группы и weekCode (серверная) ────────────
+// Группа: 3 цифры, опциональная буква, дефис, 3-4 буквы (пример: "131-ИБо",
+// "131-ИБ"). Сервер работает с lowercase-строками (см. normalizeGroup),
+// поэтому regex написан на lowercase-строку и совпадает по смыслу с
+// GROUP_RE на фронте (app.js).
+const GROUP_RE = /^\d{3}[а-яё]?-[а-яё]{3,4}$/;
+
+function isValidGroup(g) {
+  return typeof g === 'string' && GROUP_RE.test(g);
+}
+
+// weekCode: "<номер недели>_<группа в lowercase>" (например "50_131-ибо")
+// либо специальное значение 'current' (пустой week → 'current').
+const WEEK_CODE_RE = /^\d{1,3}_[a-z0-9а-яё-]{2,30}$/;
+
+function isValidWeekCode(w) {
+  return typeof w === 'string' && (w === 'current' || WEEK_CODE_RE.test(w));
+}
+
 // ── Валидация/санитизация данных при заливке (defense in depth) ─────────
 // Фронтенд экранирует вывод (escHtml), но writer'ы присылают произвольный
 // JSON. Здесь «мягко» приводим поля к ожидаемой форме: строки обрезаем и
@@ -99,29 +138,133 @@ function sanitizeHwFields(body) {
   return out;
 }
 
+// ── Лимит размера тела запроса (анти-DoS) ──────────────────────
+// Читаем JSON тела не целиком в память, а с жёстким лимитом по мере
+// чтения потока. Возвращает:
+//   { ok: true, json }                      — тело прочитано и распарсено
+//   { ok: false, tooLarge: true }           — превышен MAX_BODY_BYTES → 413
+//   { ok: false, parseError: true }         — битый JSON → 400
+const MAX_BODY_BYTES = 1024 * 1024; // 1 МБ
+
+async function readJsonBody(request, maxBytes = MAX_BODY_BYTES) {
+  if (!request.body) return { ok: true, json: {} };
+  const len = Number(request.headers.get('content-length') || 0);
+  if (len > maxBytes) return { ok: false, tooLarge: true };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > maxBytes) {
+      await reader.cancel();
+      return { ok: false, tooLarge: true };
+    }
+    chunks.push(value);
+  }
+  const buf = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  try {
+    return { ok: true, json: JSON.parse(new TextDecoder().decode(buf)) };
+  } catch {
+    return { ok: false, parseError: true };
+  }
+}
+
 // Текущий request context (для ctx.waitUntil фоновых уведомлений).
 // Устанавливается в начале fetch и используется в notifyGroupBg.
 let currentCtx = null;
+
+// ── Заголовки безопасности: применяются ко ВСЕМ /api/* ответам ─────────
+const securityHeaders = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+};
+
+// ── CORS: строгая политика вместо Access-Control-Allow-Origin: * ────────
+// Разрешаем только проверенные origin'ы: preview-домены Cloudflare Pages
+// (*.schedule-worker.pages.dev) + список из env-переменной ALLOWED_ORIGINS
+// (через запятую). Same-origin и curl-запросы без Origin не требуют CORS —
+// для них заголовков нет вообще.
+const CORS_HEADER_NAMES = [
+  'Access-Control-Allow-Origin',
+  'Access-Control-Allow-Methods',
+  'Access-Control-Allow-Headers',
+  'Access-Control-Max-Age',
+  'Vary',
+];
+
+function isAllowedOrigin(origin, env) {
+  if (!origin) return false;
+  try {
+    const u = new URL(origin);
+    const extra = String(env.ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (extra.includes(u.origin)) return true;
+    // Preview-домены Cloudflare Pages: https://<hash>.schedule-worker.pages.dev
+    if (u.hostname.endsWith('.schedule-worker.pages.dev')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// CORS-заголовки для конкретного запроса. Пустой объект = CORS запрещён.
+function corsHeadersFor(request, env) {
+  const origin = request.headers.get('Origin');
+  if (!isAllowedOrigin(origin, env)) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin',
+  };
+}
+
+// Снять CORS-заголовки с кэшируемой копии ответа (кэш не должен зависеть
+// от Origin запроса — при отдаче из кэша они накладываются заново).
+function stripCorsHeaders(headers) {
+  for (const k of CORS_HEADER_NAMES) headers.delete(k);
+  return headers;
+}
 
 export default {
   async fetch(request, env, context) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+    // Случайный ID запроса: попадает в логи (console.error) и в ответ при
+    // ошибке 500, чтобы можно было сопоставить жалобу пользователя с записью
+    // в логах Cloudflare. Наружу уходит только безобидный ID, не детали.
+    const requestId = crypto.randomUUID().slice(0, 8);
 
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      // Security headers (применяются ко всем /api/* ответам).
-      'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
-      'X-Frame-Options': 'DENY',
-      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
-    };
+    // CORS вычисляется для каждого запроса: строгий whitelist вместо '*'.
+    // Same-origin запросы и curl (без Origin) получают пустой набор — для
+    // них CORS-заголовки не нужны. Security-заголовки — в securityHeaders,
+    // они накладываются в jsonResponse на все ответы.
+    const corsHeaders = corsHeadersFor(request, env);
+
+    // ── Анти-DoS: быстрый отсев огромных тел по Content-Length ──
+    // Полный контроль (в т.ч. chunked-запросов без Content-Length) — в
+    // readJsonBody() при фактическом чтении каждого обработчиком.
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+      const len = Number(request.headers.get('content-length') || 0);
+      if (len > MAX_BODY_BYTES) {
+        return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+      }
+    }
 
     if (method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      // Preflight: отвечаем с CORS-заголовками только разрешённым origin'ам.
+      const headers = { ...securityHeaders, ...corsHeaders };
+      return new Response(null, { status: 204, headers });
     }
 
     // Логирование производительности D1: привязываем общий logger к запросу.
@@ -229,6 +372,9 @@ export default {
       if (path === '/api/owner/logout' && method === 'POST') {
         return await handleOwnerLogout(request, env, corsHeaders);
       }
+      if (path === '/api/owner/status' && method === 'GET') {
+        return await handleOwnerStatus(request, env, corsHeaders);
+      }
       if (path === '/api/invite/verify' && method === 'POST') {
         return await handleInviteVerify(request, env, corsHeaders);
       }
@@ -259,8 +405,12 @@ export default {
       store._logger.flush(`${method} ${path}`);
       return jsonResponse({ error: 'Not Found' }, corsHeaders, 404);
     } catch (e) {
+      // Детали исключения — ТОЛЬКО в логи (wrangler tail / Dashboard), клиенту
+      // уходит generic-сообщение: e.message может раскрывать устройство системы
+      // (SQL, имена таблиц, пути). requestId позволяет найти запись в логах.
+      console.error('[api] unhandled error requestId=' + requestId + ':', e && (e.stack || e.message));
       store._logger.flush(`${method} ${path} (error)`);
-      return jsonResponse({ error: e.message }, corsHeaders, 500);
+      return jsonResponse({ error: 'Internal Server Error', requestId }, corsHeaders, 500);
     } finally {
       currentCtx = null;
     }
@@ -283,7 +433,8 @@ export default {
 // Модель доступа:
 //   reader  — аноним, группа из query/body. Только GET.
 //   writer  — есть валидный token (inv:{token} в KV). POST/PUT/DELETE.
-//   owner   — token === env.OWNER_CODE. writer + управление приглашениями.
+//   owner   — token совпал с env.OWNER_CODE (constant-time, timingSafeEqualStr).
+//             writer + управление приглашениями.
 //
 // Token'ы приглашений — случайные 32-символьные строки (crypto.randomUUID
 // без дефисов). Хранятся в KV: inv:{token} -> { group, createdAt, label? }.
@@ -293,7 +444,7 @@ const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
 
 // Возвращает { group, role: 'owner'|'writer' } или null.
 //   - Authorization: Bearer <token>:
-//     * token === env.OWNER_CODE → owner (group из query/body)
+//     * token совпал с env.OWNER_CODE (constant-time сравнение, timingSafeEqualStr) → owner (group из query/body)
 //     * inv:{token} в KV → writer (group из записи)
 //     * иначе null
 //   - без заголовка, но с валидной HttpOnly-cookie owner_code → owner (viaCookie).
@@ -370,10 +521,11 @@ async function groupFromBodyOrQuery(request) {
       const url = new URL(request.url);
       return normalizeGroup(url.searchParams.get('group'));
     }
-    // clone, чтобы обработчик ниже тоже мог звать .json()
+    // clone, чтобы обработчик ниже тоже мог звать readJsonBody()
     const clone = request.clone();
-    const body = await clone.json().catch(() => ({}));
-    return normalizeGroup(body.group) || null;
+    const bb = await readJsonBody(clone);
+    if (!bb.ok) return null;
+    return normalizeGroup(bb.json.group) || null;
   } catch {
     return null;
   }
@@ -422,11 +574,14 @@ async function handleInviteCreate(request, env, corsHeaders) {
     return jsonResponse({ error: 'Forbidden: only owner can create invites' }, corsHeaders, 403);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   let group = normalizeGroup(body.group);
 
   // owner может создавать приглашения для любой группы.
-  if (!group) {
+  if (!group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
@@ -450,15 +605,18 @@ async function handleInviteCreate(request, env, corsHeaders) {
 
   // Формируем ссылку. ORIGIN — origin текущего запроса (та же Workers-домена).
   // При желании можно задать env.INVITE_ORIGIN для канонической ссылки.
+  // Токен кладём в hash-фрагмент (#invite=), а не в query (?token=), чтобы он
+  // не попадал в серверные логи, историю переходов и кэши. Старые ссылки
+  // с ?token= фронтенд по-прежнему понимает (см. consumeInviteTokenFromUrl).
   const origin = env.INVITE_ORIGIN || new URL(request.url).origin;
-  const link = `${origin}/?token=${token}`;
+  const link = `${origin}/#invite=${token}`;
 
   return jsonResponse({ ok: true, link, id, token }, corsHeaders);
 }
 
 // POST /api/owner/login
-// Body: { code }. Публичный (без Bearer). Если code === env.OWNER_CODE
-// (постоянное по времени сравнение) — ставит HttpOnly-куку owner_code и
+// Body: { code }. Публичный (без Bearer). Если code совпал с env.OWNER_CODE
+// (constant-time сравнение, timingSafeEqualStr) — ставит HttpOnly-куку owner_code и
 // возвращает { ok: true }. Иначе 403. Cookie не видна JavaScript'у, но
 // прикрепляется браузером к каждому запросу на этот же сайт — роль owner
 // восстанавливается автоматически.
@@ -470,7 +628,10 @@ async function handleOwnerLogin(request, env, corsHeaders) {
     return jsonResponse({ error: 'OWNER_CODE not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const code = (body.code || '').toString();
   if (!code || !timingSafeEqualStr(code, env.OWNER_CODE)) {
     return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
@@ -480,6 +641,7 @@ async function handleOwnerLogin(request, env, corsHeaders) {
   // больше не раскрывает секрет владельца и не даёт вечной компрометации.
   const ownerHash = await getOwnerCodeHash(env);
   const headers = {
+    ...securityHeaders,
     ...corsHeaders,
     'Content-Type': 'application/json',
     // HttpOnly — код недоступен JS (закрывает XSS-кражу из localStorage/URL).
@@ -489,10 +651,34 @@ async function handleOwnerLogin(request, env, corsHeaders) {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
 }
 
+// GET /api/owner/status
+// Публичный. Лёгкая проверка роли owner: возвращает { isOwner } по
+// HttpOnly-cookie owner_code (или Authorization: Bearer <OWNER_CODE>).
+// D1 НЕ трогает — только постоянновременное сравнение хэша куки.
+// Нужен фронтенду, чтобы восстановить права владельца после перезагрузки,
+// даже когда /api/bootstrap пропускается из-за тёплых клиентских кешей.
+// Ответ всегда приватный: он зависит от пользователя и не должен попадать
+// ни в браузерный, ни в CDN-кеш.
+async function handleOwnerStatus(request, env, corsHeaders) {
+  const authHeader = request.headers.get('Authorization');
+  const viaBearer = !!(env.OWNER_CODE &&
+    authHeader && authHeader.startsWith('Bearer ') &&
+    timingSafeEqualStr(authHeader.slice(7).trim(), env.OWNER_CODE));
+  const isOwner = viaBearer || await ownerFromCookie(request, env);
+  const headers = {
+    ...securityHeaders,
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Cache-Control': 'private, no-store',
+  };
+  return new Response(JSON.stringify({ isOwner: !!isOwner }), { status: 200, headers });
+}
+
 // POST /api/owner/logout
 // Публичный. Удаляет куку owner_code. Роль owner сбрасывается в браузере.
 async function handleOwnerLogout(request, env, corsHeaders) {
   const headers = {
+    ...securityHeaders,
     ...corsHeaders,
     'Content-Type': 'application/json',
     'Set-Cookie': `${OWNER_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
@@ -508,7 +694,10 @@ async function handleInviteVerify(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const token = (body.token || '').toString().trim();
   if (!token) {
     return jsonResponse({ error: 'Missing token' }, corsHeaders, 400);
@@ -537,7 +726,7 @@ async function handleInviteList(request, env, corsHeaders) {
 
   const url = new URL(request.url);
   const group = normalizeGroup(url.searchParams.get('group'));
-  if (!group) {
+  if (!group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
@@ -568,7 +757,7 @@ async function handleInviteDelete(request, env, corsHeaders) {
   const url = new URL(request.url);
   const id = (url.searchParams.get('id') || '').toString().trim();
   const group = normalizeGroup(url.searchParams.get('group'));
-  if (!id || !group) {
+  if (!id || !group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
@@ -609,10 +798,13 @@ async function handleInviteRename(request, env, corsHeaders) {
     return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const id = (body.id || '').toString().trim();
   const group = normalizeGroup(body.group);
-  if (!id || !group) {
+  if (!id || !group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
@@ -683,8 +875,15 @@ async function getOwnerCodeHash(env) {
 
 async function handleGetSchedule(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
   const weekCode = url.searchParams.get('week');
+
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
+  if (weekCode && !isValidWeekCode(weekCode)) {
+    return jsonResponse({ error: 'Invalid week parameter' }, corsHeaders, 400);
+  }
 
   const store = createStore(env);
   if (!env.DB) {
@@ -693,7 +892,11 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
   if (weekCode) {
     const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
-    if (data) return jsonResponse(data, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
+    if (data) {
+      const cc = await cacheControlForGet(request, env);
+      const finalCc = cc === CC_READER_GET ? CC_READER_GET_WEEKS : cc;
+      return jsonResponse(data, corsHeaders, 200, { cacheControl: finalCc, isPrivate: await isAuthRequest(request, env) });
+    }
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
 
@@ -704,7 +907,11 @@ async function handleGetSchedule(request, env, corsHeaders) {
 
 async function handleGetWeeks(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
+
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
 
   const store = createStore(env);
   if (!env.DB) {
@@ -723,11 +930,16 @@ async function handleGetWeeks(request, env, corsHeaders) {
 
 async function handleGetSchedules(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
   const weeksParam = url.searchParams.get('weeks') || '';
   const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
 
-  if (weeks.length === 0) {
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
+  // Отбрасываем мусорные weekCode (защита от cachebusting CDN-кэша).
+  const validWeeks = weeks.filter((w) => isValidWeekCode(w));
+  if (validWeeks.length === 0) {
     return jsonResponse({ error: 'Missing weeks parameter' }, corsHeaders, 400);
   }
 
@@ -736,7 +948,7 @@ async function handleGetSchedules(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const keys = weeks.map((w) => `schedule:${group}:${w}`);
+  const keys = validWeeks.map((w) => `schedule:${group}:${w}`);
   const { entries } = await store.getMany(keys, { type: 'json' });
 
   const result = {};
@@ -747,7 +959,9 @@ async function handleGetSchedules(request, env, corsHeaders) {
     result[weekCode] = e.value;
   }
 
-  return jsonResponse(result, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
+  const cc = await cacheControlForGet(request, env);
+  const finalCc = cc === CC_READER_GET ? CC_READER_GET_WEEKS : cc;
+  return jsonResponse(result, corsHeaders, 200, { cacheControl: finalCc, isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── GET /api/bootstrap?group=...&weeks=w1,w2,... ────────────────
@@ -774,9 +988,15 @@ async function handleGetSchedules(request, env, corsHeaders) {
 
 async function handleBootstrap(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
   const weeksParam = url.searchParams.get('weeks') || '';
   const weeks = weeksParam.split(',').map((s) => s.trim()).filter(Boolean);
+
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
+  // Отбрасываем мусорные weekCode (защита от cachebusting CDN-кэша).
+  const validWeeks = weeks.filter((w) => isValidWeekCode(w));
 
   const store = createStore(env);
   if (!env.DB) {
@@ -792,7 +1012,7 @@ async function handleBootstrap(request, env, corsHeaders) {
   // Одним batch-запросом читаем все ключи: weeks, hw, subjects,
   // campus-updated и расписания. Один round-trip к D1 вместо 5.
   const semester = currentSemesterKey();
-  const schedKeys = weeks.map((w) => `schedule:${group}:${w}`);
+  const schedKeys = validWeeks.map((w) => `schedule:${group}:${w}`);
   const items = [
     { key: `weeks:${group}`, type: 'json' },
     { key: `hw:${group}`, type: 'json' },
@@ -803,20 +1023,25 @@ async function handleBootstrap(request, env, corsHeaders) {
   const [weeksData, hwData, subjectsData, campusUpdatedAt, ...schedValues] = await store.batchGet(items);
 
   const schedules = {};
-  for (let i = 0; i < weeks.length; i++) {
+  for (let i = 0; i < validWeeks.length; i++) {
     if (schedValues[i] != null) {
-      schedules[weeks[i]] = schedValues[i];
+      schedules[validWeeks[i]] = schedValues[i];
     }
   }
 
+  const baseCc = await cacheControlForGet(request, env);
+  // Базовый /api/bootstrap?group= (без weeks) инвалидируется purge точно,
+  // поэтому его TTL не трогаем. С weeks= — комбинации не перечислить, см.
+  // CC_READER_GET_WEEKS (60 с).
+  const finalCc = (validWeeks.length > 0 && baseCc === CC_READER_GET) ? CC_READER_GET_WEEKS : baseCc;
   return jsonResponse({
     weeks: weeksData || [],
     schedules,
     hw: hwData || [],
     subjects: subjectsData || [],
-    campusUpdatedAt: campusUpdatedAt || '',
+    campusUpdatedAt: parseCampusMeta(campusUpdatedAt)?.campusUpdatedAt || '',
     isOwner,
-  }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate });
+  }, corsHeaders, 200, { cacheControl: finalCc, isPrivate });
 }
 // Frontend парсит campus.syktsu.ru в браузере и отправляет сюда на сохранение
 
@@ -826,13 +1051,16 @@ async function handleUpload(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json();
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { type } = body;
 
   if (type === 'weeks') {
     const { group: _group, weeks } = body;
     const group = normalizeGroup(_group);
-    if (!group || !weeks) {
+    if (!group || !isValidGroup(group) || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
     const cleanWeeks = sanitizeWeeks(weeks);
@@ -847,7 +1075,7 @@ async function handleUpload(request, env, corsHeaders) {
   if (type === 'schedule') {
     const { group: _group, weekCode, data } = body;
     const group = normalizeGroup(_group);
-    if (!group || !data) {
+    if (!group || !isValidGroup(group) || !data) {
       return jsonResponse({ error: 'Missing group or data' }, corsHeaders, 400);
     }
     const cleanData = sanitizeScheduleData(data);
@@ -855,10 +1083,15 @@ async function handleUpload(request, env, corsHeaders) {
       return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
     }
     const cleanWeekCode = sanitizeString(weekCode, 60);
+    if (cleanWeekCode && !isValidWeekCode(cleanWeekCode)) {
+      return jsonResponse({ error: 'Invalid weekCode' }, corsHeaders, 400);
+    }
     const key = cleanWeekCode ? `schedule:${group}:${cleanWeekCode}` : `schedule:${group}:current`;
     await store.put(key, JSON.stringify(cleanData), { expirationTtl: 21600000 });
 
-    await store.put('sync:meta', JSON.stringify({
+    const prevMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
+    await store.put(`campus-updated:${group}`, JSON.stringify({
+      campusUpdatedAt: prevMeta?.campusUpdatedAt || null,
       lastSync: new Date().toISOString(),
       lastWeek: cleanWeekCode || 'current',
     }), { expirationTtl: 21600000 });
@@ -869,13 +1102,15 @@ async function handleUpload(request, env, corsHeaders) {
       console.log('subjects update skipped:', e.message);
     }
 
+    await purgeGroupCdnCache(env, group, cleanWeekCode ? [cleanWeekCode] : ['current']);
+
     return jsonResponse({ ok: true, type: 'schedule', group, weekCode: cleanWeekCode }, corsHeaders);
   }
 
   if (type === 'schedule-batch') {
     const { group: _group, schedules } = body;
     const group = normalizeGroup(_group);
-    if (!group || !Array.isArray(schedules)) {
+    if (!group || !isValidGroup(group) || !Array.isArray(schedules)) {
       return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
     }
 
@@ -887,7 +1122,7 @@ async function handleUpload(request, env, corsHeaders) {
       if (!weekCode || !data) continue;
       const cleanWeekCode = sanitizeString(weekCode, 60);
       const cleanData = sanitizeScheduleData(data);
-      if (!cleanWeekCode || !cleanData) continue;
+      if (!cleanWeekCode || !isValidWeekCode(cleanWeekCode) || !cleanData) continue;
       validWeekCodes.push(cleanWeekCode);
 
       const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
@@ -925,12 +1160,14 @@ async function handleUpload(request, env, corsHeaders) {
       console.log('reaggregateSubjects skipped:', e.message);
     }
 
-    await store.put('sync:meta', JSON.stringify({
+    const prevMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
+    await store.put(`campus-updated:${group}`, JSON.stringify({
+      campusUpdatedAt: prevMeta?.campusUpdatedAt || null,
       lastSync: new Date().toISOString(),
       lastWeek: 'batch',
     }), { expirationTtl: 21600000 });
 
-    await purgeGroupCdnCache(env, group);
+    await purgeGroupCdnCache(env, group, updated);
 
     return jsonResponse({
       ok: true,
@@ -960,26 +1197,30 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { group: _group, campusUpdatedAt } = body;
   const group = normalizeGroup(_group);
 
-  if (!group) {
+  if (!group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
-  const stored = await store.get(`campus-updated:${group}`);
-  const needUpdate = !stored || stored !== (campusUpdatedAt || '');
+  const stored = parseCampusMeta(await store.get(`campus-updated:${group}`));
+  const needUpdate = !stored || stored.campusUpdatedAt !== (campusUpdatedAt || '');
 
-  // Обновляем lastSync при каждом вызове 🔄, даже если изменений нет
-  const meta = await store.get('sync:meta', { type: 'json' });
-  await store.put('sync:meta', JSON.stringify({
+  // Обновляем lastSync при каждом вызове 🔄, даже если изменений нет.
+  // Мета группы изолирована по ключу `campus-updated:{group}` — параллельные
+  // вызовы для разных групп не затирают друг друга (раньше был общий sync:meta).
+  await store.put(`campus-updated:${group}`, JSON.stringify({
+    campusUpdatedAt: stored?.campusUpdatedAt || null,
     lastSync: new Date().toISOString(),
-    lastWeek: meta?.lastWeek || 'check',
-    campusUpdatedAt: meta?.campusUpdatedAt || null,
+    lastWeek: stored?.lastWeek || 'check',
   }), { expirationTtl: 21600000 });
 
-  return jsonResponse({ needUpdate, stored: stored || null }, corsHeaders);
+  return jsonResponse({ needUpdate, stored: stored?.campusUpdatedAt || null }, corsHeaders);
 }
 
 // ── POST /api/sync-from-campus ───────────────────────────────
@@ -996,11 +1237,14 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { group: _group, campusUpdatedAt, schedules } = body;
   const group = normalizeGroup(_group);
 
-  if (!group || !Array.isArray(schedules)) {
+  if (!group || !isValidGroup(group) || !Array.isArray(schedules)) {
     return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
   }
 
@@ -1012,7 +1256,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     if (!weekCode || !data) continue;
     const cleanWeekCode = sanitizeString(weekCode, 60);
     const cleanData = sanitizeScheduleData(data);
-    if (!cleanWeekCode || !cleanData) continue;
+    if (!cleanWeekCode || !isValidWeekCode(cleanWeekCode) || !cleanData) continue;
 
     const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
     const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
@@ -1063,13 +1307,9 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
       console.log('reaggregateSubjects skipped:', e.message);
     }
 
-    // Записываем дату обновления кампуса ТОЛЬКО если реально изменилось
-    // расписание (updated.length > 0). Если кампус обновил мета-дату, но
-    // содержимое совпадает с нашим кешем — дату не трогаем.
-  const changed = updated.length > 0;
-  if (changed && campusUpdatedAt) {
-    await store.put(`campus-updated:${group}`, campusUpdatedAt, { expirationTtl: 21600000 });
-  }
+    // Мета группы (campus-updated:{group}) записывается ОДИН раз ниже,
+    // после пересчёта ДЗ: campusUpdatedAt обновляем только при реальном
+    // изменении расписания (updated.length > 0), иначе сохраняем прежнее.
 
   // Пересчёт ДЗ с dueMode='nextPair' — расписание могло измениться
   let hwResult = null;
@@ -1089,10 +1329,16 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     console.log('subjects read skipped:', e.message);
   }
 
-  await store.put('sync:meta', JSON.stringify({
+  // Единая мета-запись группы (вариант А): дату обновления кампуса
+  // обновляем только если расписание реально изменилось (updated.length > 0)
+  // и прислана новая дата; иначе сохраняем ПРЕЖНЕЕ значение — не стираем,
+  // чтобы индикатор «Расписание обновлено …» не терял данные.
+  const changed = updated.length > 0;
+  const prevCampusMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
+  await store.put(`campus-updated:${group}`, JSON.stringify({
+    campusUpdatedAt: (changed && campusUpdatedAt) ? campusUpdatedAt : (prevCampusMeta?.campusUpdatedAt || null),
     lastSync: new Date().toISOString(),
     lastWeek: 'batch',
-    campusUpdatedAt: changed ? (campusUpdatedAt || null) : null,
   }), { expirationTtl: 21600000 });
 
   // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
@@ -1105,7 +1351,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     }
   }
 
-  await purgeGroupCdnCache(env, group);
+  await purgeGroupCdnCache(env, group, updated);
 
   return jsonResponse({
     ok: true,
@@ -1127,7 +1373,11 @@ async function handleGetHw(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
+
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
 
   const data = await store.get(`hw:${group}`, { type: 'json' });
   // hw содержит данные всех студентов группы — кешируем для reader'ов на 30с.
@@ -1145,11 +1395,14 @@ async function handleAddHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json();
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { group: _group, subject, task, dueDate, dueMode, pairType, author, subgroup } = body;
   const group = normalizeGroup(_group);
 
-  if (!group || !subject) {
+  if (!group || !isValidGroup(group) || !subject) {
     return jsonResponse({ error: 'Missing group or subject' }, corsHeaders, 400);
   }
 
@@ -1160,7 +1413,7 @@ async function handleAddHw(request, env, corsHeaders) {
   const clean = sanitizeHwFields(body);
 
   const item = {
-    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    id: crypto.randomUUID().replace(/-/g, ''),
     subject: clean.subject || '',
     pairType: clean.pairType || 'any',
     subgroup: clean.subgroup || 'any',
@@ -1199,11 +1452,14 @@ async function handleUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json();
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { id, group: _group } = body;
   const group = normalizeGroup(_group);
 
-  if (!id || !group) {
+  if (!id || !group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
@@ -1255,11 +1511,14 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json();
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { group: _group, updates } = body;
   const group = normalizeGroup(_group);
 
-  if (!group || !Array.isArray(updates) || updates.length === 0) {
+  if (!group || !isValidGroup(group) || !Array.isArray(updates) || updates.length === 0) {
     return jsonResponse({ error: 'Missing group or updates' }, corsHeaders, 400);
   }
 
@@ -1324,7 +1583,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   const id = url.searchParams.get('id');
   const group = normalizeGroup(url.searchParams.get('group'));
 
-  if (!id || !group) {
+  if (!id || !group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
@@ -1353,20 +1612,18 @@ async function handleGetSubjects(request, env, corsHeaders) {
   }
 
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
   const semester = currentSemesterKey();
 
-  const key = `subjects:${group}:${semester}`;
-  let data = await store.get(key, { type: 'json' });
-
-  if (!data || data.length === 0 || (data[0] && !('subgroups' in data[0]))) {
-    try {
-      await updateSubjectsForCurrentSemester(env, group);
-      data = await store.get(key, { type: 'json' });
-    } catch (e) {
-      console.log('subjects auto-recompute failed:', e.message);
-    }
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
   }
+
+  const key = `subjects:${group}:${semester}`;
+  // GET не пишет в D1. Пересборка предметов выполняется только на write-путях
+  // (POST /api/upload, sync-from-campus). Фронт при пустом списке собирает
+  // предметы из расписания текущей недели (fallback в app.js).
+  const data = await store.get(key, { type: 'json' });
 
   return jsonResponse({ semester, subjects: data || [] }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
@@ -1380,10 +1637,13 @@ async function handlePutSubjects(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json();
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const { group: _group, subjects, semester } = body;
   const group = normalizeGroup(_group);
-  if (!group || !Array.isArray(subjects)) {
+  if (!group || !isValidGroup(group) || !Array.isArray(subjects)) {
     return jsonResponse({ error: 'Missing group or subjects' }, corsHeaders, 400);
   }
 
@@ -1405,10 +1665,12 @@ async function handleRecalcHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   }
 
-  const body = await request.json().catch(() => ({}));
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  const body = bb.ok ? bb.json : {};
   const group = normalizeGroup(body.group);
 
-  if (!group) {
+  if (!group || !isValidGroup(group)) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
@@ -1543,6 +1805,7 @@ async function reaggregateSubjects(env, group, semester) {
 // чтобы не делать N последовательных put в цикле синхронизации.
 function addSubjectsFromWeekStmt(env, group, weekCode, weekData) {
   if (!weekCode || !weekData || !weekData.days) return null;
+  if (!isValidWeekCode(weekCode)) return null;
 
   const semester = semesterFromWeekDates(weekData.weekStart, weekData.weekEnd)
     || currentSemesterKey();
@@ -1557,9 +1820,10 @@ function addSubjectsFromWeekStmt(env, group, weekCode, weekData) {
 }
 
 // ── Полная пересборка предметов текущего семестра ──
-// Используется в редких случаях (одиночный schedule-upload, миграция старых
-// данных при GET). Пересчитывает недельные вклады всех расписаний семестра
-// и пересобирает агрегат. Горячий путь синхронизации им не пользуется.
+// Используется в редких случаях (одиночный schedule-upload). Пересчитывает
+// недельные вклады всех расписаний семестра и пересобирает агрегат.
+// Вызывается ТОЛЬКО из writer-путей. Горячий путь синхронизации (batch)
+// использует инкрементальные addSubjectsFromWeekStmt + reaggregateSubjects.
 
 async function updateSubjectsForCurrentSemester(env, group) {
   const store = createStore(env);
@@ -1574,6 +1838,7 @@ async function updateSubjectsForCurrentSemester(env, group) {
   for (const { key, value: data } of entries) {
     const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
+    if (!isValidWeekCode(weekValue)) continue;
     if (!data || !data.days) continue;
     if (semesterFromWeekDates(data.weekStart, data.weekEnd) !== semester) continue;
 
@@ -1608,6 +1873,7 @@ async function recalcHomeworkForGroup(env, group) {
   for (const { key, value: data } of entries) {
     const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
+    if (!isValidWeekCode(weekValue)) continue;
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1693,6 +1959,7 @@ async function computeNextPairDate(env, group, subject, pairType, fromDate = new
   for (const { key, value: data } of entries) {
     const weekValue = key.split(`schedule:${group}:`)[1];
     if (!weekValue || weekValue === 'current') continue;
+    if (!isValidWeekCode(weekValue)) continue;
     if (data && data.days && data.weekStart) {
       const startDate = parseDateLocal(data.weekStart);
       if (startDate) weekData.push({ startDate, data });
@@ -1714,19 +1981,17 @@ async function handleStatus(request, env, corsHeaders) {
 
   const url = new URL(request.url);
   const group = normalizeGroup(url.searchParams.get('group'));
-
-  const meta = await store.get('sync:meta', { type: 'json' });
-
-  let campusUpdatedAt = meta?.campusUpdatedAt || null;
-  if (group && !campusUpdatedAt) {
-    campusUpdatedAt = await store.get(`campus-updated:${group}`);
+  if (group && !isValidGroup(group)) {
+    return jsonResponse({ db: true, error: 'Invalid group' }, corsHeaders, 400);
   }
+
+  const meta = group ? parseCampusMeta(await store.get(`campus-updated:${group}`)) : null;
 
   return jsonResponse({
     db: true,
     lastSync: meta?.lastSync || null,
     lastWeek: meta?.lastWeek || null,
-    campusUpdatedAt: campusUpdatedAt || null,
+    campusUpdatedAt: meta?.campusUpdatedAt || null,
   }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
 }
 
@@ -1739,6 +2004,10 @@ async function handleStatus(request, env, corsHeaders) {
 //   - writer (есть Authorization): private, no-store                  (приватность)
 // Варьируем по Authorization, чтобы CDN не смешивал кеши reader/writer.
 const CC_READER_GET  = 'public, max-age=60, s-maxage=300';
+// Для ответов с неделями (/api/schedules, /api/bootstrap?weeks=, /api/schedule?week=):
+// комбинаций weeks= бесконечно много, purge по точному URL невозможен,
+// поэтому сокращаем срок жизни в CDN до 60 с — окно устаревания ≤ 1 мин.
+const CC_READER_GET_WEEKS = 'public, max-age=60, s-maxage=60';
 const CC_WRITER_GET  = 'private, no-store';
 const CC_NO_STORE    = 'no-store';
 
@@ -1766,7 +2035,12 @@ async function isAuthRequest(request, env) {
 // текущего запроса после успешной записи.
 // Очищаем только ключи без Authorization (reader-кеш); writer-ответы и так
 // private, no-store, не кешируются CDN'ом.
-async function purgeGroupCdnCache(env, group) {
+// changedWeeks — weekCode, которые реально записали: для них дополнительно
+// удаляем точные ключи /api/schedule?week=. Комбинации /api/schedules?weeks=
+// и /api/bootstrap?weeks= перечислить нельзя (Cache API удаляет только по
+// точному URL, keys() нет) — их свежесть обеспечивает короткий s-maxage
+// (CC_READER_GET_WEEKS, 60 с) на этих эндпоинтах.
+async function purgeGroupCdnCache(env, group, changedWeeks = []) {
   try {
     if (typeof caches === 'undefined' || !caches.default) return;
     const cache = caches.default;
@@ -1780,6 +2054,9 @@ async function purgeGroupCdnCache(env, group) {
       `/api/status?group=${encodeURIComponent(group)}`,
       `/api/bootstrap?group=${encodeURIComponent(group)}`,
     ];
+    for (const w of changedWeeks || []) {
+      paths.push(`/api/schedule?group=${encodeURIComponent(group)}&week=${encodeURIComponent(w)}`);
+    }
     await Promise.all(
       paths.map((p) =>
         cache.delete(new URL(p, base).toString(), { ignoreMethod: true }).catch(() => {})
@@ -1823,6 +2100,10 @@ async function cachedGet(request, env, corsHeaders, builder) {
       if (hit) {
         const h = new Headers(hit.headers);
         h.set('CF-Cache-Status', 'HIT');
+        // В кэше могут лежать ответы со старыми CORS-заголовками (в т.ч. "*"),
+        // поэтому CORS всегда пересчитывается для текущего запроса.
+        stripCorsHeaders(h);
+        for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
         return new Response(hit.body, { status: hit.status, headers: h });
       }
     } catch (_) {
@@ -1837,9 +2118,15 @@ async function cachedGet(request, env, corsHeaders, builder) {
     try {
       const h = new Headers(resp.headers);
       h.set('CF-Cache-Status', 'MISS');
-      const toStore = new Response(resp.body, { status: resp.status, headers: h });
-      // Клонируем для ответа клиенту и для записи в кеш (тело можно прочесть 1 раз).
-      const forClient = toStore.clone();
+      // Кэш хранит ответ БЕЗ CORS-заголовков (они зависят от Origin запроса);
+      // при отдаче из кэша (HIT) они накладываются заново. Тело дублируем
+      // через tee: один поток клиенту (с CORS), второй — в кэш (без CORS).
+      const [clientBody, cacheBody] = resp.body.tee();
+      const forClient = new Response(clientBody, { status: resp.status, headers: h });
+      const toStore = new Response(cacheBody, {
+        status: resp.status,
+        headers: stripCorsHeaders(new Headers(h)),
+      });
       if (typeof currentCtx !== 'undefined' && currentCtx && currentCtx.waitUntil) {
         currentCtx.waitUntil(cache.put(cacheKey, toStore).catch(() => {}));
       } else {
@@ -1855,7 +2142,7 @@ async function cachedGet(request, env, corsHeaders, builder) {
 }
 
 function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
-  const headers = { ...corsHeaders, 'Content-Type': 'application/json' };
+  const headers = { ...securityHeaders, ...corsHeaders, 'Content-Type': 'application/json' };
   if (opts.cacheControl) {
     headers['Cache-Control'] = opts.cacheControl;
     // Vary: Authorization ставим ТОЛЬКО для writer/owner-ответов (private),
@@ -1884,6 +2171,11 @@ function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
 
 const TG_API_BASE = 'https://api.telegram.org';
 
+function maskChatId(id) {
+  const s = String(id);
+  return s.length <= 4 ? '***' : '***' + s.slice(-4);
+}
+
 async function tgApi(env, method, payload) {
   const token = env.TELEGRAM_BOT_TOKEN;
   if (!token) {
@@ -1891,7 +2183,7 @@ async function tgApi(env, method, payload) {
     return { ok: false, skipped: true, reason: 'no-token' };
   }
   try {
-    console.log('[tg] tgApi ->', method, 'chat_id=', payload && payload.chat_id, 'textLen=', payload && payload.text ? payload.text.length : 0);
+    console.log('[tg] tgApi ->', method, 'chat_id=', maskChatId(payload && payload.chat_id), 'textLen=', payload && payload.text ? payload.text.length : 0);
       const resp = await fetch(`${TG_API_BASE}/bot${token}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1903,7 +2195,7 @@ async function tgApi(env, method, payload) {
       console.log('[tg] tgApi', method, 'failed: status=', resp.status, 'body=', JSON.stringify(data).slice(0, 300));
       return { ok: false, error: data };
     }
-    console.log('[tg] tgApi', method, 'ok: chat_id=', payload && payload.chat_id);
+    console.log('[tg] tgApi', method, 'ok: chat_id=', maskChatId(payload && payload.chat_id));
     return { ok: true, result: data.result };
   } catch (e) {
     console.log('[tg] tgApi', method, 'exception:', e.name, e.message);
@@ -1991,7 +2283,7 @@ async function notifyGroup(env, group, text, opts = {}) {
   for (const sub of subs) {
     for (const c of chunks) {
       await sendTgRichMessage(env, sub.chatId, c, { parseMode: opts.parseMode || 'HTML' });
-      console.log('[tg] notifyGroup: send to', sub.chatId, 'ok');
+      console.log('[tg] notifyGroup: send to', maskChatId(sub.chatId), 'ok');
     }
   }
 }
@@ -2159,7 +2451,9 @@ async function handleTgWebhook(request, env) {
   }
 
   let update;
-  try { update = await request.json(); } catch { return new Response('ok', { status: 200 }); }
+  const wb = await readJsonBody(request);
+  if (!wb.ok) return new Response('ok', { status: 200 });
+  update = wb.json;
 
   // ── Callback query (инлайн-кнопки выбора подгруппы) ──
   if (update.callback_query) {
@@ -2171,7 +2465,7 @@ async function handleTgWebhook(request, env) {
     if (cbMatch && chatId) {
       const subgroup = cbMatch[1] === 'any' ? 'any' : cbMatch[1];
       const group = normalizeGroup(cbMatch[2]);
-      if (group) {
+      if (group && isValidGroup(group)) {
         // Сохраняем подписку + subgroup в tg:subs:{group}
         await addGroupSubscriber(env, group, chatId, subgroup);
         // Обновляем обратный индекс tg:groups:{chatId}
@@ -2236,10 +2530,10 @@ async function handleTgWebhook(request, env) {
     } else if (/^\/sub(@\w+)?\s+(.+)$/i.test(text)) {
       const groupName = RegExp.$2.trim();
       const group = normalizeGroup(groupName);
-      if (!group) {
+      if (!group || !isValidGroup(group)) {
         await tgApi(env, 'sendMessage', {
           chat_id: chatId,
-          text: '❌ Не удалось распознать название группы. Проверь и попробуй ещё раз.',
+          text: '❌ Не удалось распознать название группы. Проверь формат (например: /sub 131-ИБо) и попробуй ещё раз.',
         });
         return new Response('ok', { status: 200 });
       }
@@ -2339,8 +2633,11 @@ async function handleTgStatus(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
   const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group') || env.DEFAULT_GROUP || '131-ИБо');
+  const group = normalizeGroup(url.searchParams.get('group'));
   const chatId = url.searchParams.get('chatId') || '';
+  if (!isValidGroup(group)) {
+    return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
+  }
   const subs = await getGroupSubscribers(env, group);
   const existing = chatId ? subs.find(s => String(s.chatId) === String(chatId)) : null;
   return jsonResponse({
