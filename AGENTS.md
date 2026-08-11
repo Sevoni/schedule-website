@@ -105,9 +105,18 @@ All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 
 - **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `owner_code` cookie (30 days, `Secure; SameSite=Lax`). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend restores `ownerRole` on every load via a lightweight `GET /api/owner/status` (computed from the cookie server-side, no D1) — this runs at the start of `loadData()` because the cache-only fast path (warm localStorage caches) skips `/api/bootstrap` entirely. `isOwner` is also returned in `/api/bootstrap`. Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
 - **Owner logout**: `POST /api/owner/logout` → clears the cookie (button in settings «Ваша роль»).
-- **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` on load → `becomeOwner()` → `POST /api/owner/login`.
-- **Invite link**: new links use hash fragment `#invite=<token>` (avoids server logs/history/caches); legacy `?token=<invToken>` still parsed. Frontend reads it on load, validates via `/api/invite/verify`, saves as writer token. Quirk: the copy-button in the invite list (`copyInviteLink`) still rebuilds `?token=` URLs while the worker returns `#invite=` — both work, don't "fix" either side.
+- **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` (legacy) or `#owner=<OWNER_CODE>` (new links, hash not logged) on load → `becomeOwner()` → `POST /api/owner/login`.
+- **Invite link**: new links use hash fragment `#invite=<token>` (avoids server logs/history/caches); legacy `?token=<invToken>` still parsed. Frontend reads it on load, validates via `/api/invite/verify`, saves as writer token. `copyInviteLink` also builds `#invite=` links — both formats work, legacy `?token=` is accepted for already-distributed links.
 - `INVITE_ORIGIN` (var) — canonical origin for invite links (`https://kampussgu.dpdns.org`).
+
+### CSRF protection (не ломать!)
+
+Two layers on top of cookie-based owner auth (cookie `owner_code` is auto-attached by the browser, incl. same-site form-POST from any `*.dpdns.org` subdomain):
+
+1. **`readJsonBody()` rejects any non-`application/json` Content-Type** (`parseError` → 400). HTML forms can't send JSON, so text/plain JSON-smuggling is dead. All body-reading handlers get this via `readJsonBody` — don't bypass it.
+2. **`csrfGuardForCookieAuth(auth, request, corsHeaders)`** — requires header `X-Requested-With: fetch` when owner role came from cookie (`auth.viaCookie`). Used in `requireWriter` + invite handlers (create/delete/rename — NOT list: it's a read-only GET, no side effects, no CSRF value). Frontend sends this header in `apiPost`/`apiPut`/`apiDelete` (app.js) — keep it there. Bearer-auth (writer/owner via `Authorization`) doesn't need the header. `apiFetch` (GETs) doesn't send it on purpose — keeps preview-domain GETs preflight-free.
+
+Rule: **every new write/owner-powerful endpoint** that can be reached with cookie auth must call `csrfGuardForCookieAuth` after `resolveAuth`, and the frontend call must go through one of the `api*` helpers (they add the header). Public endpoints (`/api/owner/login|logout|status`, `/api/invite/verify`) don't use the guard.
 
 ### D1 key patterns
 

@@ -12,6 +12,7 @@ function fetchTimeout(url, opts = {}) {
 // Удаляет перечисленные ключи из query-строки URL, не трогая остальные.
 // Используется для синхронной зачистки токенов (?token=, ?owner=) из адресной
 // строки сразу после их чтения — до сетевых запросов (безопасность).
+// Hash-токены (#invite=, #owner=) зачищаются через history.replaceState.
 function clearUrlParams(keysToRemove) {
   const params = new URLSearchParams(location.search);
   let changed = false;
@@ -403,11 +404,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const startPageShown = !state.group;
   if (startPageShown) showStartPage();
 
-  // Если в URL есть ?token=... — это переход по ссылке-приглашению.
+  // Если в URL есть ?token= или #invite= — это переход по ссылке-приглашению.
   // Валидируем через бэкенд, при успехе сохраняем токен как writerToken.
   await consumeInviteTokenFromUrl();
 
-  // Если в URL есть ?owner=<code> — сразу пробуем стать владельцем
+  // Если в URL есть ?owner= или #owner= — сразу пробуем стать владельцем
   // (альтернатива ручному вводу кода в настройках).
   await consumeOwnerCodeFromUrl();
 
@@ -483,15 +484,27 @@ async function consumeInviteTokenFromUrl() {
   }
 }
 
-// Проверяет ?owner=<code> в URL, валидирует через бэкенд, сохраняет как
-// owner-токен. Чистит URL. Возвращает true, если успешно стали owner.
+// Проверяет ?owner=<code> (или #owner=<code>) в URL, валидирует через бэкенд,
+// сохраняет как owner-токен. Чистит URL. Возвращает true, если успешно стали owner.
+// Поддерживаются оба формата:
+//   - старые/розданные:  /?owner=<code>   (логируется серверами)
+//   - новые:             /#owner=<code>   (hash не попадает в логи серверов)
 async function consumeOwnerCodeFromUrl() {
-  const code = (new URLSearchParams(location.search).get('owner') || '').trim();
+  let code = (new URLSearchParams(location.search).get('owner') || '').trim();
+  let fromHash = false;
+  if (!code) {
+    const hashMatch = (location.hash || '').match(/^#owner=([^&]+)/);
+    if (hashMatch) { code = decodeURIComponent(hashMatch[1]).trim(); fromHash = true; }
+  }
   if (!code) return false;
 
   // Чистим URL ДО сетевой верификации, в любом случае (успех или нет —
   // код не должен висеть в адресной строке ни секунды).
-  clearUrlParams(['owner']);
+  if (fromHash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  } else {
+    clearUrlParams(['owner']);
+  }
 
   const ok = await becomeOwner(code, { silent: false });
   return ok;
@@ -1939,7 +1952,7 @@ async function apiFetch(path, params = {}) {
 }
 
 async function apiPost(path, body) {
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' };
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(state.apiBase + path, {
@@ -1964,7 +1977,7 @@ async function apiDelete(path, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
   }
-  const headers = {};
+  const headers = { 'X-Requested-With': 'fetch' };
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(url.toString(), { method: 'DELETE', headers });
@@ -1981,7 +1994,7 @@ async function apiDelete(path, params = {}) {
 }
 
 async function apiPut(path, body) {
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' };
   const auth = getAuthToken();
   if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(state.apiBase + path, {
@@ -2534,7 +2547,7 @@ function renderDaySchedule(day) {
           }
           const done = doneHwIds.has(hw.id);
           const dueText = (hw.author ? escHtml(hw.author) : '');
-          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание', hw.id)}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
+          return `<div class="pair-hw-item${dc}${done ? ' done' : ''}"><span class="pair-hw-done" data-id="${escHtml(hw.id)}" title="Отметить выполненным"><svg class="icon" style="width:16px;height:16px"><use href="#icon-check"></use></svg></span><span class="pair-hw-task">${hwTaskMarkup(hw.task, 'задание', hw.id)}</span>${dueText ? `<span class="pair-hw-due">${dueText}</span>` : ''}</div>`;
         }).join('') + '</div>';
       }
 
@@ -2552,7 +2565,7 @@ function renderDaySchedule(day) {
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
               ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
-              ${isWriter() ? `<button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${pairTypeCode}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>` : ''}
+              ${isWriter() ? `<button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${escHtml(pairTypeCode)}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>` : ''}
             </div>
           </div>
           <div class="pair-subject">${escHtml(p.subject)}</div>
@@ -2875,7 +2888,7 @@ function mdInline(t) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) => {
-      const u = url.trim();
+      const u = url.trim().replace(/["']/g, '');
       if (/^(https?:\/\/|mailto:|\/|#)/i.test(u)) {
         return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
       }
@@ -3927,8 +3940,8 @@ function renderHomework() {
            ${authorHtml}
          </div>
         <div class="hw-actions">
-            <button class="hw-done" data-id="${hw.id}" title="Отметить выполненным"><svg class="icon" style="width:18px;height:18px"><use href="#icon-check"></use></svg></button>
-            ${isWriter() ? `<button class="hw-edit" data-id="${hw.id}" title="Редактировать"><svg class="icon" style="width:18px;height:18px"><use href="#icon-pencil"></use></svg></button>` : ''}
+            <button class="hw-done" data-id="${escHtml(hw.id)}" title="Отметить выполненным"><svg class="icon" style="width:18px;height:18px"><use href="#icon-check"></use></svg></button>
+            ${isWriter() ? `<button class="hw-edit" data-id="${escHtml(hw.id)}" title="Редактировать"><svg class="icon" style="width:18px;height:18px"><use href="#icon-pencil"></use></svg></button>` : ''}
         </div>
       </div>`;
    }).join('');
@@ -4002,8 +4015,8 @@ setupTgSection._refresh = function () {
 // Видно только когда isWriter(). Содержит:
 //  - кнопку «Создать ссылку-приглашение» (writer и owner)
 //  - список активных ссылок с кнопками «Отозвать»
-// Права владельца (owner) получают ТОЛЬКО через ссылку ?owner=<code>
-// (см. becomeOwner / consumeOwnerCodeFromUrl), ручного ввода в настройках нет.
+// Права владельца (owner) получают через ссылку ?owner=<code> (или #owner=<code>)
+// либо ручным вводом кода в настройках (см. becomeOwner / consumeOwnerCodeFromUrl).
 
 function setupInviteSection() {
   const section = document.getElementById('inviteSection');
@@ -4454,7 +4467,7 @@ function copyInviteLink(el) {
     return;
   }
   const origin = DEFAULT_API.replace(/\/api\/?$/, '').replace(/\/+$/, '');
-  const link = origin + '/?token=' + encodeURIComponent(token);
+  const link = origin + '/#invite=' + encodeURIComponent(token);
 
   function done(ok) {
     if (ok) showToast('Ссылка скопирована', 'ok');
@@ -4559,9 +4572,12 @@ function fallbackCopy(text, done) {
 })();
 
 function escHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str || '';
-  return d.innerHTML;
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Экранирует строку для безопасного использования в CSS-селекторе [data-id="..."].

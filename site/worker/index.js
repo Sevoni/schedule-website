@@ -148,6 +148,14 @@ const MAX_BODY_BYTES = 1024 * 1024; // 1 МБ
 
 async function readJsonBody(request, maxBytes = MAX_BODY_BYTES) {
   if (!request.body) return { ok: true, json: {} };
+  // CSRF-защита (JSON-smuggling): HTML-формы не умеют отправлять
+  // Content-Type: application/json — только urlencoded/multipart/text/plain.
+  // Отбиваем любое тело не-JSON, чтобы text/plain-форма не протащила
+  // валидный JSON без CORS-preflight (enctype="text/plain").
+  const ct = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (ct !== 'application/json') {
+    return { ok: false, parseError: true };
+  }
   const len = Number(request.headers.get('content-length') || 0);
   if (len > maxBytes) return { ok: false, tooLarge: true };
   const reader = request.body.getReader();
@@ -222,7 +230,7 @@ function corsHeadersFor(request, env) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin',
   };
@@ -379,8 +387,8 @@ export default {
         return await handleInviteVerify(request, env, corsHeaders);
       }
       if (path === '/api/invite' && method === 'GET') {
-        const guard = await requireWriter(request, env, corsHeaders);
-        if (guard) return guard;
+        // Read-only: CSRF-заголовок не нужен (нет side-эффектов).
+        // handleInviteList сам проверяет auth.role === 'owner' → 403.
         return await handleInviteList(request, env, corsHeaders);
       }
       if (path === '/api/invite' && method === 'DELETE') {
@@ -531,6 +539,22 @@ async function groupFromBodyOrQuery(request) {
   }
 }
 
+// CSRF-защита для cookie-авторизации (2-й слой поверх Content-Type check):
+// HttpOnly-кука owner_code прикладывается браузером автоматически, в т.ч. к
+// same-site form-POST с поддомена того же registrable-домена (dpdns.org).
+// Кастомный заголовок X-Requested-With форма поставить не может — его шлёт
+// только наш JS (apiPost/apiPut/apiDelete в app.js; apiFetch — только GET,
+// guard для GET не применяется). Если роль owner получена из куки (viaCookie),
+// а заголовка нет — отбиваем 403. Bearer-авторизация заголовка не требует
+// (формы его тоже не умеют слать). Возвращает Response (403) или null (ок).
+function csrfGuardForCookieAuth(auth, request, corsHeaders) {
+  if (auth && auth.role === 'owner' && auth.viaCookie &&
+      request.headers.get('X-Requested-With') !== 'fetch') {
+    return jsonResponse({ error: 'Forbidden: CSRF header required' }, corsHeaders, 403);
+  }
+  return null;
+}
+
 // Возвращает Response 403, если у запрошенного нет прав writer.
 // Иначе возвращает null + значение не используется. Группа берётся из auth
 // (writer) или из query/body (owner). Для reader — 403.
@@ -539,6 +563,8 @@ async function requireWriter(request, env, corsHeaders) {
   if (!auth || (auth.role !== 'writer' && auth.role !== 'owner')) {
     return jsonResponse({ error: 'Forbidden: writer access required' }, corsHeaders, 403);
   }
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
   if (auth.role === 'writer') {
     const targetGroup = await groupFromBodyOrQuery(request);
     if (!targetGroup || auth.group !== targetGroup) {
@@ -573,6 +599,8 @@ async function handleInviteCreate(request, env, corsHeaders) {
   if (!auth || auth.role !== 'owner') {
     return jsonResponse({ error: 'Forbidden: only owner can create invites' }, corsHeaders, 403);
   }
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
 
   const bb = await readJsonBody(request);
   if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
@@ -753,6 +781,8 @@ async function handleInviteDelete(request, env, corsHeaders) {
   if (!auth || auth.role !== 'owner') {
     return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
   }
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
 
   const url = new URL(request.url);
   const id = (url.searchParams.get('id') || '').toString().trim();
@@ -797,6 +827,8 @@ async function handleInviteRename(request, env, corsHeaders) {
   if (!auth || auth.role !== 'owner') {
     return jsonResponse({ error: 'Forbidden: only owner can manage invites' }, corsHeaders, 403);
   }
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
 
   const bb = await readJsonBody(request);
   if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
