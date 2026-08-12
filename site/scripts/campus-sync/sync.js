@@ -10,13 +10,23 @@
 // без кук и JS (проверено). Парсер — порт из frontend/app.js с ослабленными
 // regex под прокси-разметку (перестановка атрибутов, инжекция tr_page).
 //
+// ВАЖНО: translate.yandex.com режет капчей не-российские IP, а GitHub
+// Actions работает из-за рубежа. Поэтому mint НЕ работает в CI — префикс
+// минтится на российской машине и хранится в GitHub variable
+// CAMPUS_PROXY_PREFIX (Settings → Variables). Скрипт берёт его оттуда,
+// mint остаётся только как fallback без переменной.
+//
 // Запуск:
 //   node sync.js                          # parse + печать сводки
 //   GROUP=131-ИБо AHEAD_WEEKS=4 node sync.js
+//   node sync.js --mint                   # заминтить префикс и напечатать его
+//   node sync.js --mint --set-variable owner/repo   # + обновить GitHub variable через gh CLI
+//   CAMPUS_PROXY_PREFIX=https://… node sync.js      # использовать готовый префикс
 // Выход: 0 при успехе, 1 при ошибке. В конце печатается JSON-сводка.
 
 const CAMPUS_BASE = 'https://campus.syktsu.ru/schedule/group/';
 const MINT_URL = 'https://translate.yandex.com/translate?url=';
+const { execFileSync } = require('node:child_process');
 
 function log(...args) { console.log(...args); }
 function fail(msg) { console.error('[ERROR] ' + msg); process.exit(1); }
@@ -34,9 +44,38 @@ async function mintProxyPrefix() {
   // [^?]+ — весь путь до query (включая слэши), т.е. полный прокси-URL целевой страницы.
   const m = location.match(/https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+/);
   if (resp.status !== 302 || !m) {
+    if (location.includes('showcaptcha')) {
+      throw new Error(
+        'Яндекс показал капчу — translate.yandex.com режет не-российские IP, а GitHub Actions ' +
+        'работает из-за рубежа.\n' +
+        'Заминтите префикс с российского IP: node sync.js --mint' +
+        (process.argv.includes('--set-variable') ? ' --set-variable <owner/repo>' : '') +
+        '\nлибо вставьте его вручную: GitHub → Settings → Secrets and variables → Actions → Variables → CAMPUS_PROXY_PREFIX'
+      );
+    }
     throw new Error('Не удалось заминтить прокси-хэш (status=' + resp.status + ', location=' + location.slice(0, 120) + ')');
   }
   return m[0].replace(/\/+$/, '');
+}
+
+async function checkProxyPrefix(prefix, group) {
+  const params = new URLSearchParams();
+  params.set('num_group', group);
+  params.set('searchdata', 'ИСКАТЬ');
+  const resp = await fetch(prefix + '/?' + params.toString(), {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+  });
+  return resp.ok;
+}
+
+function setGhVariable(repo, value) {
+  log('gh variable set CAMPUS_PROXY_PREFIX --repo ' + repo + ' …');
+  try {
+    execFileSync('gh', ['variable', 'set', 'CAMPUS_PROXY_PREFIX', '--body', value, '--repo', repo], { stdio: 'inherit' });
+    log('✓ Переменная CAMPUS_PROXY_PREFIX обновлена в ' + repo);
+  } catch (e) {
+    fail('Не удалось обновить переменную через gh CLI (' + (e && e.message ? e.message.split('\n')[0] : String(e)) + ').\n  Проверьте gh auth login, либо вставьте префикс вручную: Settings → Variables.');
+  }
 }
 
 async function fetchCampusHtml(prefix, group, weekCode) {
@@ -242,6 +281,11 @@ function findCurrentWeek(weeks) {
 }
 
 async function main() {
+  const args = process.argv.slice(2);
+  const mintOnly = args.includes('--mint');
+  const setVarIdx = args.indexOf('--set-variable');
+  const setVar = setVarIdx >= 0 ? args[setVarIdx + 1] : '';
+
   const group = (process.env.GROUP || process.env.CAMPUS_GROUP || '131-ИБо').trim().toLowerCase();
   const ahead = Math.max(0, parseInt(process.env.AHEAD_WEEKS || '4', 10) || 0);
 
@@ -249,10 +293,50 @@ async function main() {
   log('Группа: ' + group + ', недель вперёд: ' + ahead);
   log('');
 
-  log('[1/3] Минтим прокси-хэш...');
-  const prefix = await mintProxyPrefix();
-  log('      префикс: ' + prefix.slice(0, 90) + '…');
+  // ── Режим --mint: заминтить префикс и выйти ──
+  if (mintOnly) {
+    log('[mint] Минтим прокси-хэш...');
+    const minted = await mintProxyPrefix();
+    log('[mint] префикс: ' + minted);
+    log('');
+    log('=== CAMPUS_PROXY_PREFIX ===');
+    log(minted);
+    log('============================');
+    if (setVar) {
+      log('');
+      setGhVariable(setVar, minted);
+    } else {
+      log('');
+      log('Вставьте префикс вручную: GitHub → Settings → Secrets and variables → Actions → Variables → CAMPUS_PROXY_PREFIX');
+    }
+    log('=== ГОТОВО ===');
+    return;
+  }
 
+  // ── Префикс: env CAMPUS_PROXY_PREFIX (приоритет) или свежий mint ──
+  let prefix = (process.env.CAMPUS_PROXY_PREFIX || '').trim().replace(/\/+$/, '');
+  if (!prefix) {
+    log('[1/3] Минтим прокси-хэш...');
+    prefix = await mintProxyPrefix();
+    log('      префикс: ' + prefix.slice(0, 90) + '…');
+  } else if (!/^https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+$/.test(prefix)) {
+    fail('CAMPUS_PROXY_PREFIX имеет неверный формат: ' + prefix.slice(0, 90) +
+      '\n  Ожидается: https://translated.turbopages.org/proxy_u/<pair>.<uuid>/https/campus.syktsu.ru/schedule/group' +
+      '\n  Заминтите заново: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : ''));
+  } else {
+    log('[1/3] Прокси-префикс из CAMPUS_PROXY_PREFIX:');
+    log('      ' + prefix.slice(0, 90) + '…');
+    log('      Проверяем живость префикса...');
+    const alive = await checkProxyPrefix(prefix, group);
+    if (!alive) {
+      fail('Префикс протух — прокси вернул HTTP-ошибку.' +
+        '\n  Обновите CAMPUS_PROXY_PREFIX с российского IP: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : '') +
+        '\n  или вручную: Settings → Variables.');
+    }
+    log('      ✓ префикс живой');
+  }
+
+  log('');
   log('[2/3] Качаем недели (' + CAMPUS_BASE + '?...searchdata)…');
   const weeksHtml = await fetchCampusHtml(prefix, group);
   const weeks = parseWeekOptions(weeksHtml);

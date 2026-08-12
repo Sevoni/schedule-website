@@ -5,6 +5,13 @@ name: Campus sync (proxy parse)
 # поэтому HTML качается через прокси-путь (GET + query-параметры).
 # Скрипт: site/scripts/campus-sync/sync.js — mint хэша, fetch, парсинг, сводка.
 #
+# ВАЖНО: mint-шаг (translate.yandex.com) режет капчей не-российские IP,
+# поэтому в CI он НЕ работает. Префикс минтится один раз на российской
+# машине и хранится в repository variable CAMPUS_PROXY_PREFIX
+# (Settings → Secrets and variables → Actions → Variables). Обновление:
+#   node site/scripts/campus-sync/sync.js --mint --set-variable <owner/repo>
+# (нужен gh auth), либо вставьте префикс вручную в переменную.
+#
 # Сейчас это ТОЛЬКО проверка парсинга: скрипт ничего не пишет в API сайта.
 # Показывает в логах недели/пары. Интеграция (запись в D1) добавится позже.
 
@@ -36,4 +43,7 @@ jobs:
           # репозитория (Settings → Variables), по умолчанию 131-ИБо / 4.
           GROUP: ${{ vars.CAMPUS_GROUP || '131-ИБо' }}
           AHEAD_WEEKS: ${{ vars.CAMPUS_AHEAD_WEEKS || '4' }}
+          # Заминтированный на российской машине прокси-префикс
+          # (см. шапку файла: node sync.js --mint --set-variable owner/repo).
+          CAMPUS_PROXY_PREFIX: ${{ vars.CAMPUS_PROXY_PREFIX }}
         run: node site/scripts/campus-sync/sync.js
