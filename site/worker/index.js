@@ -62,6 +62,8 @@ function sanitizeString(v, maxLen = 200) {
 
 const SCHEDULE_PAIR_KEYS = ['subject', 'teacher', 'room', 'type', 'subgroup', 'num', 'time'];
 
+const ALLOWED_PAIR_TYPES = new Set(['л', 'пр', 'пз', 'лаб', 'с', 'зчО', 'зач', 'экз']);
+
 function sanitizePair(p) {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
   const out = {};
@@ -75,6 +77,11 @@ function sanitizePair(p) {
     if (k === 'time') {
       const t = sanitizeString(p[k], 10);
       if (/^\d{1,2}:\d{2}$/.test(t)) out[k] = t;
+      continue;
+    }
+    if (k === 'type') {
+      const t = sanitizeString(p[k], 20);
+      if (ALLOWED_PAIR_TYPES.has(t)) out[k] = t;
       continue;
     }
     const s = sanitizeString(p[k]);
@@ -145,6 +152,9 @@ function sanitizeHwFields(body) {
 //   { ok: false, tooLarge: true }           — превышен MAX_BODY_BYTES → 413
 //   { ok: false, parseError: true }         — битый JSON → 400
 const MAX_BODY_BYTES = 1024 * 1024; // 1 МБ
+const MAX_BATCH_SCHEDULES = 30; // sync-from-campus / schedule-batch (фронт шлёт ≤5)
+const MAX_BATCH_HW_UPDATES = 500; // /api/hw/batch
+const MAX_WEEKS_LIST = 300; // upload type=weeks
 
 async function readJsonBody(request, maxBytes = MAX_BODY_BYTES) {
   if (!request.body) return { ok: true, json: {} };
@@ -194,10 +204,12 @@ const securityHeaders = {
 };
 
 // ── CORS: строгая политика вместо Access-Control-Allow-Origin: * ────────
-// Разрешаем только проверенные origin'ы: preview-домены Cloudflare Pages
-// (*.schedule-worker.pages.dev) + список из env-переменной ALLOWED_ORIGINS
-// (через запятую). Same-origin и curl-запросы без Origin не требуют CORS —
-// для них заголовков нет вообще.
+// Разрешаем только проверенные origin'ы: список из env-переменной
+// ALLOWED_ORIGINS (через запятую) + preview-домены Cloudflare Pages
+// (*.schedule-worker.pages.dev) — только при ALLOW_PREVIEW_CORS === 'true'
+// (по умолчанию выключено: на проде "false", локально включается в .dev.vars).
+// Same-origin и curl-запросы без Origin не требуют CORS — для них заголовков
+// нет вообще.
 const CORS_HEADER_NAMES = [
   'Access-Control-Allow-Origin',
   'Access-Control-Allow-Methods',
@@ -216,7 +228,8 @@ function isAllowedOrigin(origin, env) {
       .filter(Boolean);
     if (extra.includes(u.origin)) return true;
     // Preview-домены Cloudflare Pages: https://<hash>.schedule-worker.pages.dev
-    if (u.hostname.endsWith('.schedule-worker.pages.dev')) return true;
+    // Разрешены ТОЛЬКО при ALLOW_PREVIEW_CORS === 'true' (по умолчанию false).
+    if (env.ALLOW_PREVIEW_CORS === 'true' && u.hostname.endsWith('.schedule-worker.pages.dev')) return true;
     return false;
   } catch {
     return false;
@@ -288,12 +301,15 @@ export default {
     // Применяется ко всем запросам до маршрутизации. Возвращает Response(429)
     // при превышении лимита или null — тогда выполняем обычный маршрут.
     // Использует D1 через store._db для атомарного инкремента счётчика.
-    // При недоступности D1 — fail-open (пропускаем), чтобы не положить сайт.
+    // Политика недоступности D1 решается внутри checkRateLimit
+    // (fail-closed для verify, fail-open для остальных категорий).
+    // Исключения отсюда быть не должно; аварийный catch — fail-closed последней инстанции.
     try {
       const limited = await applyRateLimits(store, request, path, method, corsHeaders);
       if (limited) return limited;
     } catch (rlErr) {
-      console.log('[ratelimit] check failed (fail-open):', rlErr.message);
+      console.error('[ratelimit] unexpected error (fail-closed):', rlErr.message);
+      return rateLimitResponse(corsHeaders, 60);
     }
 
     try {
@@ -406,7 +422,7 @@ export default {
       if (path === '/api/tg/webhook' && method === 'POST') {
         return await handleTgWebhook(request, env);
       }
-      if (path === '/api/tg/status' && method === 'GET') {
+      if (path === '/api/tg/status' && method === 'POST') {
         return await handleTgStatus(request, env, corsHeaders);
       }
 
@@ -765,7 +781,10 @@ async function handleInviteList(request, env, corsHeaders) {
     createdAt,
     ...(label ? { label } : {}),
   }));
-  return jsonResponse({ ok: true, items }, corsHeaders);
+  return jsonResponse({ ok: true, items }, corsHeaders, 200, {
+    cacheControl: CC_WRITER_GET,
+    isPrivate: true,
+  });
 }
 
 // DELETE /api/invite?id=...&group=...
@@ -1095,6 +1114,9 @@ async function handleUpload(request, env, corsHeaders) {
     if (!group || !isValidGroup(group) || !weeks) {
       return jsonResponse({ error: 'Missing group or weeks' }, corsHeaders, 400);
     }
+    if (weeks.length > MAX_WEEKS_LIST) {
+      return jsonResponse({ error: 'Too many weeks (max 300)' }, corsHeaders, 400);
+    }
     const cleanWeeks = sanitizeWeeks(weeks);
     if (!cleanWeeks) {
       return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
@@ -1144,6 +1166,10 @@ async function handleUpload(request, env, corsHeaders) {
     const group = normalizeGroup(_group);
     if (!group || !isValidGroup(group) || !Array.isArray(schedules)) {
       return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
+    }
+
+    if (schedules.length > MAX_BATCH_SCHEDULES) {
+      return jsonResponse({ error: 'Too many schedules (max 30)' }, corsHeaders, 400);
     }
 
     const updated = [];
@@ -1278,6 +1304,10 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
 
   if (!group || !isValidGroup(group) || !Array.isArray(schedules)) {
     return jsonResponse({ error: 'Missing group or schedules' }, corsHeaders, 400);
+  }
+
+  if (schedules.length > MAX_BATCH_SCHEDULES) {
+    return jsonResponse({ error: 'Too many schedules (max 30)' }, corsHeaders, 400);
   }
 
   const updated = [];
@@ -1552,6 +1582,10 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
 
   if (!group || !isValidGroup(group) || !Array.isArray(updates) || updates.length === 0) {
     return jsonResponse({ error: 'Missing group or updates' }, corsHeaders, 400);
+  }
+
+  if (updates.length > MAX_BATCH_HW_UPDATES) {
+    return jsonResponse({ error: 'Too many updates (max 500)' }, corsHeaders, 400);
   }
 
   const key = `hw:${group}`;
@@ -2655,18 +2689,25 @@ async function unbindChat(env, chatId) {
   await store.delete(`tg:groups:${chatId}`);
 }
 
-// ── GET /api/tg/status?group=...&chatId=... ─────────────────────
+// ── POST /api/tg/status { group, chatId } ───────────────────────
 // Возвращает { subscribed, botUsername } — подписан ли ПЕРЕДАННЫЙ chatId
 // к этой группе (изоляция: каждый пользователь видит только свой статус).
+// chatId принимается в теле POST, а НЕ в query GET: личный chatId не должен
+// попадать в URL (логи Cloudflare/прокси, история браузера).
 // Отписка — только командой /stop в боте (webhook), где chatId берётся
 // из самого апдейта Telegram (подписанного secret_token).
 
 async function handleTgStatus(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
-  const url = new URL(request.url);
-  const group = normalizeGroup(url.searchParams.get('group'));
-  const chatId = url.searchParams.get('chatId') || '';
+  const bb = await readJsonBody(request);
+  if (!bb.ok) {
+    if (bb.tooLarge) return jsonResponse({ error: 'Body too large' }, corsHeaders, 413);
+    return jsonResponse({ error: 'Invalid JSON' }, corsHeaders, 400);
+  }
+  const body = bb.json || {};
+  const group = normalizeGroup(body.group);
+  const chatId = String(body.chatId != null ? body.chatId : '').slice(0, 64);
   if (!isValidGroup(group)) {
     return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
   }
@@ -2675,7 +2716,7 @@ async function handleTgStatus(request, env, corsHeaders) {
   return jsonResponse({
     subscribed: !!existing,
     botUsername: env.TG_BOT_USERNAME || '',
-  }, corsHeaders);
+  }, corsHeaders, 200, { cacheControl: CC_NO_STORE });
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2869,15 +2910,20 @@ function warnRlFailOpen(kind, id) {
   const now = Date.now();
   if (now - lastRlWarnTime < 30000) return;
   lastRlWarnTime = now;
-  console.warn(`[ratelimit] no db (${kind}:${id}) — fail-open, лимиты отключены`);
+  console.warn(`[ratelimit] no db (${kind}:${id}) — fail-open для категории, verify — fail-closed`);
 }
 
 // Атомарно инкрементирует счётчик и проверяет лимит.
 // Возвращает { limited: false } или { limited: true, retryAfter: <сек> }.
-// При ошибке D1 — fail-open (возвращает { limited: false }).
-async function checkRateLimit(store, id, kind, limit, windowSec) {
+// Политика при недоступности D1:
+//   failClosed=false (global/tg/tgstatus) — fail-open ({ limited: false }),
+//   failClosed=true (verify: owner login/invite) — fail-closed
+//     ({ limited: true, retryAfter: 60, degraded: true }): лимит проверить нельзя → отказ.
+async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
+  const { failClosed = false } = opts;
   if (!store || !store._db || !id) {
     warnRlFailOpen(kind, id);
+    if (failClosed) return { limited: true, retryAfter: 60, degraded: true };
     return { limited: false };
   }
   const now = Date.now();
@@ -2885,30 +2931,37 @@ async function checkRateLimit(store, id, kind, limit, windowSec) {
   const key = `rl:${kind}:${id}:${windowStart}`;
   const expiresAt = now + (windowSec + 60) * 1000; // +60 сек запас на TTL
 
-  // Один атомарный запрос: UPSERT + RETURNING post-image счётчика.
-  // Гонки нет: SQLite сериализует запись, RETURNING возвращает значение ПОСЛЕ инкремента.
-  // value храним как TEXT (как всё в kv), поэтому ON CONFLICT — CAST,
-  // а RETURNING CAST(value AS INTEGER) AS count возвращает уже число.
-  const row = await store._db
-    .prepare(
-      `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, '1', ?, ?)
-       ON CONFLICT(key) DO UPDATE SET
-         value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
-         expires_at = excluded.expires_at,
-         updated_at = excluded.updated_at
-       RETURNING CAST(value AS INTEGER) AS count`
-    )
-    .bind(key, expiresAt, now)
-    .first();
-  const count = row ? row.count : 1;
+  try {
+    // Один атомарный запрос: UPSERT + RETURNING post-image счётчика.
+    // Гонки нет: SQLite сериализует запись, RETURNING возвращает значение ПОСЛЕ инкремента.
+    // value храним как TEXT (как всё в kv), поэтому ON CONFLICT — CAST,
+    // а RETURNING CAST(value AS INTEGER) AS count возвращает уже число.
+    const row = await store._db
+      .prepare(
+        `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, '1', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+           expires_at = excluded.expires_at,
+           updated_at = excluded.updated_at
+         RETURNING CAST(value AS INTEGER) AS count`
+      )
+      .bind(key, expiresAt, now)
+      .first();
+    const count = row ? row.count : 1;
 
-  if (count > limit) {
-    // Сколько секунд до конца окна.
-    const windowEndMs = (windowStart + 1) * windowSec * 1000;
-    const retryAfter = Math.max(1, Math.ceil((windowEndMs - now) / 1000));
-    return { limited: true, retryAfter };
+    if (count > limit) {
+      // Сколько секунд до конца окна.
+      const windowEndMs = (windowStart + 1) * windowSec * 1000;
+      const retryAfter = Math.max(1, Math.ceil((windowEndMs - now) / 1000));
+      return { limited: true, retryAfter };
+    }
+    return { limited: false };
+  } catch (err) {
+    // D1-сбой на уровне SQL: та же политика, что при недоступности базы.
+    console.warn(`[ratelimit] db error (${kind}:${id}): ${err.message}`);
+    if (failClosed) return { limited: true, retryAfter: 60, degraded: true };
+    return { limited: false };
   }
-  return { limited: false };
 }
 
 // Формирует 429-ответ с понятным сообщением и Retry-After.
@@ -2930,9 +2983,20 @@ function rateLimitResponse(corsHeaders, retryAfter) {
 
 // Единая точка применения лимитов. Возвращает Response(429) или null.
 // Вызывается из fetch() после OPTIONS, до маршрутизации.
+// Чувствительные публичные POST: invite verify/create и owner login/logout —
+// D1-read oracle / оракул кода владельца. Для них — fail-closed (см. checkRateLimit).
+function isVerifyPath(path) {
+  return path === '/api/invite/verify' || path === '/api/invite/create' ||
+         path === '/api/owner/login' || path === '/api/owner/logout';
+}
+
 async function applyRateLimits(store, request, path, method, corsHeaders) {
   const ip = getClientIp(request);
-  if (!ip) return null; // без IP не лимитируем (не должно случаться за CF)
+  if (!ip) {
+    // fail-closed для чувствительных путей: без IP лимит не проверить (за CF не случается).
+    if (method === 'POST' && isVerifyPath(path)) return rateLimitResponse(corsHeaders, 60);
+    return null;
+  }
 
   // 1) Глобальный IP-лимит на ВСЕ запросы.
   const global = await checkRateLimit(store, ip, 'global', 120, 60);
@@ -2940,16 +3004,21 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
 
   // 2) Точечные лимиты на публичные POST (поверх глобального).
   if (method === 'POST') {
-    // Чувствительные: invite verify/create и owner login/logout — публичные,
-    // D1-read oracle / оракул кода владельца.
-    if (path === '/api/invite/verify' || path === '/api/invite/create' ||
-        path === '/api/owner/login' || path === '/api/owner/logout') {
-      const rl = await checkRateLimit(store, ip, 'verify', 10, 60);
-      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+    if (isVerifyPath(path)) {
+      const rl = await checkRateLimit(store, ip, 'verify', 10, 60, { failClosed: true });
+      if (rl.limited) {
+        if (rl.degraded) console.warn('[ratelimit] verify degraded: D1 недоступен, запрос отклонён');
+        return rateLimitResponse(corsHeaders, rl.retryAfter);
+      }
     }
     // TG webhook — публичный, шлёт исходящие в Telegram.
     if (path === '/api/tg/webhook') {
       const rl = await checkRateLimit(store, ip, 'tg', 60, 60);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+    }
+    // /api/tg/status — публичный оракул подписки по chatId: замедлить перебор.
+    if (path === '/api/tg/status') {
+      const rl = await checkRateLimit(store, ip, 'tgstatus', 30, 60);
       if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
     }
   }

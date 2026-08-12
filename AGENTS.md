@@ -90,7 +90,7 @@ Local secrets go in `site/.dev.vars` (gitignored).
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
 - **Cron** (`[triggers]` in wrangler.toml): daily cleanup of expired D1 rows.
 - **Route**: `kampussgu.dpdns.org/api/*` → Worker (custom domain). Static Pages on same domain.
-- **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` (always) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based).
+- **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` **only when var `ALLOW_PREVIEW_CORS === "true"`** (default `"false"` on prod; local override in `.dev.vars`) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Preview builds (`{hash}.schedule-worker.pages.dev`) deliberately do NOT work against the prod API — frontend testing happens via deploy to the main domain. Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based).
 - **CDN caching**: public GETs are manually cached via Cache API (`cachedGet` in `worker/index.js`): readers get `public, max-age=60, s-maxage=300` (CDN 5 min), writers `private, no-store`. After every write the worker purges that group's cached URLs (`purgeGroupCdnCache`). If you test with curl and see stale data, pass an `Authorization: Bearer` header (bypasses cache) or wait for purge.
 
 ### Auth (role-based access)
@@ -169,7 +169,7 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |
 | POST | `/api/tg/webhook` | — | Telegram webhook receiver (bot commands + callbacks) |
-| GET | `/api/tg/status?group=&chatId=` | reader | Get subscription status (subscribed + botUsername only) |
+| POST | `/api/tg/status` | reader | Get subscription status: body `{ group, chatId }` → `{ subscribed, botUsername }`. **POST, не GET** — chatId (личный ID чата) не должен попадать в URL/логи. Ответ `no-store`, rate limit `tgstatus` 30/мин |
 
 No `/api/auth`, `/api/group/register`, `/api/tg/subscribe`, `/api/tg/unsubscribe` or `/api/tg/set-webhook` endpoints exist anymore — writer access is invite-token only, and TG subscriptions are managed **inside the bot itself** (webhook): `/sub <группа>` → inline keyboard to pick subgroup, `/status`. Unsubscribe is only via `/stop` in the bot (chatId comes from the signed webhook update, not from the client).
 

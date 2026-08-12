@@ -26,10 +26,17 @@ INVITE_ORIGIN = "https://kampussgu.dpdns.org"
 
 # CORS: дополнительные разрешённые origin'ы для браузерных запросов к /api/*
 # (через запятую, например "https://sched.example.ru"). Preview-домены
-# *.schedule-worker.pages.dev разрешены всегда. Same-origin и curl (без
-# Origin) в списке не нуждаются. ВАЖНО: этот список кэшируется CDN'ом —
-# меняйте его только вместе с деплоем воркера.
-ALLOWED_ORIGINS = ""
+# *.schedule-worker.pages.dev разрешены ТОЛЬКО при ALLOW_PREVIEW_CORS === 'true'
+# (см. ниже). Same-origin и curl (без Origin) в списке не нуждаются. ВАЖНО:
+# этот список кэшируется CDN'ом — меняйте его только вместе с деплоем воркера.
+ALLOWED_ORIGINS = "https://translated.turbopages.org"
+
+# CORS для preview-доменов *.schedule-worker.pages.dev.
+# "false" (или отсутствие) — вилдкард выключен, превью-сборки НЕ работают
+# с прод-API. Для локальной разработки включать в .dev.vars. На проде
+# держать выключенным; менять на "true" только временно, когда нужно
+# проверить превью-сборку против прод-API.
+ALLOW_PREVIEW_CORS = "false"
 
 # Логирование производительности D1 (для анализа тормозов):
 #   LOG_DB=0          — отключить всё логирование БД

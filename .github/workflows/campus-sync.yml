@@ -1,0 +1,39 @@
+name: Campus sync (proxy parse)
+
+# Парсинг расписания campus.syktsu.ru через прокси Яндекс.Перевода
+# (translated.turbopages.org). Кампус принимает запросы только из России,
+# поэтому HTML качается через прокси-путь (GET + query-параметры).
+# Скрипт: site/scripts/campus-sync/sync.js — mint хэша, fetch, парсинг, сводка.
+#
+# Сейчас это ТОЛЬКО проверка парсинга: скрипт ничего не пишет в API сайта.
+# Показывает в логах недели/пары. Интеграция (запись в D1) добавится позже.
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # каждые 4 часа
+  workflow_dispatch:         # ручной запуск (кнопка "Run workflow")
+
+concurrency:
+  group: campus-sync
+  cancel-in-progress: false
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Parse campus schedule via Yandex proxy
+        env:
+          # Группа и число недель вперёд — переопределяются переменными
+          # репозитория (Settings → Variables), по умолчанию 131-ИБо / 4.
+          GROUP: ${{ vars.CAMPUS_GROUP || '131-ИБо' }}
+          AHEAD_WEEKS: ${{ vars.CAMPUS_AHEAD_WEEKS || '4' }}
+        run: node site/scripts/campus-sync/sync.js

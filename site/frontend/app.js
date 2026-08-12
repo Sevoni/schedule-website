@@ -5,6 +5,13 @@ const DEFAULT_GROUP = '131-ибо';
 const CAMPUS_URL = 'https://campus.syktsu.ru/schedule/group/';
 const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 
+// Страница открыта через Яндекс.Перевод (translated.turbopages.org).
+// В прокси прямой коннект на наш домен блокируется их CSP (connect-src),
+// поэтому API-запросы идут относительным путём ./api/... через прокси
+// (same-origin, без CORS). Ведущая точка в суффиксе исключает коллизию
+// с доменами вида attackerturbopages.org.
+const IS_TURBOPAGES = location.hostname.endsWith('.turbopages.org');
+
 function fetchTimeout(url, opts = {}) {
   return fetch(url, opts);
 }
@@ -30,10 +37,14 @@ const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 // ── State ─────────────────────────────────────────────────────
 
 let state = {
-  apiBase: DEFAULT_API,
+  // В прокси Яндекса — base текущей страницы (translated.turbopages.org/proxy_u/<hash>/https/kampussgu.dpdns.org/),
+  // иначе обычный API-домен. Все apiFetch/apiPost/apiPut/apiDelete строят URL через state.apiBase.
+  // Трейлинг-слэш убираем: код конкатенирует apiBase + '/api/...', иначе получится //api/ (404 у Cloudflare).
+  apiBase: IS_TURBOPAGES ? new URL('./', location.href).href.replace(/\/+$/, '') : DEFAULT_API,
   group: (localStorage.getItem('group') || '').toLowerCase(),
   // campusEnabled: по умолчанию true. При false topical загрузки из кампуса не происходит — только из БД.
-  campusEnabled: localStorage.getItem('campusEnabled') !== '0',
+  // В прокси Яндекса campus.syktsu.ru недоступен по CORS — отключаем синхронизацию (без записи в localStorage).
+  campusEnabled: IS_TURBOPAGES ? false : localStorage.getItem('campusEnabled') !== '0',
   // subgroupFilter: 'any' — показывать обе подгруппы; '1'/'2' — только свою.
   subgroupFilter: localStorage.getItem('subgroupFilter') || 'any',
   lastSyncAt: localStorage.getItem('lastSyncAt') || '',
@@ -2615,7 +2626,7 @@ function renderDaySchedule(day) {
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
-              ${typeFullName ? `<span class="pair-type ${typeClass}">${typeFullName}</span>` : ''}
+              ${typeFullName ? `<span class="pair-type ${typeClass}">${escHtml(typeFullName)}</span>` : ''}
               ${isWriter() ? `<button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${escHtml(pairTypeCode)}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>` : ''}
             </div>
           </div>
@@ -4341,7 +4352,7 @@ function setupSettingsModal() {
     // Обновляем статус привязки под текущую группу.
     const statusEl = document.getElementById('tgStatus');
     const linkEl = document.getElementById('tgBotLink');
-    apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
+    apiPost('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
       state.tgBotUsername = res.botUsername || state.tgBotUsername || '';
       if (state.tgBotUsername) {
         localStorage.setItem('tgBotUsername', state.tgBotUsername);
@@ -4488,7 +4499,7 @@ function setupSettingsModal() {
     loadData();
 
     if (groupChanged) {
-      apiFetch('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
+      apiPost('/api/tg/status', { group: state.group, chatId: state.tgChatId || '' }).then(res => {
         if (res.subscribed) {
           localStorage.setItem('tgChatId', state.tgChatId || '');
           localStorage.setItem('tgSubgroup', state.tgSubgroup || 'any');
