@@ -49,6 +49,29 @@ const { execFileSync } = require('node:child_process');
 // в POST, а прокси турбопаги POST не пропускает (415).
 const DIRECT = process.env.DIRECT === '1';
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Retry на 5xx/сетевые ошибки: турбопага иногда отдаёт 503 для
+// дата-центровых IP (GitHub Actions). Задержки: 1с, 4с, 9с.
+async function fetchWithRetry(url, opts, retries = 4) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) await sleep(1000 * attempt * attempt);
+    try {
+      const resp = await fetch(url, opts);
+      if (resp.status >= 500 && resp.status < 600 && attempt < retries - 1) {
+        lastErr = new Error('HTTP ' + resp.status);
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries - 1) continue;
+    }
+  }
+  throw lastErr;
+}
+
 function log(...args) { console.log(...args); }
 function fail(msg) { console.error('[ERROR] ' + msg); process.exit(1); }
 
@@ -83,7 +106,7 @@ async function checkProxyPrefix(prefix, group) {
   const params = new URLSearchParams();
   params.set('num_group', group);
   params.set('searchdata', 'ИСКАТЬ');
-  const resp = await fetch(prefix + '/?' + params.toString(), {
+  const resp = await fetchWithRetry(prefix + '/?' + params.toString(), {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
   });
   return resp.ok;
@@ -117,7 +140,7 @@ async function fetchCampusHtml(prefix, group, weekCode) {
   }
 
   const url = prefix + '/?' + params.toString();
-  const resp = await fetch(url, {
+  const resp = await fetchWithRetry(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
   });
   if (!resp.ok) throw new Error('Прокси-кампус: HTTP ' + resp.status + ' для ' + url.slice(0, 150));
@@ -372,30 +395,51 @@ async function main() {
   }
 
   // ── Префикс: env CAMPUS_PROXY_PREFIX (приоритет) или свежий mint ──
+  // CAMPUS_PROXY_PREFIX может содержать НЕСКОЛЬКО префиксов через запятую/
+  // пробел/перевод строки — пробуем по очереди, пока не найдётся живой.
+  // Это даёт резерв: если один хэш турбопаги протухнет/отдаст 5xx, второй сработает.
   let prefix = '';
   if (DIRECT) {
     log('Прямое подключение: POST к ' + CAMPUS_BASE);
   } else {
-    prefix = (process.env.CAMPUS_PROXY_PREFIX || '').trim().replace(/\/+$/, '');
-    if (!prefix) {
+    const candidates = (process.env.CAMPUS_PROXY_PREFIX || '')
+      .split(/[\s,;]+/)
+      .map(s => s.trim().replace(/\/+$/, ''))
+      .filter(Boolean);
+    if (candidates.length === 0) {
       log(stepLabel() + ' Минтим прокси-хэш...');
       prefix = await mintProxyPrefix();
       log('      префикс: ' + prefix.slice(0, 90) + '…');
-    } else if (!/^https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+$/.test(prefix)) {
-      fail('CAMPUS_PROXY_PREFIX имеет неверный формат: ' + prefix.slice(0, 90) +
-        '\n  Ожидается: https://translated.turbopages.org/proxy_u/<pair>.<uuid>/https/campus.syktsu.ru/schedule/group' +
-        '\n  Заминтите заново: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : ''));
     } else {
-      log(stepLabel() + ' Прокси-префикс из CAMPUS_PROXY_PREFIX:');
-      log('      ' + prefix.slice(0, 90) + '…');
-      log('      Проверяем живость префикса...');
-      const alive = await checkProxyPrefix(prefix, group);
-      if (!alive) {
-        fail('Префикс протух — прокси вернул HTTP-ошибку.' +
-          '\n  Обновите CAMPUS_PROXY_PREFIX с российского IP: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : '') +
+      const badFormat = candidates.filter(c => !/^https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+$/.test(c));
+      if (badFormat.length === candidates.length) {
+        fail('CAMPUS_PROXY_PREFIX имеет неверный формат: ' + candidates[0].slice(0, 90) +
+          '\n  Ожидается: https://translated.turbopages.org/proxy_u/<pair>.<uuid>/https/campus.syktsu.ru/schedule/group' +
+          '\n  Заминтите заново: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : ''));
+      }
+      log(stepLabel() + ' Проверяем префиксы из CAMPUS_PROXY_PREFIX (' + candidates.length + ' шт.):');
+      for (const cand of candidates) {
+        log('      ' + cand.slice(0, 90) + '…');
+        log('      Проверяем живость префикса...');
+        let alive = false;
+        try {
+          alive = await checkProxyPrefix(cand, group);
+        } catch (e) {
+          alive = false;
+        }
+        if (!alive) {
+          log('      ✗ префикс не отвечает (протух или 5xx) — пробуем следующий');
+          continue;
+        }
+        log('      ✓ префикс живой');
+        prefix = cand;
+        break;
+      }
+      if (!prefix) {
+        fail('Все префиксы CAMPUS_PROXY_PREFIX недоступны (протухли или отдают ошибки).' +
+          '\n  Обновите их с российского IP: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : '') +
           '\n  или вручную: Settings → Variables.');
       }
-      log('      ✓ префикс живой');
     }
   }
 
