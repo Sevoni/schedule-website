@@ -91,9 +91,9 @@
         <div class="theme-section">
           <h3><svg class="icon icon-h3"><use href="#icon-palette"></use></svg> Тема оформления</h3>
           <div class="theme-radios">
-            <label class="theme-radio"><input type="radio" name="theme-mode" value="light"><svg class="icon"><use href="#icon-sun"></use></svg>Светлая</label>
-            <label class="theme-radio"><input type="radio" name="theme-mode" value="dark" checked><svg class="icon"><use href="#icon-moon"></use></svg>Тёмная</label>
-            <label class="theme-radio"><input type="radio" name="theme-mode" value="auto"><svg class="icon"><use href="#icon-monitor"></use></svg>Авто</label>
+            <label class="theme-radio"><input type="radio" name="theme-mode" value="light"><span class="theme-radio-icon"><svg class="icon"><use href="#icon-sun"></use></svg></span><span class="theme-radio-label">Светлая</span></label>
+            <label class="theme-radio"><input type="radio" name="theme-mode" value="dark" checked><span class="theme-radio-icon"><svg class="icon"><use href="#icon-moon"></use></svg></span><span class="theme-radio-label">Тёмная</span></label>
+            <label class="theme-radio"><input type="radio" name="theme-mode" value="auto"><span class="theme-radio-icon"><svg class="icon"><use href="#icon-monitor"></use></svg></span><span class="theme-radio-label">Авто</span></label>
           </div>
         </div>
 
@@ -221,14 +221,28 @@
           <div id="hwTaskError" class="hw-error hidden">Заполните поле задания</div>
           <div class="hw-markup-hint">Поддерживается разметка: <code># Заголовок</code>, <code>**жирный**</code>, <code>*курсив*</code>, <code>`код`</code>, списки, таблицы, <code>[текст](ссылка)</code></div>
         </label>
-        <div class="hw-due-mode">
+        <div class="hw-due-mode" role="radiogroup" aria-label="Срок сдачи">
           <label class="hw-mode-radio">
             <input type="radio" name="hwDueMode" value="nextPair" checked>
-            <span><svg class="icon"><use href="#icon-rotate-ccw"></use></svg> Следующая пара</span>
+            <span class="hw-mode-card">
+              <span class="hw-mode-icon"><svg class="icon"><use href="#icon-rotate-ccw"></use></svg></span>
+              <span class="hw-mode-text">
+                <span class="hw-mode-title">Следующая пара</span>
+                <span class="hw-mode-sub">К ближайшему занятию</span>
+              </span>
+              <span class="hw-mode-check"><svg class="icon"><use href="#icon-check"></use></svg></span>
+            </span>
           </label>
           <label class="hw-mode-radio">
             <input type="radio" name="hwDueMode" value="date">
-            <span><svg class="icon"><use href="#icon-calendar"></use></svg> Дата</span>
+            <span class="hw-mode-card">
+              <span class="hw-mode-icon"><svg class="icon"><use href="#icon-calendar"></use></svg></span>
+              <span class="hw-mode-text">
+                <span class="hw-mode-title">Дата</span>
+                <span class="hw-mode-sub">Выбрать конкретный день</span>
+              </span>
+              <span class="hw-mode-check"><svg class="icon"><use href="#icon-check"></use></svg></span>
+            </span>
           </label>
         </div>
         <div id="hwDateWrap" class="hw-calendar-wrap hidden">
@@ -273,6 +287,9 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+
+  <!-- Вспышка при смене темы оформления -->
+  <div id="themeSweep" class="theme-sweep"></div>
 
   <!-- SVG-спрайт Lucide (иконки как #icon-...). Встроен инлайн, чтобы работать без сети. -->
   <svg xmlns="http://www.w3.org/2000/svg" style="display:none;" aria-hidden="true">

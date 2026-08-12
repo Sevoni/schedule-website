@@ -271,6 +271,16 @@ function applyTheme() {
     };
     window._themeMq.addEventListener('change', window._themeMqHandler);
   }
+  // Вспышка при ручной смене темы (не при загрузке).
+  if (window._themeApplied) {
+    const sweep = document.getElementById('themeSweep');
+    if (sweep) {
+      sweep.classList.remove('theme-sweep-anim');
+      void sweep.offsetWidth;
+      sweep.classList.add('theme-sweep-anim');
+    }
+  }
+  window._themeApplied = true;
 }
 
 function applyAccent() {
@@ -412,6 +422,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   // (альтернатива ручному вводу кода в настройках).
   await consumeOwnerCodeFromUrl();
 
+  // Переход по #invite=/#owner= на уже открытой странице (например, клик по
+  // ссылке в той же вкладке) НЕ перезагружает документ — DOMContentLoaded не
+  // срабатывает, и токен остаётся непрочитанным. Обрабатываем hashchange.
+  // После зачистки hash (replaceState) событие сработает ещё раз с пустым
+  // hash — функции выйдут рано, рекурсии нет.
+  window.addEventListener('hashchange', async () => {
+    const before = state.group;
+    const startShown = !document.getElementById('startPage').classList.contains('hidden');
+    await consumeInviteTokenFromUrl();
+    await consumeOwnerCodeFromUrl();
+    // Группа могла прийти из ссылки-приглашения, пока пользователь сидел на
+    // стартовой странице той же вкладки — дорисовываем то, что в init делает
+    // код после consumeInviteTokenFromUrl().
+    if (state.group !== before) {
+      if (startShown) hideStartPage();
+      await loadData();
+      refreshEditVisibility();
+    }
+  });
+
   document.getElementById('syncBtn').onclick = () => {
     if (!isWriter()) {
       showToast('Только просмотр. Введите ссылку-приглашение в настройках, чтобы редактировать.', 'warn');
@@ -456,6 +486,19 @@ async function consumeInviteTokenFromUrl() {
     clearUrlParams(['token']);
   }
 
+  // Роль владельца живёт в HttpOnly-cookie, которую JS не видит, а
+  // state.ownerRole восстанавливается только позже (restoreOwnerRole в
+  // loadData). Запускаем лёгкую проверку /api/owner/status параллельно с
+  // верификацией токена: владельцу не нужно перескакивать на группу из
+  // приглашения, он остаётся на своей группе (и ролью владельца после
+  // перезагрузки снова подтвердит кука).
+  const ownerCheck = fetchTimeout(state.apiBase + '/api/owner/status', {
+    headers: { 'Cache-Control': 'no-store' },
+  })
+    .then(r => r.json().catch(() => ({ isOwner: false })))
+    .then(d => d.isOwner === true)
+    .catch(() => false);
+
   try {
     const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
       method: 'POST',
@@ -463,6 +506,7 @@ async function consumeInviteTokenFromUrl() {
       body: JSON.stringify({ token }),
     });
     const data = await resp.json();
+    const isOwner = await ownerCheck;
     if (resp.ok && data.ok && data.group) {
       // Сохраняем токен writer'а per-group.
       // ownerRole не трогаем — он глобальный.
@@ -470,10 +514,14 @@ async function consumeInviteTokenFromUrl() {
       state.writerTokens[group] = data.token;
       localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
 
-      // Подставляем группу из приглашения. Так пользователь сразу попадёт
-      // на ту группу, к которой его пригласили.
-      state.group = group;
-      localStorage.setItem('group', group);
+      // Подставляем группу из приглашения — но только не владельцу: он не
+      // должен переезжать на чужую группу, а после перезагрузки — тем более
+      // «залипать» на ней редактором. Токен он всё равно получил и может
+      // редактировать ту группу, выбрав её вручную.
+      if (!isOwner) {
+        state.group = group;
+        localStorage.setItem('group', group);
+      }
 
       showToast('Доступ на редактирование получен (' + data.group + ')', 'ok');
     } else {
@@ -1807,6 +1855,8 @@ function parsePairCell(html) {
   return { subject, teacher, room, type, subgroup };
 }
 
+const RESERVED_DAY_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function parseScheduleHTML(html) {
   const result = {
     group: '',
@@ -1843,6 +1893,7 @@ function parseScheduleHTML(html) {
 
   for (let i = 0; i < dayHeaders.length; i++) {
     const dayName = dayHeaders[i].name;
+    if (RESERVED_DAY_KEYS.has(dayName)) continue;
     const dayDate = dayHeaders[i].date;
     const contentStart = dayHeaders[i].end;
     const contentEnd = (i + 1 < dayHeaders.length)
@@ -2889,6 +2940,7 @@ function mdInline(t) {
     .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) => {
       const u = url.trim().replace(/["']/g, '');
+      if (u.startsWith('//')) return m;
       if (/^(https?:\/\/|mailto:|\/|#)/i.test(u)) {
         return '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>';
       }
@@ -3138,6 +3190,27 @@ function formatDateDisplay(str) {
   return `${d}.${m}.${y}`;
 }
 
+// Единый переключатель режима сдачи: ставит radio, показывает/прячет календарь
+// и при необходимости рендерит его (иначе при открытии сразу на «Дата»
+// календарь мог не появиться).
+function setHwDueMode(mode) {
+  const dateWrap = document.getElementById('hwDateWrap');
+  document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
+    if (r.value === mode) r.checked = true;
+  });
+  const showDate = mode === 'date';
+  dateWrap.classList.toggle('hidden', !showDate);
+  if (showDate && !calState.year) {
+    const now = new Date();
+    calState.year = now.getFullYear();
+    calState.month = now.getMonth();
+    calState.selectedDate = '';
+    renderCalendar(calState.year, calState.month, '');
+    const dateSelectedEl = document.getElementById('hwDateSelected');
+    if (dateSelectedEl) dateSelectedEl.textContent = '—';
+  }
+}
+
 // ── Subject+Type encoded option values ────────────────────────
 const PV_SEP = '\u0001';
 function encodePairValue(s, t, sub) {
@@ -3274,9 +3347,7 @@ function setupHomeworkModal() {
       document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
         if (r.value === 'nextPair') r.disabled = true;
       });
-      const dateRadio = document.querySelector('input[name="hwDueMode"][value="date"]');
-      if (dateRadio) dateRadio.checked = true;
-      document.getElementById('hwDateWrap').classList.remove('hidden');
+      setHwDueMode('date');
     } else {
       customWrap.classList.add('hidden');
       pairTypeWrap.classList.remove('hidden');
@@ -3300,12 +3371,8 @@ function setupHomeworkModal() {
   // Due mode radio
   document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
     r.onchange = () => {
-      const dateWrap = document.getElementById('hwDateWrap');
-      if (document.querySelector('input[name="hwDueMode"]:checked')?.value === 'date') {
-        dateWrap.classList.remove('hidden');
-      } else {
-        dateWrap.classList.add('hidden');
-      }
+      const checked = document.querySelector('input[name="hwDueMode"]:checked');
+      if (checked) setHwDueMode(checked.value);
       updateSaveBtnState();
     };
   });
@@ -3649,25 +3716,17 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
     document.getElementById('hwAuthor').value = existingHw.author || '';
 
     document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
-    const mode = existingHw.dueMode === 'date' ? 'date' : 'nextPair';
-    const modeRadio = document.querySelector('input[name="hwDueMode"][value="' + mode + '"]');
-    if (modeRadio) modeRadio.checked = true;
-    if (mode === 'date') {
-      document.getElementById('hwDateWrap').classList.remove('hidden');
-      if (existingHw.dueDate) {
-        const parts = existingHw.dueDate.split('-').map(Number);
-        // Календарь всегда открывается на текущем месяце (сброс при переоткрытии),
-        // но сохраняем выбранную дату для подсветки.
-        const now = new Date();
-        calState.year = now.getFullYear();
-        calState.month = now.getMonth();
-        calState.selectedDate = existingHw.dueDate;
-        renderCalendar(calState.year, calState.month, existingHw.dueDate);
-        document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
-      }
-    } else {
-      document.getElementById('hwDateWrap').classList.add('hidden');
+    if (existingHw.dueMode === 'date' && existingHw.dueDate) {
+      // Календарь всегда открывается на текущем месяце (сброс при переоткрытии),
+      // но сохраняем выбранную дату для подсветки.
+      const now = new Date();
+      calState.year = now.getFullYear();
+      calState.month = now.getMonth();
+      calState.selectedDate = existingHw.dueDate;
+      renderCalendar(calState.year, calState.month, existingHw.dueDate);
+      document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
     }
+    setHwDueMode(existingHw.dueMode === 'date' ? 'date' : 'nextPair');
 
     updateSubgroupVisibility(existingHw.subgroup);
     originalHwFields = getHwFormValues();
@@ -3711,13 +3770,12 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
 
     // Due mode
     document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
-    const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
-    if (defaultMode) defaultMode.checked = true;
     if (sel.value === '__custom__') {
-      document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
-      document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
+      document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
+        if (r.value === 'nextPair') r.disabled = true;
+      });
     }
-    document.getElementById('hwDateWrap').classList.add('hidden');
+    setHwDueMode(sel.value === '__custom__' ? 'date' : 'nextPair');
 
     // Calendar init
     const today = new Date();
@@ -3760,13 +3818,12 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
 
     // Due mode
     document.querySelectorAll('input[name="hwDueMode"]').forEach(r => r.disabled = false);
-    const defaultMode = document.querySelector('input[name="hwDueMode"][value="nextPair"]');
-    if (defaultMode) defaultMode.checked = true;
     if (sel.value === '__custom__') {
-      document.querySelector('input[name="hwDueMode"][value="nextPair"]').checked = false;
-      document.querySelector('input[name="hwDueMode"][value="date"]').checked = true;
+      document.querySelectorAll('input[name="hwDueMode"]').forEach(r => {
+        if (r.value === 'nextPair') r.disabled = true;
+      });
     }
-    document.getElementById('hwDateWrap').classList.add('hidden');
+    setHwDueMode(sel.value === '__custom__' ? 'date' : 'nextPair');
 
     // Calendar init
     const today = new Date();
@@ -4196,6 +4253,22 @@ const ACCENT_PALETTE = [
   '#f97316', '#ef4444', '#ec4899', '#d946ef', '#8b5cf6',
 ];
 
+// Галочка-иконка для выбранного цвета (SVG-элемент, не влезает в innerHTML из-за use).
+function makeSwatchCheck() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'icon swatch-check');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '3');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  p.setAttribute('d', 'M20 6 9 17l-5-5');
+  svg.appendChild(p);
+  return svg;
+}
+
 // Строит выбор цвета кнопок (swatch-кнопки). Выбранный цвет сохраняется сразу.
 function buildAccentPicker() {
   const wrap = document.getElementById('accentPicker');
@@ -4209,12 +4282,17 @@ function buildAccentPicker() {
     b.style.color = hex;
     b.title = hex;
     b.setAttribute('aria-label', 'Цвет ' + hex);
+    if (state.accent === hex) b.appendChild(makeSwatchCheck());
     b.onclick = () => {
       state.accent = hex;
       localStorage.setItem('accent', hex);
       applyAccent();
-      wrap.querySelectorAll('.accent-swatch').forEach((s) => s.classList.remove('selected'));
+      wrap.querySelectorAll('.accent-swatch.selected').forEach((s) => {
+        s.classList.remove('selected');
+        if (s.firstChild) s.removeChild(s.firstChild);
+      });
       b.classList.add('selected');
+      b.appendChild(makeSwatchCheck());
       refreshIcons();
     };
     wrap.appendChild(b);
@@ -4589,7 +4667,7 @@ function cssEscape(str) {
 function formatDateTime(iso) {
   if (!iso) return '—';
   const m = iso.match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
-  if (!m) return iso;
+  if (!m) return '—';
   const [_, y, mo, d, h, mi, s] = m;
   // lastSync хранится в UTC (с Z), campusUpdatedAt — локальное время кампуса (без Z).
   // Конвертируем в локальное время браузера, если строка заканчивается на Z или содержит T...Z
