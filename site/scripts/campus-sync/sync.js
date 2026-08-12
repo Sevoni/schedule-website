@@ -17,16 +17,37 @@
 // mint остаётся только как fallback без переменной.
 //
 // Запуск:
-//   node sync.js                          # parse + печать сводки
-//   GROUP=131-ИБо AHEAD_WEEKS=4 node sync.js
+//   node sync.js                          # текущая неделя (1 запрос через прокси)
+//   GROUP=131-ИБо node sync.js
+//   DIRECT=1 AHEAD_WEEKS=4 node sync.js   # текущая + N вперёд, напрямую POST'ом (только из России)
+//   TARGET_DATE=25.05.2026 node sync.js   # расписание конкретной недели (25.05.2026 или 2026-05-25)
+//   DIRECT=1 TARGET_DATE=25.05.2026 node sync.js  # то же, но напрямую POST'ом к кампусу (только из России)
 //   node sync.js --mint                   # заминтить префикс и напечатать его
 //   node sync.js --mint --set-variable owner/repo   # + обновить GitHub variable через gh CLI
 //   CAMPUS_PROXY_PREFIX=https://… node sync.js      # использовать готовый префикс
-// Выход: 0 при успехе, 1 при ошибке. В конце печатается JSON-сводка.
+// Выход: 0 при успехе, 1 при ошибке. В конце печатается JSON-сводка в
+// формате парсера frontend/app.js:
+//   { ok, group, weeksTotal, campusUpdatedAt,
+//     weeks: [{ value, text, weekNum, dates }],     // как parseWeekOptions
+//     parsedWeeks, totalPairs,
+//     schedules: [{ weekCode, weekText, data }] }   // data — как parseScheduleHTML
+// Такой же payload фронтенд шлёт на /api/sync-from-campus — для будущей
+// интеграции достаточно распарсить сводку и POST-нуть на этот эндпоинт.
+//
+// ВАЖНО: кампус отдаёт расписание ТЕКУЩЕЙ недели прямо в ответе на
+// searchdata=ИСКАТЬ, поэтому в прокси-режиме делается ровно 1 запрос,
+// а AHEAD_WEEKS игнорируется (кампус отдаёт другие недели только через
+// POST, прокси турбопаги POST не пропускает). Другие недели доступны
+// только с DIRECT=1 (напрямую, из России).
 
 const CAMPUS_BASE = 'https://campus.syktsu.ru/schedule/group/';
 const MINT_URL = 'https://translate.yandex.com/translate?url=';
 const { execFileSync } = require('node:child_process');
+
+// DIRECT=1 — ходить напрямую POST'ом к кампусу (только из России).
+// Нужно для конкретных недель (TARGET_DATE): кампус принимает weeks только
+// в POST, а прокси турбопаги POST не пропускает (415).
+const DIRECT = process.env.DIRECT === '1';
 
 function log(...args) { console.log(...args); }
 function fail(msg) { console.error('[ERROR] ' + msg); process.exit(1); }
@@ -83,6 +104,18 @@ async function fetchCampusHtml(prefix, group, weekCode) {
   params.set('num_group', group);
   if (weekCode) params.set('weeks', weekCode);
   else params.set('searchdata', 'ИСКАТЬ');
+
+  if (DIRECT) {
+    const resp = await fetch(CAMPUS_BASE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+      body: params.toString(),
+    });
+    if (!resp.ok) throw new Error('Campus (direct): HTTP ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    return decodeCampusHtml(buf, resp.headers.get('content-type') || '');
+  }
+
   const url = prefix + '/?' + params.toString();
   const resp = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
@@ -280,6 +313,26 @@ function findCurrentWeek(weeks) {
   return 0;
 }
 
+// Индекс недели, в диапазон которой попадает дата (ДД.ММ.ГГГГ или ГГГГ-ММ-ДД).
+// -1 — дата вне диапазона недель; null — неверный формат.
+function findWeekByDate(weeks, dateStr) {
+  let t = null;
+  const mDMY = dateStr.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  const mISO = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (mDMY) t = new Date(+mDMY[3], +mDMY[2] - 1, +mDMY[1]);
+  else if (mISO) t = new Date(+mISO[1], +mISO[2] - 1, +mISO[3]);
+  if (!t || isNaN(t)) return null;
+  for (let i = 0; i < weeks.length; i++) {
+    const [from, to] = weeks[i].dates;
+    if (from && to) {
+      const f = parseDateDDMMYYYY(from);
+      const tt = parseDateDDMMYYYY(to);
+      if (t >= f && t <= tt) return i;
+    }
+  }
+  return -1;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const mintOnly = args.includes('--mint');
@@ -288,8 +341,13 @@ async function main() {
 
   const group = (process.env.GROUP || process.env.CAMPUS_GROUP || '131-ИБо').trim().toLowerCase();
   const ahead = Math.max(0, parseInt(process.env.AHEAD_WEEKS || '4', 10) || 0);
+  const targetDate = (process.env.TARGET_DATE || '').trim();
 
-  log('=== Campus sync через прокси Яндекса ===');
+  const totalSteps = DIRECT ? 2 : 3;
+  let step = 0;
+  const stepLabel = () => { step++; return '[' + step + '/' + totalSteps + ']'; };
+
+  log('=== Campus sync ' + (DIRECT ? 'напрямую (POST, только из России)' : 'через прокси Яндекса') + ' ===');
   log('Группа: ' + group + ', недель вперёд: ' + ahead);
   log('');
 
@@ -314,30 +372,35 @@ async function main() {
   }
 
   // ── Префикс: env CAMPUS_PROXY_PREFIX (приоритет) или свежий mint ──
-  let prefix = (process.env.CAMPUS_PROXY_PREFIX || '').trim().replace(/\/+$/, '');
-  if (!prefix) {
-    log('[1/3] Минтим прокси-хэш...');
-    prefix = await mintProxyPrefix();
-    log('      префикс: ' + prefix.slice(0, 90) + '…');
-  } else if (!/^https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+$/.test(prefix)) {
-    fail('CAMPUS_PROXY_PREFIX имеет неверный формат: ' + prefix.slice(0, 90) +
-      '\n  Ожидается: https://translated.turbopages.org/proxy_u/<pair>.<uuid>/https/campus.syktsu.ru/schedule/group' +
-      '\n  Заминтите заново: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : ''));
+  let prefix = '';
+  if (DIRECT) {
+    log('Прямое подключение: POST к ' + CAMPUS_BASE);
   } else {
-    log('[1/3] Прокси-префикс из CAMPUS_PROXY_PREFIX:');
-    log('      ' + prefix.slice(0, 90) + '…');
-    log('      Проверяем живость префикса...');
-    const alive = await checkProxyPrefix(prefix, group);
-    if (!alive) {
-      fail('Префикс протух — прокси вернул HTTP-ошибку.' +
-        '\n  Обновите CAMPUS_PROXY_PREFIX с российского IP: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : '') +
-        '\n  или вручную: Settings → Variables.');
+    prefix = (process.env.CAMPUS_PROXY_PREFIX || '').trim().replace(/\/+$/, '');
+    if (!prefix) {
+      log(stepLabel() + ' Минтим прокси-хэш...');
+      prefix = await mintProxyPrefix();
+      log('      префикс: ' + prefix.slice(0, 90) + '…');
+    } else if (!/^https:\/\/translated\.turbopages\.org\/proxy_u\/[^/]+\/https\/[^?]+$/.test(prefix)) {
+      fail('CAMPUS_PROXY_PREFIX имеет неверный формат: ' + prefix.slice(0, 90) +
+        '\n  Ожидается: https://translated.turbopages.org/proxy_u/<pair>.<uuid>/https/campus.syktsu.ru/schedule/group' +
+        '\n  Заминтите заново: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : ''));
+    } else {
+      log(stepLabel() + ' Прокси-префикс из CAMPUS_PROXY_PREFIX:');
+      log('      ' + prefix.slice(0, 90) + '…');
+      log('      Проверяем живость префикса...');
+      const alive = await checkProxyPrefix(prefix, group);
+      if (!alive) {
+        fail('Префикс протух — прокси вернул HTTP-ошибку.' +
+          '\n  Обновите CAMPUS_PROXY_PREFIX с российского IP: node sync.js --mint' + (setVar ? ' --set-variable <owner/repo>' : '') +
+          '\n  или вручную: Settings → Variables.');
+      }
+      log('      ✓ префикс живой');
     }
-    log('      ✓ префикс живой');
   }
 
   log('');
-  log('[2/3] Качаем недели (' + CAMPUS_BASE + '?...searchdata)…');
+  log(stepLabel() + ' Качаем недели (' + CAMPUS_BASE + '?...searchdata)…');
   const weeksHtml = await fetchCampusHtml(prefix, group);
   const weeks = parseWeekOptions(weeksHtml);
   if (!weeks.length) {
@@ -356,18 +419,29 @@ async function main() {
   log('      последняя: ' + weeks[weeks.length - 1].text);
 
   const currentIdx = findCurrentWeek(weeks);
+  let targetIdx = currentIdx;
+  if (targetDate) {
+    const found = findWeekByDate(weeks, targetDate);
+    if (found === null) fail('Неверный формат TARGET_DATE: ' + targetDate + ' (ожидается ДД.ММ.ГГГГ или ГГГГ-ММ-ДД)');
+    if (found < 0) fail('Дата ' + targetDate + ' вне диапазона недель (' + weeks[0].text + ' — ' + weeks[weeks.length - 1].text + ')');
+    targetIdx = found;
+  }
+
   log('');
-  log('[3/3] Качаем расписание: текущая (' + (currentIdx + 1) + '-я из списка) + ' + ahead + ' вперёд…');
+  if (targetDate) {
+    log(stepLabel() + ' Качаем расписание: неделя от ' + targetDate + ' (' + weeks[targetIdx].text + ')…');
+  } else if (!DIRECT || ahead === 0) {
+    log(stepLabel() + ' Текущая неделя (' + (currentIdx + 1) + '-я из списка) уже в ответе — отдельный запрос не нужен'
+      + (!DIRECT && ahead > 0 ? ' (AHEAD_WEEKS через прокси игнорируется — кампус отдаёт только текущую)' : '') + '…');
+  } else {
+    log(stepLabel() + ' Качаем расписание: текущая (' + (currentIdx + 1) + '-я из списка) + ' + ahead + ' вперёд…');
+  }
 
-  const indices = [];
-  for (let i = currentIdx; i < Math.min(weeks.length, currentIdx + 1 + ahead); i++) indices.push(i);
-
-  const parsed = [];
-  for (const i of indices) {
-    const w = weeks[i];
-    const html = await fetchCampusHtml(prefix, group, w.value);
+  // Текущую неделю кампус отдаёт прямо в ответе на searchdata=ИСКАТЬ,
+  // поэтому в обычном (прокси) режиме дополнительных запросов нет.
+  // data — результат parseScheduleHTML, тот же формат, что и в frontend/app.js.
+  const parseWeek = (w, html) => {
     const data = parseScheduleHTML(html);
-    data.campusUpdatedAt = extractCampusUpdatedAt(html);
     let totalPairs = 0;
     const daysSummary = {};
     for (const [dayName, day] of Object.entries(data.days)) {
@@ -377,29 +451,49 @@ async function main() {
         daysSummary[dayName] = nonEmpty.map(p => p.num + ' ' + p.time + ' ' + p.subject + (p.type ? ' (' + p.type + ')' : '') + (p.teacher ? ' — ' + p.teacher : '')).join('; ');
       }
     }
-    parsed.push({
+    const entry = {
       weekCode: w.value,
       weekText: w.text,
-      weekStart: data.weekStart,
-      weekEnd: data.weekEnd,
-      days: Object.keys(data.days).length,
+      data,
       pairs: totalPairs,
       daysSummary,
-    });
+    };
     log('  ' + w.value + ' [' + w.text + ']: дней=' + Object.keys(data.days).length + ', пар=' + totalPairs);
     for (const [dayName, s] of Object.entries(daysSummary)) {
       log('      ' + dayName + ': ' + s);
     }
+    return entry;
+  };
+
+  const parsed = [];
+  if (!targetDate && (!DIRECT || ahead === 0)) {
+    parsed.push(parseWeek(weeks[currentIdx], weeksHtml));
+  } else {
+    const indices = [];
+    if (targetDate) indices.push(targetIdx);
+    else for (let i = currentIdx; i < Math.min(weeks.length, currentIdx + 1 + ahead); i++) indices.push(i);
+    for (const i of indices) {
+      const w = weeks[i];
+      const html = await fetchCampusHtml(prefix, group, w.value);
+      parsed.push(parseWeek(w, html));
+    }
   }
 
+  // Сводка в формате парсера frontend/app.js:
+  //   weeks     — полный список, как parseWeekOptions (value/text/weekNum/dates);
+  //   schedules — как payload /api/sync-from-campus: [{ weekCode, data }],
+  //               где data = результат parseScheduleHTML (group, weekStart,
+  //               weekEnd, days: { день: { date, pairs: [{ num, time, subject,
+  //               teacher, room, type, subgroup }] } }).
   const summary = {
     ok: true,
     group,
     weeksTotal: weeks.length,
     campusUpdatedAt,
+    weeks,
     parsedWeeks: parsed.length,
     totalPairs: parsed.reduce((acc, p) => acc + p.pairs, 0),
-    weeks: parsed.map(p => ({ weekCode: p.weekCode, weekText: p.weekText, pairs: p.pairs })),
+    schedules: parsed.map(p => ({ weekCode: p.weekCode, weekText: p.weekText, data: p.data })),
   };
   log('');
   log('=== СВОДКА (JSON) ===');
