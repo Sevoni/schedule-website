@@ -341,7 +341,14 @@ async function main() {
   const weeksHtml = await fetchCampusHtml(prefix, group);
   const weeks = parseWeekOptions(weeksHtml);
   if (!weeks.length) {
-    throw new Error('Не удалось распарсить список недель — группа не найдена или разметка изменилась');
+    const markers = [];
+    if (/captcha|showcaptcha|smartcaptcha|turnstile|human\s*verification/i.test(weeksHtml)) markers.push('капча Яндекса');
+    if (/доступ ограничен|доступ закрыт|блокирован/i.test(weeksHtml)) markers.push('блокировка доступа');
+    if (/ошибк|error|not\s*found/i.test(weeksHtml)) markers.push('страница ошибки');
+    const probe = weeksHtml.replace(/\s+/g, ' ').slice(0, 800);
+    fail('Не удалось распарсить список недель — группа не найдена или разметка изменилась.' +
+      '\n  Размер HTML: ' + weeksHtml.length + ' байт; маркеры: ' + (markers.length ? markers.join(', ') : 'не найдены') +
+      '\n  Начало HTML: ' + probe + (weeksHtml.length > 800 ? ' …' : ''));
   }
   const campusUpdatedAt = extractCampusUpdatedAt(weeksHtml);
   log('      недель: ' + weeks.length + (campusUpdatedAt ? ', обновлено: ' + campusUpdatedAt : ', обновлено: не найдено'));
