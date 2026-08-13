@@ -24,6 +24,11 @@ on:
   schedule:
     - cron: '0 */4 * * *'   # каждые 4 часа
   workflow_dispatch:         # ручной запуск (кнопка "Run workflow")
+    inputs:
+      group:                 # любая группа — поле в UI ручного запуска
+        description: 'Группа для парсинга (например, 131-ИБо). Пусто — CAMPUS_GROUP или 131-ИБо'
+        required: false
+        default: ''
 
 concurrency:
   group: campus-sync
@@ -44,9 +49,9 @@ jobs:
 
       - name: Parse campus schedule via Yandex proxy
         env:
-          # Группа — переопределяется переменной репозитория
+          # Группа — из поля ручного запуска, иначе из переменной репозитория
           # (Settings → Variables), по умолчанию 131-ИБо.
-          GROUP: ${{ vars.CAMPUS_GROUP || '131-ИБо' }}
+          GROUP: ${{ inputs.group || vars.CAMPUS_GROUP || '131-ИБо' }}
           # Заминтированный на российской машине прокси-префикс
           # (см. шапку файла: node sync.js --mint --set-variable owner/repo).
           CAMPUS_PROXY_PREFIX: ${{ vars.CAMPUS_PROXY_PREFIX }}
