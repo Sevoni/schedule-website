@@ -64,6 +64,15 @@ const SCHEDULE_PAIR_KEYS = ['subject', 'teacher', 'room', 'type', 'subgroup', 'n
 
 const ALLOWED_PAIR_TYPES = new Set(['л', 'пр', 'пз', 'лаб', 'с', 'зчО', 'зач', 'экз']);
 
+// Допустимые значения enum-полей домашнего задания. В отличие от расписания,
+// в ДЗ дополнительно разрешён 'any' («любой тип пары» / «обе подгруппы») —
+// это значение по умолчанию, которое шлёт фронтенд. Пустая строка тоже
+// допустима: handleAddHw приводит её к 'any' через `clean.pairType || 'any'`,
+// а браузер при редактировании записи с невалидным значением (старые грязные
+// данные) не находит опцию в <select> и отправляет именно ''.
+const ALLOWED_HW_PAIR_TYPES = new Set(['л', 'пр', 'пз', 'лаб', 'с', 'зчО', 'зач', 'экз', 'any']);
+const ALLOWED_HW_SUBGROUPS = new Set(['1', '2', 'any']);
+
 function sanitizePair(p) {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
   const out = {};
@@ -143,6 +152,25 @@ function sanitizeHwFields(body) {
   if (body.subgroup != null) out.subgroup = sanitizeString(body.subgroup, 10);
   if (body.dueDate != null) out.dueDate = sanitizeString(body.dueDate, 40);
   return out;
+}
+
+// Валидация enum-полей ДЗ (pairType / subgroup). Возвращает null, если оба поля
+// отсутствуют (частичный PUT) или допустимы, иначе — строку с описанием ошибки
+// (вызывающий код превращает её в 400). Пустая строка допустима: она означает
+// «любой тип/подгруппа» и нормализуется в 'any' в handleAddHw / хранится как
+// 'any'-эквивалент при обновлении. Значения нормализуем через sanitizeString
+// (та же логика, что в sanitizeHwFields), чтобы число/мусор были строками.
+function validateHwEnums(body) {
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return null;
+  if (body.pairType != null) {
+    const t = sanitizeString(body.pairType, 20);
+    if (t !== '' && !ALLOWED_HW_PAIR_TYPES.has(t)) return `Invalid pairType "${t}"`;
+  }
+  if (body.subgroup != null) {
+    const s = sanitizeString(body.subgroup, 10);
+    if (s !== '' && !ALLOWED_HW_SUBGROUPS.has(s)) return `Invalid subgroup "${s}"`;
+  }
+  return null;
 }
 
 // ── Лимит размера тела запроса (анти-DoS) ──────────────────────
@@ -728,7 +756,19 @@ async function handleOwnerStatus(request, env, corsHeaders) {
 
 // POST /api/owner/logout
 // Публичный. Удаляет куку __Host-owner_code. Роль owner сбрасывается в браузере.
+// CSRF-защита (см. csrfGuardForCookieAuth): HttpOnly-кука __Host-owner_code
+// прикладывается браузером автоматически, в т.ч. к same-site form-POST
+// с поддомена dpdns.org — такой POST мог бы вылогинить владельца. Поэтому,
+// если роль owner пришла из куки (auth.viaCookie), требуем заголовок
+// X-Requested-With: fetch (его шлёт только наш JS — apiPost в app.js).
+// Bearer-авторизация и запросы вообще без авторизации (идемпотентный logout
+// «вхолостую») заголовок не требуют: гвард их пропускает. Эндпоинт остаётся
+// публичным — logout работает и без Bearer.
 async function handleOwnerLogout(request, env, corsHeaders) {
+  const auth = await resolveAuth(request, env);
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
+
   const headers = {
     ...securityHeaders,
     ...corsHeaders,
@@ -984,9 +1024,7 @@ async function handleGetSchedule(request, env, corsHeaders) {
   if (weekCode) {
     const data = await store.get(`schedule:${group}:${weekCode}`, { type: 'json' });
     if (data) {
-      const cc = await cacheControlForGet(request, env);
-      const finalCc = cc === CC_READER_GET ? CC_READER_GET_WEEKS : cc;
-      return jsonResponse(data, corsHeaders, 200, { cacheControl: finalCc, isPrivate: await isAuthRequest(request, env) });
+      return jsonResponse(data, corsHeaders, 200, { cacheControl: await finalCacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
     }
     return jsonResponse({ error: 'Week not found' }, corsHeaders, 404);
   }
@@ -1050,9 +1088,8 @@ async function handleGetSchedules(request, env, corsHeaders) {
     result[weekCode] = e.value;
   }
 
-  const cc = await cacheControlForGet(request, env);
-  const finalCc = cc === CC_READER_GET ? CC_READER_GET_WEEKS : cc;
-  return jsonResponse(result, corsHeaders, 200, { cacheControl: finalCc, isPrivate: await isAuthRequest(request, env) });
+  const cc = await finalCacheControlForGet(request, env);
+  return jsonResponse(result, corsHeaders, 200, { cacheControl: cc, isPrivate: await isAuthRequest(request, env) });
 }
 
 // ── GET /api/bootstrap?group=...&weeks=w1,w2,... ────────────────
@@ -1120,11 +1157,11 @@ async function handleBootstrap(request, env, corsHeaders) {
     }
   }
 
-  const baseCc = await cacheControlForGet(request, env);
   // Базовый /api/bootstrap?group= (без weeks) инвалидируется purge точно,
   // поэтому его TTL не трогаем. С weeks= — комбинации не перечислить, см.
-  // CC_READER_GET_WEEKS (60 с).
-  const finalCc = (validWeeks.length > 0 && baseCc === CC_READER_GET) ? CC_READER_GET_WEEKS : baseCc;
+  // CC_READER_GET_WEEKS (60 с). Выбор политики — в finalCacheControlForGet
+  // (общая для MISS-пути и HIT-ветки cachedGet).
+  const finalCc = await finalCacheControlForGet(request, env);
   return jsonResponse({
     weeks: weeksData || [],
     schedules,
@@ -1512,6 +1549,11 @@ async function handleAddHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Invalid dueMode' }, corsHeaders, 400);
   }
 
+  const enumError = validateHwEnums(body);
+  if (enumError) {
+    return jsonResponse({ error: enumError }, corsHeaders, 400);
+  }
+
   const clean = sanitizeHwFields(body);
 
   const item = {
@@ -1569,6 +1611,14 @@ async function handleUpdateHw(request, env, corsHeaders) {
   // из допустимых значений (как при создании ДЗ в handleAddHw).
   if (body.dueMode != null && !['nextPair', 'date'].includes(body.dueMode)) {
     return jsonResponse({ error: 'Invalid dueMode' }, corsHeaders, 400);
+  }
+
+  // Enum-поля: если переданы — проверяем до обращения к базе. Частичные
+  // обновления ({ id, group, dueDate }) проходят: отсутствующие поля не
+  // проверяются и не меняются (см. ниже clean.pairType != null ? ... ).
+  const enumError = validateHwEnums(body);
+  if (enumError) {
+    return jsonResponse({ error: enumError }, corsHeaders, 400);
   }
 
   const key = `hw:${group}`;
@@ -1758,6 +1808,9 @@ async function handlePutSubjects(request, env, corsHeaders) {
   if (!group || !isValidGroup(group) || !Array.isArray(subjects)) {
     return jsonResponse({ error: 'Missing group or subjects' }, corsHeaders, 400);
   }
+  if (semester && !isValidSemesterKey(semester)) {
+    return jsonResponse({ error: 'Invalid semester' }, corsHeaders, 400);
+  }
 
   const sem = semester || currentSemesterKey();
   await store.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
@@ -1812,6 +1865,18 @@ function currentSemesterKey(now = new Date()) {
   }
   // весна: с 31 января по 31 июля
   return `${y - 1}-${y}-весна`;
+}
+
+// Валидация ключа семестра из пользовательского ввода (POST /api/subjects).
+// Формат строго совпадает с currentSemesterKey(): "2025-2026-осень" /
+// "2025-2026-весна" — годы четырёхзначные и идут подряд (второй = первый + 1).
+// Regex отсекает управляющие символы, кавычки и произвольные строки,
+// поэтому отдельная sanitizeString не нужна.
+function isValidSemesterKey(sem) {
+  if (typeof sem !== 'string') return false;
+  const m = /^(\d{4})-(\d{4})-(весна|осень)$/.exec(sem);
+  if (!m) return false;
+  return parseInt(m[2], 10) === parseInt(m[1], 10) + 1;
 }
 
 function semesterFromWeekDates(startStr, endStr) {
@@ -2133,6 +2198,32 @@ async function cacheControlForGet(request, env) {
   return CC_READER_GET;
 }
 
+// Итоговая политика Cache-Control для ответа на GET — ЕДИНАЯ точка выбора.
+// Обёртка над cacheControlForGet + поправка для запросов, зависящих от
+// параметров week/weeks (/api/schedule?week=, /api/schedules?weeks=,
+// /api/bootstrap?weeks=): комбинаций таких параметров бесконечно много,
+// purge по точному URL их не накрывает (см. purgeGroupCdnCache), поэтому
+// для читательских ответов TTL сокращается до CC_READER_GET_WEEKS (60 с).
+// Используется и в хендлерах (MISS-путь, где ставится Cache-Control), и в
+// cachedGet при отдаче из кэша (HIT) — чтобы кэшированный ответ не нёс
+// устаревший Cache-Control после смены констант политики: на HIT политика
+// пересчитывается из ТЕКУЩИХ констант, а не берётся из кэшированной копии.
+async function finalCacheControlForGet(request, env) {
+  const cc = await cacheControlForGet(request, env);
+  if (cc !== CC_READER_GET) return cc; // writer/owner — private, без поправок
+  const url = new URL(request.url);
+  const path = url.pathname;
+  if (path === '/api/schedules') return CC_READER_GET_WEEKS;
+  if (path === '/api/schedule' && url.searchParams.get('week')) return CC_READER_GET_WEEKS;
+  if (path === '/api/bootstrap') {
+    const weeks = (url.searchParams.get('weeks') || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    // Совпадает с условием validWeeks.length > 0 в handleBootstrap.
+    if (weeks.some((w) => isValidWeekCode(w))) return CC_READER_GET_WEEKS;
+  }
+  return cc;
+}
+
 // Есть ли у запроса аутентификация (writer/owner): Bearer-токен ИЛИ
 // валидная HttpOnly-cookie __Host-owner_code. Для таких ответов isPrivate=true:
 // Vary:Authorization + private, чтобы CDN не смешивал их с reader-кешем.
@@ -2217,6 +2308,18 @@ async function cachedGet(request, env, corsHeaders, builder) {
         // поэтому CORS всегда пересчитывается для текущего запроса.
         stripCorsHeaders(h);
         for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
+        // Cache-Control тоже пересчитываем из ТЕКУЩИХ констант (см.
+        // finalCacheControlForGet): в кэше могут лежать ответы, закешированные
+        // при старой политике (старые TTL), и HIT не должен отдавать их с
+        // устаревшими заголовками — значение берём то же, что поставил бы
+        // MISS-путь для этого запроса.
+        const cc = await finalCacheControlForGet(request, env);
+        // Защита от выдачи приватного ответа из общего кэша: до HIT доходят
+        // только reader'ы (для writer/owner выше ранний выход), но если
+        // текущая политика для этого запроса вдруг непубличная — не отдаём
+        // кэш, а идём в builder (MISS-семантика).
+        if (cc !== CC_READER_GET && cc !== CC_READER_GET_WEEKS) return builder();
+        h.set('Cache-Control', cc);
         return new Response(hit.body, { status: hit.status, headers: h });
       }
     } catch (_) {
@@ -2284,6 +2387,15 @@ function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
 
 const TG_API_BASE = 'https://api.telegram.org';
 
+// Срок жизни ключей Telegram-подписок (tg:subs:{group}, tg:groups:{chatId}),
+// 180 суток в секундах. Ставится при КАЖДОЙ записи: создание, миграция legacy,
+// обновление. store.put — upsert (ON CONFLICT ... expires_at = excluded.expires_at),
+// поэтому повторный put продлевает срок (активность подписки = повторный /sub
+// или смена подгруппы через инлайн-кнопку). Брошенные подписки (блок бота,
+// удаление чата, забывчивость) протухают и удаляются ежедневным cron
+// (cleanupExpired), что ограничивает неконтролируемый рост D1.
+const TG_SUBS_TTL_SECONDS = 15552000; // 180 * 24 * 60 * 60
+
 function maskChatId(id) {
   const s = String(id);
   return s.length <= 4 ? '***' : '***' + s.slice(-4);
@@ -2326,7 +2438,7 @@ async function getGroupSubscribers(env, group) {
     const old = await store.get(`tg:chat:${group}`);
     if (old) {
       const list = [{ chatId: String(old), subgroup: 'any' }];
-      await store.put(`tg:subs:${group}`, JSON.stringify(list));
+      await store.put(`tg:subs:${group}`, JSON.stringify(list), { expirationTtl: TG_SUBS_TTL_SECONDS });
       await store.delete(`tg:chat:${group}`);
       return list;
     }
@@ -2336,7 +2448,7 @@ async function getGroupSubscribers(env, group) {
   // Миграция: массив строк → массив объектов.
   if (raw.length && typeof raw[0] === 'string') {
     const migrated = raw.map(id => ({ chatId: String(id), subgroup: 'any' }));
-    await store.put(`tg:subs:${group}`, JSON.stringify(migrated));
+    await store.put(`tg:subs:${group}`, JSON.stringify(migrated), { expirationTtl: TG_SUBS_TTL_SECONDS });
     return migrated;
   }
   return raw;
@@ -2351,14 +2463,14 @@ async function addGroupSubscriber(env, group, chatId, subgroup) {
   } else {
     list.push({ chatId: String(chatId), subgroup: subgroup || 'any' });
   }
-  await store.put(`tg:subs:${group}`, JSON.stringify(list));
+  await store.put(`tg:subs:${group}`, JSON.stringify(list), { expirationTtl: TG_SUBS_TTL_SECONDS });
 }
 
 async function removeGroupSubscriber(env, group, chatId) {
   const store = createStore(env);
   const list = await getGroupSubscribers(env, group);
   const filtered = list.filter(s => String(s.chatId) !== String(chatId));
-  if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered));
+  if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered), { expirationTtl: TG_SUBS_TTL_SECONDS });
   else await store.delete(`tg:subs:${group}`);
 }
 
@@ -2445,8 +2557,11 @@ function splitForTg(text, maxLen) {
 // `*` и `_` НЕ экранируем — это markdown-разметка (жирный/курсив),
 // которую пользователь может вводить в тексте ДЗ. Непарные разделители
 // GFM оставляет как есть, поэтому одиночные звёздочки не ломают текст.
+// `<` и `>` экранируем (защита в глубину): Rich Markdown принимает HTML-теги,
+// поэтому литеральные < > из пользовательского текста не должны превращаться
+// в разметку/ссылки — GFM рендерит экранированные \< \> как обычные символы.
 function escMarkdown(s) {
-  return String(s).replace(/[\\`~\[\]]/g, (ch) => '\\' + ch);
+  return String(s).replace(/[\\`~<>\[\]]/g, (ch) => '\\' + ch);
 }
 
 // Конвертация нашей HTML-разметки (escTg + <b>/<i>/<code>) в Rich Markdown —
@@ -2454,8 +2569,15 @@ function escMarkdown(s) {
 // GitHub Flavored Markdown и дополнительно принимает HTML-теги, но для
 // красоты и читаемости переводим базовые теги в md-синтаксис.
 function htmlToMarkdown(html) {
-  const entities = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
-  const decode = (s) => s.replace(/&(amp|lt|gt|quot|#39);/g, (m) => entities[m] || m);
+  // ВАЖНО (безопасность): &lt;/&gt; намеренно НЕ декодируем обратно в < >.
+  // escTg экранирует пользовательские < > в &lt;/&gt;, а их декодирование здесь
+  // превращало их в настоящие HTML-теги в Rich Markdown (он принимает HTML) —
+  // т.е. открывало HTML-инъекцию: <a href="https://evil.ru"> из текста ДЗ
+  // становилось кликабельной ссылкой, битый тег давал 400 от Telegram.
+  // Сущности &lt;/&gt; Telegram рендерит как обычные < > — текст виден
+  // корректно, но тегом/ссылкой не становится.
+  const entities = { '&amp;': '&', '&quot;': '"', '&#39;': "'" };
+  const decode = (s) => s.replace(/&(amp|quot|#39);/g, (m) => entities[m] || m);
   let out = '';
   let i = 0;
   while (i < html.length) {
@@ -2463,12 +2585,12 @@ function htmlToMarkdown(html) {
     if (lt === -1) { out += escMarkdown(decode(html.slice(i))); break; }
     out += escMarkdown(decode(html.slice(i, lt)));
     const gt = html.indexOf('>', lt);
-    if (gt === -1) { out += html.slice(lt); break; }
+    if (gt === -1) { out += escMarkdown(html.slice(lt)); break; }
     const tag = html.slice(lt + 1, gt);
     if (tag === 'b' || tag === '/b') out += '**';
     else if (tag === 'i' || tag === '/i') out += '*';
     else if (tag === 'code' || tag === '/code') out += '`';
-    else out += html.slice(lt, gt + 1); // незнакомый тег оставляем как есть
+    else out += escMarkdown(html.slice(lt, gt + 1)); // незнакомый/битый тег — экранируем как текст, а не пропускаем как HTML
     i = gt + 1;
   }
   return out;
@@ -2593,7 +2715,7 @@ async function handleTgWebhook(request, env) {
         const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
         if (!groupsRaw.includes(group)) {
           groupsRaw.push(group);
-          await store.put(`tg:groups:${chatId}`, JSON.stringify(groupsRaw));
+          await store.put(`tg:groups:${chatId}`, JSON.stringify(groupsRaw), { expirationTtl: TG_SUBS_TTL_SECONDS });
         }
 
         const subLabel = subgroup === 'any' ? 'обе подгруппы' : `подгруппа ${subgroup}`;
@@ -2745,12 +2867,26 @@ async function unbindChat(env, chatId) {
 }
 
 // ── POST /api/tg/status { group, chatId } ───────────────────────
-// Возвращает { subscribed, botUsername } — подписан ли ПЕРЕДАННЫЙ chatId
-// к этой группе (изоляция: каждый пользователь видит только свой статус).
-// chatId принимается в теле POST, а НЕ в query GET: личный chatId не должен
-// попадать в URL (логи Cloudflare/прокси, история браузера).
+// Публичный «оракул»: возвращает { subscribed, botUsername } — подписан ли
+// ПЕРЕДАННЫЙ chatId к этой группе. Это осознанный компромисс: запрос приходит
+// со страницы сайта (браузера), сервер не знает, кто реально спрашивает, и
+// надёжно привязать ответ к отправителю нельзя. Поверхность утечки ограничена:
+//   • строгая валидация chatId — только цифры, иначе 400 БЕЗ обращения к D1
+//     (мусорный перебор abc/-1/12.5/управляющие символы вообще не «спрашивает»);
+//   • rate-limit tgstatus 30/мин/IP (см. applyRateLimits) — валидный перебор
+//     chatId (9–10 цифр) при такой скорости занимает годы;
+//   • chatId в теле POST, а НЕ в query GET: личный chatId не должен попадать
+//     в URL (логи Cloudflare/прокси, история браузера).
+// Пустой chatId — штатный запрос сайта до привязки бота: отвечаем
+// subscribed:false сразу, без чтения D1 (фронт при этом чистит localStorage).
 // Отписка — только командой /stop в боте (webhook), где chatId берётся
 // из самого апдейта Telegram (подписанного secret_token).
+
+// chatId — числовой идентификатор чата Telegram (у ботов подписки только из
+// личных чатов, поэтому id положительный). Принимаем строку из цифр (1–16)
+// или неотрицательное целое число; остальное (строки с пробелами, знак,
+// дробные, булевы, объекты) → 400.
+const TG_CHAT_ID_RE = /^\d{1,16}$/;
 
 async function handleTgStatus(request, env, corsHeaders) {
   const store = createStore(env);
@@ -2762,12 +2898,21 @@ async function handleTgStatus(request, env, corsHeaders) {
   }
   const body = bb.json || {};
   const group = normalizeGroup(body.group);
-  const chatId = String(body.chatId != null ? body.chatId : '').slice(0, 64);
   if (!isValidGroup(group)) {
     return jsonResponse({ error: 'Invalid group' }, corsHeaders, 400);
   }
+  const chatId = body.chatId != null ? String(body.chatId) : '';
+  if (chatId !== '' && !TG_CHAT_ID_RE.test(chatId)) {
+    return jsonResponse({ error: 'Invalid chatId' }, corsHeaders, 400);
+  }
+  if (!chatId) {
+    return jsonResponse({
+      subscribed: false,
+      botUsername: env.TG_BOT_USERNAME || '',
+    }, corsHeaders, 200, { cacheControl: CC_NO_STORE });
+  }
   const subs = await getGroupSubscribers(env, group);
-  const existing = chatId ? subs.find(s => String(s.chatId) === String(chatId)) : null;
+  const existing = subs.find(s => String(s.chatId) === chatId);
   return jsonResponse({
     subscribed: !!existing,
     botUsername: env.TG_BOT_USERNAME || '',
@@ -2969,6 +3114,11 @@ const RATE_LIMIT_VERIFY = 10;
 // Telegram webhook (шлёт исходящие в Telegram): 60/мин.
 const RATE_LIMIT_TG_WEBHOOK = 60;
 // /api/tg/status (оракул подписки по chatId): 30/мин.
+// Значение намеренно НЕ ужесточаем: (1) сайт ходит сюда при каждом открытии
+// настроек и смене группы, а за одним cf-connecting-ip (CGNAT/NAT) сидят десятки
+// честных пользователей — лимит ниже дал бы ложные 429 (см. RATE_LIMIT_GLOBAL);
+// (2) мусорный перебор отсекается строгой валидацией chatId (400 до D1),
+// а валидный перебор цифр и так занимает годы при 30 запросах/мин/IP.
 const RATE_LIMIT_TG_STATUS = 30;
 
 // Извлекает IP клиента из каноничного заголовка Cloudflare.
@@ -3109,6 +3259,8 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
       if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
     }
     // /api/tg/status — публичный оракул подписки по chatId: замедлить перебор.
+    // Плюс строгая валидация chatId в handleTgStatus (только цифры, иначе 400
+    // без чтения D1) — мусорные пробы не попадают даже в счётчик «ответов».
     if (path === '/api/tg/status') {
       const rl = await checkRateLimit(store, ip, 'tgstatus', RATE_LIMIT_TG_STATUS, RATE_LIMIT_WINDOW_SEC);
       if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter, rl);

@@ -7,4 +7,4 @@
   Referrer-Policy: no-referrer
   Strict-Transport-Security: max-age=31536000; includeSubDomains
   Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
-  Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-ZwQm2DvFzITZP8DlcrJzJ0u86bEGhGecCPIXZ8wdsuQ='; connect-src 'self' https://campus.syktsu.ru https://api.telegram.org; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+  Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-ZwQm2DvFzITZP8DlcrJzJ0u86bEGhGecCPIXZ8wdsuQ='; connect-src 'self' https://campus.syktsu.ru; base-uri 'self'; frame-ancestors 'none'; form-action 'self'

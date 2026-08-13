@@ -488,7 +488,17 @@ async function consumeInviteTokenFromUrl() {
   let fromHash = false;
   if (!token) {
     const hashMatch = (location.hash || '').match(/^#invite=([^&]+)/);
-    if (hashMatch) { token = decodeURIComponent(hashMatch[1]); fromHash = true; }
+    if (hashMatch) {
+      try {
+        token = decodeURIComponent(hashMatch[1]);
+      } catch (_) {
+        // Битая %-последовательность (например, #invite=%zz): URIError здесь
+        // прервал бы стартовую цепочку init. Считаем, что ссылки нет.
+        console.warn('[invite] некорректный #invite= в URL, ссылка проигнорирована');
+        token = '';
+      }
+      fromHash = true;
+    }
   }
   if (!token) return;
 
@@ -566,7 +576,17 @@ async function consumeOwnerCodeFromUrl() {
   let fromHash = false;
   if (!code) {
     const hashMatch = (location.hash || '').match(/^#owner=([^&]+)/);
-    if (hashMatch) { code = decodeURIComponent(hashMatch[1]).trim(); fromHash = true; }
+    if (hashMatch) {
+      try {
+        code = decodeURIComponent(hashMatch[1]).trim();
+      } catch (_) {
+        // Битая %-последовательность (например, #owner=%zz): URIError здесь
+        // прервал бы стартовую цепочку init. Считаем, что ссылки нет.
+        console.warn('[owner] некорректный #owner= в URL, ссылка проигнорирована');
+        code = '';
+      }
+      fromHash = true;
+    }
   }
   if (!code) return false;
 
