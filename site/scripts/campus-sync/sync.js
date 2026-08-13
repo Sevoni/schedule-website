@@ -41,6 +41,9 @@
 // только с DIRECT=1 (напрямую, из России).
 
 const CAMPUS_BASE = 'https://campus.syktsu.ru/schedule/group/';
+// lang=ru-ru: заминтить с парой ru-ru — страница отдаётся как «перевод
+// русского на русский», т.е. БЕЗ перевода (иначе tr_page.js динамически
+// переводит контент на английский при открытии в браузере).
 const MINT_URL = 'https://translate.yandex.com/translate?url=';
 const { execFileSync } = require('node:child_process');
 
@@ -79,7 +82,10 @@ function fail(msg) { console.error('[ERROR] ' + msg); process.exit(1); }
 
 async function mintProxyPrefix() {
   const target = encodeURIComponent(CAMPUS_BASE);
-  const resp = await fetch(MINT_URL + target + '&lang=en-ru', {
+  // lang=ru-ru — «перевод с русского на русский»: страница отдаётся без
+  // перевода (проверено: trDir='ru-ru', uiLang='en'), пары en-ru показывают
+  // переведённую версию при открытии прокси-URL в браузере.
+  const resp = await fetch(MINT_URL + target + '&lang=ru-ru', {
     redirect: 'manual',
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
   });

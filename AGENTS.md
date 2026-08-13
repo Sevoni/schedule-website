@@ -90,28 +90,28 @@ Local secrets go in `site/.dev.vars` (gitignored).
 - **Frontend** (`site/frontend/`): vanilla JS SPA, no framework. Fetches from Worker API, falls back to parsing campus.syktsu.ru directly in the browser.
 - **Cron** (`[triggers]` in wrangler.toml): daily cleanup of expired D1 rows.
 - **Route**: `kampussgu.dpdns.org/api/*` → Worker (custom domain). Static Pages on same domain.
-- **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` **only when var `ALLOW_PREVIEW_CORS === "true"`** (default `"false"` on prod; local override in `.dev.vars`) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Preview builds (`{hash}.schedule-worker.pages.dev`) deliberately do NOT work against the prod API — frontend testing happens via deploy to the main domain. Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based).
+- **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` **only when var `ALLOW_PREVIEW_CORS === "true"`** (default `"false"` on prod; local override in `.dev.vars`) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Preview builds (`{hash}.schedule-worker.pages.dev`) deliberately do NOT work against the prod API — frontend testing happens via deploy to the main domain. Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based). On top of CORS, ALL `/api/*` responses (incl. 429 `rateLimitResponse`, TG webhook `tgWebhookResponse`, preflight `OPTIONS`) get a uniform defensive base via the single `securityHeaders` object in `worker/index.js`: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Strict-Transport-Security: max-age=31536000; includeSubDomains` (no `preload` — requires hstspreload.org registration), `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, `Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()` (identical to static `frontend/_headers`). COOP/CORP are NOT CORS headers — `cachedGet` strips/re-applies only `CORS_HEADER_NAMES`, so they stay on cached responses harmlessly.
 - **CDN caching**: public GETs are manually cached via Cache API (`cachedGet` in `worker/index.js`): readers get `public, max-age=60, s-maxage=300` (CDN 5 min), writers `private, no-store`. After every write the worker purges that group's cached URLs (`purgeGroupCdnCache`). If you test with curl and see stale data, pass an `Authorization: Bearer` header (bypasses cache) or wait for purge.
 
 ### Auth (role-based access)
 
-`resolveAuth(request, env)` reads `Authorization: Bearer <token>` and, if absent, the **HttpOnly cookie `owner_code`**:
+`resolveAuth(request, env)` reads `Authorization: Bearer <token>` and, if absent, the **HttpOnly cookie `__Host-owner_code`**:
 
 - no header + no cookie → **reader** (anonymous; group from query/body). GET only.
 - token ∈ D1 `inv:{token}` → **writer** (group from the invite record). POST/PUT/DELETE.
-- token === `env.OWNER_CODE` OR valid `owner_code` cookie (constant-time compare of SHA-256 hash via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
+- token === `env.OWNER_CODE` OR valid `__Host-owner_code` cookie (constant-time compare of SHA-256 hash via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
 
 All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 
-- **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `owner_code` cookie (30 days, `Secure; SameSite=Lax`). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend restores `ownerRole` on every load via a lightweight `GET /api/owner/status` (computed from the cookie server-side, no D1) — this runs at the start of `loadData()` because the cache-only fast path (warm localStorage caches) skips `/api/bootstrap` entirely. `isOwner` is also returned in `/api/bootstrap`. Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
+- **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `__Host-owner_code` cookie (30 days, `Secure; SameSite=Lax; Path=/`, no Domain — `__Host-` prefix locks these attributes). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend restores `ownerRole` on every load via a lightweight `GET /api/owner/status` (computed from the cookie server-side, no D1) — this runs at the start of `loadData()` because the cache-only fast path (warm localStorage caches) skips `/api/bootstrap` entirely. `isOwner` is also returned in `/api/bootstrap`. Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
 - **Owner logout**: `POST /api/owner/logout` → clears the cookie (button in settings «Ваша роль»).
-- **Owner login via link**: frontend reads `?owner=<OWNER_CODE>` (legacy) or `#owner=<OWNER_CODE>` (new links, hash not logged) on load → `becomeOwner()` → `POST /api/owner/login`.
-- **Invite link**: new links use hash fragment `#invite=<token>` (avoids server logs/history/caches); legacy `?token=<invToken>` still parsed. Frontend reads it on load, validates via `/api/invite/verify`, saves as writer token. `copyInviteLink` also builds `#invite=` links — both formats work, legacy `?token=` is accepted for already-distributed links.
+- **Owner login via link**: frontend reads `#owner=<OWNER_CODE>` (new links, hash not logged) or `?owner=<OWNER_CODE>` (LEGACY, still parsed for already-distributed links — logs `console.warn('[deprecated] legacy ?owner= link used; please migrate to #-format')`) on load → `becomeOwner()` → `POST /api/owner/login`. New owner links are only referenced in `#owner=` form (`index.html` shows `…/#owner=<код>`).
+- **Invite link**: **all new links are generated ONLY in hash form** `#invite=<token>` (avoids server logs/history/caches) — both in the worker (`handleInviteCreate`) and on the frontend (`copyInviteLink`). The legacy `?token=<invToken>` format is still **parsed** for already-distributed links (logs `console.warn('[deprecated] legacy ?token= link used; please migrate to #-format')`), but never generated. Frontend reads the link on load, validates via `/api/invite/verify`, saves as writer token; legacy `?token=` is accepted for already-distributed links only.
 - `INVITE_ORIGIN` (var) — canonical origin for invite links (`https://kampussgu.dpdns.org`).
 
 ### CSRF protection (не ломать!)
 
-Two layers on top of cookie-based owner auth (cookie `owner_code` is auto-attached by the browser, incl. same-site form-POST from any `*.dpdns.org` subdomain):
+Two layers on top of cookie-based owner auth (cookie `__Host-owner_code` is auto-attached by the browser, incl. same-site form-POST from any `*.dpdns.org` subdomain):
 
 1. **`readJsonBody()` rejects any non-`application/json` Content-Type** (`parseError` → 400). HTML forms can't send JSON, so text/plain JSON-smuggling is dead. All body-reading handlers get this via `readJsonBody` — don't bypass it.
 2. **`csrfGuardForCookieAuth(auth, request, corsHeaders)`** — requires header `X-Requested-With: fetch` when owner role came from cookie (`auth.viaCookie`). Used in `requireWriter` + invite handlers (create/delete/rename — NOT list: it's a read-only GET, no side effects, no CSRF value). Frontend sends this header in `apiPost`/`apiPut`/`apiDelete` (app.js) — keep it there. Bearer-auth (writer/owner via `Authorization`) doesn't need the header. `apiFetch` (GETs) doesn't send it on purpose — keeps preview-domain GETs preflight-free.
@@ -162,8 +162,8 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | POST | `/api/sync-from-campus` | writer | Full sync: save + update subjects + recalc HW |
 | POST | `/api/invite/create` | writer | Create invite link |
 | POST | `/api/invite/verify` | — | Verify invite token → group (public) |
-| POST | `/api/owner/login` | — | Owner login: sets HttpOnly `owner_code` cookie (public, rate-limited) |
-| POST | `/api/owner/logout` | — | Owner logout: clears `owner_code` cookie (public, rate-limited) |
+| POST | `/api/owner/login` | — | Owner login: sets HttpOnly `__Host-owner_code` cookie (public, rate-limited) |
+| POST | `/api/owner/logout` | — | Owner logout: clears `__Host-owner_code` cookie (public, rate-limited) |
 | GET | `/api/owner/status` | — | Owner role check: `{ isOwner }` from HttpOnly cookie / Bearer (public, no D1, always `private, no-store`) |
 | GET | `/api/invite?group=` | writer | List group invites |
 | PUT | `/api/invite` | writer | Rename invite label |
@@ -175,7 +175,7 @@ No `/api/auth`, `/api/group/register`, `/api/tg/subscribe`, `/api/tg/unsubscribe
 
 ## Rate limiting
 
-D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 120** (all requests), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
+D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 600** (all requests — щадящий лимит из-за CGNAT/NAT: за одним cf-connecting-ip сидят сотни людей, 120 давало ложные 429), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`), **tgstatus 30** (`/api/tg/status`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. Each 429 logs `[rate-limited] kind=… ip=… windowStart=… count=… limit=…` (see `rateLimitResponse`) — track the 429 share via `wrangler tail`. If D1 errors, limits fail **open**. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
 
 ## Data model
 

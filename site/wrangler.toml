@@ -20,8 +20,9 @@ TG_BOT_USERNAME = "kampussgubot"
 # Без него первая ссылка не создаётся. Используется env.OWNER_CODE.
 
 # Канонический origin для ссылок-приглашений. Ссылки формируются как
-# ${INVITE_ORIGIN}/?token=<uuid>, то есть открываются на фронтенде (Pages),
-# а не на Worker (workers.dev). Укажите свой Pages-URL.
+# ${INVITE_ORIGIN}/#invite=<token> (hash-формат, не попадает в логи серверов),
+# то есть открываются на фронтенде (Pages), а не на Worker (workers.dev).
+# Укажите свой Pages-URL.
 INVITE_ORIGIN = "https://kampussgu.dpdns.org"
 
 # CORS: дополнительные разрешённые origin'ы для браузерных запросов к /api/*

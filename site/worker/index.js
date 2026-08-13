@@ -201,6 +201,14 @@ const securityHeaders = {
   'Referrer-Policy': 'no-referrer',
   'X-Frame-Options': 'DENY',
   'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+  // L10: COOP/CORP — защита от XS-Leaks и загрузки API в чужом контексте.
+  // Для JSON-API CORP 'same-origin' безопасен (читается с того же origin;
+  // CORS-клиентам вроде curl не мешает). preload в HSTS НЕ добавляем — он
+  // требует регистрации в hstspreload.org (вне рамок кода).
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  // Идентично статике в frontend/_headers — API и Pages не противоречат.
+  'Permissions-Policy': 'geolocation=(), microphone=(), camera=(), payment=()',
 };
 
 // ── CORS: строгая политика вместо Access-Control-Allow-Origin: * ────────
@@ -309,7 +317,7 @@ export default {
       if (limited) return limited;
     } catch (rlErr) {
       console.error('[ratelimit] unexpected error (fail-closed):', rlErr.message);
-      return rateLimitResponse(corsHeaders, 60);
+      return rateLimitResponse(corsHeaders, 60, { kind: 'unknown' });
     }
 
     try {
@@ -471,7 +479,7 @@ const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
 //     * token совпал с env.OWNER_CODE (constant-time сравнение, timingSafeEqualStr) → owner (group из query/body)
 //     * inv:{token} в KV → writer (group из записи)
 //     * иначе null
-//   - без заголовка, но с валидной HttpOnly-cookie owner_code → owner (viaCookie).
+//   - без заголовка, но с валидной HttpOnly-cookie __Host-owner_code → owner (viaCookie).
 //     Cookie сверяется за постоянное время, D1 не трогается.
 //   - иначе null (аноним = reader)
 async function resolveAuth(request, env) {
@@ -484,7 +492,7 @@ async function resolveAuth(request, env) {
     if (token) {
       // Owner: секретный код из env. Группу берём из query/body — за это
       // отвечает вызывающий код.
-      if (env.OWNER_CODE && timingSafeEqualStr(token, env.OWNER_CODE)) {
+      if (env.OWNER_CODE && await timingSafeEqualStr(token, env.OWNER_CODE)) {
         return { role: 'owner', token };
       }
 
@@ -501,7 +509,7 @@ async function resolveAuth(request, env) {
     return null;
   }
 
-  // Authorization отсутствует — пробуем HttpOnly-cookie owner_code.
+  // Authorization отсутствует — пробуем HttpOnly-cookie __Host-owner_code.
   // Код владельца JS не знает, D1 не затрагиваем.
   if (await ownerFromCookie(request, env)) {
     return { role: 'owner', viaCookie: true };
@@ -510,7 +518,7 @@ async function resolveAuth(request, env) {
   return null;
 }
 
-// Извлекает хэш владельца из HttpOnly cookie `owner_code` и сверяет с
+// Извлекает хэш владельца из HttpOnly cookie `__Host-owner_code` и сверяет с
 // SHA-256(env.OWNER_CODE) постоянным по времени сравнением (timingSafeEqualStr).
 // Cookie НЕ виден JavaScript'у — роль owner восстанавливается через него
 // автоматически на каждом запросе без повторного ввода кода.
@@ -523,10 +531,10 @@ async function ownerFromCookie(request, env) {
   for (const part of cookieHeader.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    if (part.slice(0, eq).trim() !== 'owner_code') continue;
+    if (part.slice(0, eq).trim() !== OWNER_COOKIE_NAME) continue;
     let value = part.slice(eq + 1).trim();
     try { value = decodeURIComponent(value); } catch (_) { /* оставляем как есть */ }
-    return timingSafeEqualStr(value, expected);
+    return await timingSafeEqualStr(value, expected);
   }
   return false;
 }
@@ -556,7 +564,7 @@ async function groupFromBodyOrQuery(request) {
 }
 
 // CSRF-защита для cookie-авторизации (2-й слой поверх Content-Type check):
-// HttpOnly-кука owner_code прикладывается браузером автоматически, в т.ч. к
+// HttpOnly-кука __Host-owner_code прикладывается браузером автоматически, в т.ч. к
 // same-site form-POST с поддомена того же registrable-домена (dpdns.org).
 // Кастомный заголовок X-Requested-With форма поставить не может — его шлёт
 // только наш JS (apiPost/apiPut/apiDelete в app.js; apiFetch — только GET,
@@ -660,12 +668,12 @@ async function handleInviteCreate(request, env, corsHeaders) {
 
 // POST /api/owner/login
 // Body: { code }. Публичный (без Bearer). Если code совпал с env.OWNER_CODE
-// (constant-time сравнение, timingSafeEqualStr) — ставит HttpOnly-куку owner_code и
+// (constant-time сравнение, timingSafeEqualStr) — ставит HttpOnly-куку __Host-owner_code и
 // возвращает { ok: true }. Иначе 403. Cookie не видна JavaScript'у, но
 // прикрепляется браузером к каждому запросу на этот же сайт — роль owner
 // восстанавливается автоматически.
 const OWNER_COOKIE_TTL = 2592000; // 30 дней (сек)
-const OWNER_COOKIE_NAME = 'owner_code';
+const OWNER_COOKIE_NAME = '__Host-owner_code';
 
 async function handleOwnerLogin(request, env, corsHeaders) {
   if (!env.OWNER_CODE) {
@@ -677,7 +685,7 @@ async function handleOwnerLogin(request, env, corsHeaders) {
   if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
   const body = bb.json;
   const code = (body.code || '').toString();
-  if (!code || !timingSafeEqualStr(code, env.OWNER_CODE)) {
+  if (!code || !(await timingSafeEqualStr(code, env.OWNER_CODE))) {
     return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
   }
 
@@ -697,7 +705,7 @@ async function handleOwnerLogin(request, env, corsHeaders) {
 
 // GET /api/owner/status
 // Публичный. Лёгкая проверка роли owner: возвращает { isOwner } по
-// HttpOnly-cookie owner_code (или Authorization: Bearer <OWNER_CODE>).
+// HttpOnly-cookie __Host-owner_code (или Authorization: Bearer <OWNER_CODE>).
 // D1 НЕ трогает — только постоянновременное сравнение хэша куки.
 // Нужен фронтенду, чтобы восстановить права владельца после перезагрузки,
 // даже когда /api/bootstrap пропускается из-за тёплых клиентских кешей.
@@ -707,7 +715,7 @@ async function handleOwnerStatus(request, env, corsHeaders) {
   const authHeader = request.headers.get('Authorization');
   const viaBearer = !!(env.OWNER_CODE &&
     authHeader && authHeader.startsWith('Bearer ') &&
-    timingSafeEqualStr(authHeader.slice(7).trim(), env.OWNER_CODE));
+    await timingSafeEqualStr(authHeader.slice(7).trim(), env.OWNER_CODE));
   const isOwner = viaBearer || await ownerFromCookie(request, env);
   const headers = {
     ...securityHeaders,
@@ -719,7 +727,7 @@ async function handleOwnerStatus(request, env, corsHeaders) {
 }
 
 // POST /api/owner/logout
-// Публичный. Удаляет куку owner_code. Роль owner сбрасывается в браузере.
+// Публичный. Удаляет куку __Host-owner_code. Роль owner сбрасывается в браузере.
 async function handleOwnerLogout(request, env, corsHeaders) {
   const headers = {
     ...securityHeaders,
@@ -889,19 +897,52 @@ async function handleInviteRename(request, env, corsHeaders) {
 
 // ── Constant-time string comparison ────────────────────────────
 // Защищает от timing-атак при сравнении секретов (TG_WEBHOOK_SECRET и т.п.).
-// Возвращает true, если строки равны. Длина сравнивается в постоянное время
-// не идеально, но для секрета фиксированной длины этого достаточно.
+// Возвращает true, если строки равны.
+//
+// Реализация: обе строки хэшируются SHA-256 (ровно 32 байта), и хэши
+// сравниваются XOR-аккумулятором по этой фиксированной длине — время не
+// зависит от длины входных строк (раньше цикл шёл по более короткой из них,
+// и по задержке теоретически можно было угадать длину секрета). Хэш секрета
+// (второго аргумента) кэшируется, чтобы повторное хэширование на каждом
+// запросе тоже не зависело от длины секрета.
+//
+// Функция async — вызывающие места обязаны await'ить результат.
 
-function timingSafeEqualStr(a, b) {
+// Кэш SHA-256 для секретов, передаваемых вторым аргументом: они повторяются
+// на каждом запросе. Ограничен 32 записями, вытесняется самая старая.
+const TIMING_SAFE_HASH_CACHE_MAX = 32;
+const secretHashCache = new Map(); // секрет → Uint8Array (32 байта)
+
+async function sha256Digest(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return new Uint8Array(buf);
+}
+
+function getSecretHashCached(secret) {
+  const hit = secretHashCache.get(secret);
+  if (hit) return Promise.resolve(hit);
+  return sha256Digest(secret).then((hash) => {
+    secretHashCache.set(secret, hash);
+    if (secretHashCache.size > TIMING_SAFE_HASH_CACHE_MAX) {
+      // Map хранит порядок вставки — первый ключ это самая старая запись.
+      secretHashCache.delete(secretHashCache.keys().next().value);
+    }
+    return hash;
+  });
+}
+
+async function timingSafeEqualStr(a, b) {
   const sa = String(a == null ? '' : a);
   const sb = String(b == null ? '' : b);
-  const ea = new TextEncoder().encode(sa);
-  const eb = new TextEncoder().encode(sb);
-  // Используем crypto.subtle через XOR-аккумулятор, чтобы не зависеть от
-  // раннего выхода при первом несовпадении.
-  let diff = ea.length ^ eb.length;
-  const len = Math.min(ea.length, eb.length);
-  for (let i = 0; i < len; i++) diff |= ea[i] ^ eb[i];
+  // Хэши фиксированной длины (32 байта каждый): время цикла не зависит от
+  // длины строк, XOR-аккумулятор не допускает раннего выхода.
+  const [ha, hb] = await Promise.all([
+    sha256Digest(sa),
+    getSecretHashCached(sb),
+  ]);
+  let diff = ha.length ^ hb.length;
+  const len = Math.max(ha.length, hb.length);
+  for (let i = 0; i < len; i++) diff |= (ha[i] || 0) ^ (hb[i] || 0);
   return diff === 0;
 }
 
@@ -909,9 +950,8 @@ function timingSafeEqualStr(a, b) {
 // Пересчитывается только при смене значения env.OWNER_CODE.
 let ownerCodeHashCache = { code: null, hash: null };
 async function sha256Hex(str) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
   let bin = '';
-  for (const b of new Uint8Array(buf)) bin += String.fromCharCode(b);
+  for (const b of await sha256Digest(str)) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 async function getOwnerCodeHash(env) {
@@ -1525,6 +1565,12 @@ async function handleUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
+  // dueMode — опциональное поле при правке: если передано, должно быть одним
+  // из допустимых значений (как при создании ДЗ в handleAddHw).
+  if (body.dueMode != null && !['nextPair', 'date'].includes(body.dueMode)) {
+    return jsonResponse({ error: 'Invalid dueMode' }, corsHeaders, 400);
+  }
+
   const key = `hw:${group}`;
   const existing = await store.get(key, { type: 'json' }) || [];
   const idx = existing.findIndex(h => h.id === id);
@@ -1733,7 +1779,8 @@ async function handleRecalcHw(request, env, corsHeaders) {
 
   const bb = await readJsonBody(request);
   if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
-  const body = bb.ok ? bb.json : {};
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const body = bb.json;
   const group = normalizeGroup(body.group);
 
   if (!group || !isValidGroup(group)) {
@@ -2087,7 +2134,7 @@ async function cacheControlForGet(request, env) {
 }
 
 // Есть ли у запроса аутентификация (writer/owner): Bearer-токен ИЛИ
-// валидная HttpOnly-cookie owner_code. Для таких ответов isPrivate=true:
+// валидная HttpOnly-cookie __Host-owner_code. Для таких ответов isPrivate=true:
 // Vary:Authorization + private, чтобы CDN не смешивал их с reader-кешем.
 async function isAuthRequest(request, env) {
   return (request.headers.get('Authorization') || '').startsWith('Bearer ') ||
@@ -2499,26 +2546,34 @@ function buildHwText(action, group, hw, prevHw) {
 //   /stop              — отвязывает chat_id от всех групп
 //   /status            — показывает текущую подписку
 
+// Ответ вебхука Telegram: аналог jsonResponse для этого пути. Telegram не
+// шлёт Origin и не требует CORS — поэтому добавляем ТОЛЬКО базовый набор
+// security-заголовков (тот же securityHeaders, что и у основных ответов),
+// чтобы у каждого ответа вебхука был оборонительный пояс «защиты в глубину».
+function tgWebhookResponse(body, status = 200) {
+  return new Response(body, { status, headers: { ...securityHeaders } });
+}
+
 async function handleTgWebhook(request, env) {
   const store = createStore(env);
-  if (!env.DB) return new Response('ok', { status: 200 });
+  if (!env.DB) return tgWebhookResponse('ok');
 
   // Защита от подделки updates: Telegram при setWebhook с secret_token
   // шлёт заголовок X-Telegram-Bot-Api-Secret-Token на каждый запрос.
   // Секрет обязателен — без него webhook отключён (503), подделки не принимаются.
   if (!env.TG_WEBHOOK_SECRET) {
     console.error('[tg] FATAL: TG_WEBHOOK_SECRET not set — webhook disabled');
-    return new Response('Webhook misconfigured: TG_WEBHOOK_SECRET is required', { status: 503 });
+    return tgWebhookResponse('Webhook misconfigured: TG_WEBHOOK_SECRET is required', 503);
   }
   const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
-  if (!timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET)) {
+  if (!(await timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET))) {
     console.log('[tg] webhook rejected: bad secret_token');
-    return new Response('Unauthorized', { status: 401 });
+    return tgWebhookResponse('Unauthorized', 401);
   }
 
   let update;
   const wb = await readJsonBody(request);
-  if (!wb.ok) return new Response('ok', { status: 200 });
+  if (!wb.ok) return tgWebhookResponse('ok');
   update = wb.json;
 
   // ── Callback query (инлайн-кнопки выбора подгруппы) ──
@@ -2550,24 +2605,24 @@ async function handleTgWebhook(request, env) {
         });
         // Отвечаем на callback, чтобы убрать "часики" на кнопке.
         await tgApi(env, 'answerCallbackQuery', { callback_query_id: cq.id });
-        return new Response('ok', { status: 200 });
+        return tgWebhookResponse('ok');
       }
     }
     // Неизвестный callback — просто отвечаем.
     await tgApi(env, 'answerCallbackQuery', { callback_query_id: cq.id });
-    return new Response('ok', { status: 200 });
+    return tgWebhookResponse('ok');
   }
 
   // ── Обычные сообщения ──
   const msg = update.message || update.edited_message;
-  if (!msg || !msg.chat) return new Response('ok', { status: 200 });
+  if (!msg || !msg.chat) return tgWebhookResponse('ok');
 
   const chatId = String(msg.chat.id);
   const text = (msg.text || '').trim();
   const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
   // В групповых чатах игнорируем.
-  if (isGroup) return new Response('ok', { status: 200 });
+  if (isGroup) return tgWebhookResponse('ok');
 
   try {
     // /start — приветствие
@@ -2601,7 +2656,7 @@ async function handleTgWebhook(request, env) {
           chat_id: chatId,
           text: '❌ Не удалось распознать название группы. Проверь формат (например: /sub 131-ИБо) и попробуй ещё раз.',
         });
-        return new Response('ok', { status: 200 });
+        return tgWebhookResponse('ok');
       }
       // Проверяем, уже ли подписан.
       const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
@@ -2615,7 +2670,7 @@ async function handleTgWebhook(request, env) {
           text: `⚠️ Ты уже подписан на группу <b>${escTg(group)}</b> (<i>${escTg(subLabel)}</i>).\n\nСначала отпиши: <code>/stop</code>, потом снова <code>/sub ${escTg(group)}</code>.`,
           parse_mode: 'HTML',
         });
-        return new Response('ok', { status: 200 });
+        return tgWebhookResponse('ok');
       }
       // Показываем инлайн-кнопки выбора подгруппы.
       await tgApi(env, 'sendMessage', {
@@ -2635,7 +2690,7 @@ async function handleTgWebhook(request, env) {
       await unbindChat(env, chatId);
       await tgApi(env, 'sendMessage', {
         chat_id: chatId,
-        text: '❌ Ты отписан от всех уведомлений.\n\nЧтобы снова подписаться: <code>/sub</code> <group>',
+        text: '❌ Ты отписан от всех уведомлений.\n\nЧтобы снова подписаться: <code>/sub</code> &lt;группа&gt;',
         parse_mode: 'HTML',
       });
     // /status — текущая подписка
@@ -2675,7 +2730,7 @@ async function handleTgWebhook(request, env) {
   } catch (e) {
     console.log('handleTgWebhook error:', e.message);
   }
-  return new Response('ok', { status: 200 });
+  return tgWebhookResponse('ok');
 }
 
 async function unbindChat(env, chatId) {
@@ -2892,11 +2947,29 @@ function formatHwMessage(action, group, hw, prevHw) {
 // счётчик автоматически начинает заново (новый ключ), старый протухает.
 //
 // Лимиты (окно 60 сек):
-//   global  — 120/мин по IP, на ВСЕ запросы. Легитимный writer-burst
-//             ~5-8 запросов при sync => запас 15×. Читатель ~1-3.
+//   global  — 600/мин по IP, на ВСЕ запросы. Поднят с 120 (L9): за одним
+//             cf-connecting-ip могут сидеть сотни честных людей (CGNAT/NAT
+//             мобильных операторов, университетские/офисные сети) — лимит 120
+//             давал ложные 429 «узлам». Легитимный writer-burst ~5-8 запросов
+//             при sync => запас 75×; читатель ~1-3. Доля 429 отслеживается по
+//             логу '[rate-limited]' (см. rateLimitResponse).
 //   verify  — 10/мин по IP, на публичные POST /api/invite/verify,
 //             /api/invite/create (D1-read oracle / owner-код).
 //   tg      — 60/мин по IP, на POST /api/tg/webhook.
+
+// Именованные константы лимитов (окно 60 сек). Точечные лимиты (verify/tg/
+// tgstatus) — антиспам-защита чувствительных публичных POST, их значения
+// менять нельзя. Подробности политики (fail-open/fail-closed) — в checkRateLimit.
+const RATE_LIMIT_WINDOW_SEC = 60;
+// Глобальный лимит на все запросы с одного IP: 600/мин щадящий для общих IP
+// (CGNAT/NAT), но всё ещё ограничивает скриптовый спам.
+const RATE_LIMIT_GLOBAL = 600;
+// Публичные «оракулы» (owner login/logout, invite verify/create): 10/мин.
+const RATE_LIMIT_VERIFY = 10;
+// Telegram webhook (шлёт исходящие в Telegram): 60/мин.
+const RATE_LIMIT_TG_WEBHOOK = 60;
+// /api/tg/status (оракул подписки по chatId): 30/мин.
+const RATE_LIMIT_TG_STATUS = 30;
 
 // Извлекает IP клиента из каноничного заголовка Cloudflare.
 // cf-connecting-ip ставится CF на каждом запросе к Worker.
@@ -2923,7 +2996,7 @@ async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
   const { failClosed = false } = opts;
   if (!store || !store._db || !id) {
     warnRlFailOpen(kind, id);
-    if (failClosed) return { limited: true, retryAfter: 60, degraded: true };
+    if (failClosed) return { limited: true, retryAfter: 60, degraded: true, kind, id };
     return { limited: false };
   }
   const now = Date.now();
@@ -2953,21 +3026,37 @@ async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
       // Сколько секунд до конца окна.
       const windowEndMs = (windowStart + 1) * windowSec * 1000;
       const retryAfter = Math.max(1, Math.ceil((windowEndMs - now) / 1000));
-      return { limited: true, retryAfter };
+      // Доп. поля (kind/id/count/limit/windowStart) — для структурированного
+      // лога '[rate-limited]' при 429 (мониторинг доли блокировок, L9).
+      return { limited: true, retryAfter, kind, id, count, limit, windowStart };
     }
     return { limited: false };
   } catch (err) {
     // D1-сбой на уровне SQL: та же политика, что при недоступности базы.
     console.warn(`[ratelimit] db error (${kind}:${id}): ${err.message}`);
-    if (failClosed) return { limited: true, retryAfter: 60, degraded: true };
+    if (failClosed) return { limited: true, retryAfter: 60, degraded: true, kind, id };
     return { limited: false };
   }
 }
 
 // Формирует 429-ответ с понятным сообщением и Retry-After.
 // corsHeaders нужны, чтобы фронтенд (другой origin) мог прочитать тело.
-function rateLimitResponse(corsHeaders, retryAfter) {
+// details — данные счётчика для мониторинга (L9): при передаче логируем
+// структурированную строку '[rate-limited] kind=… ip=… windowStart=…
+// count=… limit=…' (по ней через wrangler tail отслеживается доля 429).
+// Ничего из тела запроса не логируется.
+function rateLimitResponse(corsHeaders, retryAfter, details) {
+  if (details) {
+    console.warn(
+      `[rate-limited] kind=${details.kind || 'unknown'} ` +
+      `ip=${details.ip || 'unknown'} ` +
+      `windowStart=${details.windowStart !== undefined ? details.windowStart : 'unknown'} ` +
+      `count=${details.count !== undefined ? details.count : 'unknown'} ` +
+      `limit=${details.limit !== undefined ? details.limit : 'unknown'}`
+    );
+  }
   const headers = {
+    ...securityHeaders,
     ...corsHeaders,
     'Content-Type': 'application/json',
     'Retry-After': String(retryAfter || 5),
@@ -2994,32 +3083,35 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
   const ip = getClientIp(request);
   if (!ip) {
     // fail-closed для чувствительных путей: без IP лимит не проверить (за CF не случается).
-    if (method === 'POST' && isVerifyPath(path)) return rateLimitResponse(corsHeaders, 60);
+    if (method === 'POST' && isVerifyPath(path)) {
+      return rateLimitResponse(corsHeaders, 60, { kind: 'verify' });
+    }
     return null;
   }
 
-  // 1) Глобальный IP-лимит на ВСЕ запросы.
-  const global = await checkRateLimit(store, ip, 'global', 120, 60);
-  if (global.limited) return rateLimitResponse(corsHeaders, global.retryAfter);
+  // 1) Глобальный IP-лимит на ВСЕ запросы. 600/мин (см. RATE_LIMIT_GLOBAL):
+  //    за одним cf-connecting-ip могут сидеть сотни людей (CGNAT/NAT).
+  const global = await checkRateLimit(store, ip, 'global', RATE_LIMIT_GLOBAL, RATE_LIMIT_WINDOW_SEC);
+  if (global.limited) return rateLimitResponse(corsHeaders, global.retryAfter, global);
 
   // 2) Точечные лимиты на публичные POST (поверх глобального).
   if (method === 'POST') {
     if (isVerifyPath(path)) {
-      const rl = await checkRateLimit(store, ip, 'verify', 10, 60, { failClosed: true });
+      const rl = await checkRateLimit(store, ip, 'verify', RATE_LIMIT_VERIFY, RATE_LIMIT_WINDOW_SEC, { failClosed: true });
       if (rl.limited) {
         if (rl.degraded) console.warn('[ratelimit] verify degraded: D1 недоступен, запрос отклонён');
-        return rateLimitResponse(corsHeaders, rl.retryAfter);
+        return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
       }
     }
     // TG webhook — публичный, шлёт исходящие в Telegram.
     if (path === '/api/tg/webhook') {
-      const rl = await checkRateLimit(store, ip, 'tg', 60, 60);
-      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+      const rl = await checkRateLimit(store, ip, 'tg', RATE_LIMIT_TG_WEBHOOK, RATE_LIMIT_WINDOW_SEC);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
     }
     // /api/tg/status — публичный оракул подписки по chatId: замедлить перебор.
     if (path === '/api/tg/status') {
-      const rl = await checkRateLimit(store, ip, 'tgstatus', 30, 60);
-      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter);
+      const rl = await checkRateLimit(store, ip, 'tgstatus', RATE_LIMIT_TG_STATUS, RATE_LIMIT_WINDOW_SEC);
+      if (rl.limited) return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
     }
   }
 

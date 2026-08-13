@@ -478,8 +478,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // Проверяет ?token= (или #invite=) в URL, валидирует, сохраняет writerToken
 // per-group, чистит URL. Поддерживаются оба формата ссылок:
-//   - старые/розданные:  /?token=<invToken>
-//   - новые:             /#invite=<invToken>  (hash не попадает в логи серверов)
+//   - старые/розданные (LEGACY):  /?token=<invToken>  (попадал в логи серверов)
+//   - новые:                       /#invite=<invToken>  (hash не попадает в логи
+//     серверов; генерируется только этот формат — см. copyInviteLink и
+//     handleInviteCreate в воркере). Legacy-формат продолжает работать для уже
+//     выданных ссылок, но при его использовании логируется console.warn.
 async function consumeInviteTokenFromUrl() {
   let token = new URLSearchParams(location.search).get('token');
   let fromHash = false;
@@ -488,6 +491,13 @@ async function consumeInviteTokenFromUrl() {
     if (hashMatch) { token = decodeURIComponent(hashMatch[1]); fromHash = true; }
   }
   if (!token) return;
+
+  // Legacy query-формат (?token=): уже распределённые ссылки продолжают
+  // работать, но новые ссылки генерируются только в #-формате (#invite=).
+  // Однократно логируем факт использования legacy-ссылки.
+  if (!fromHash) {
+    console.warn('[deprecated] legacy ?token= link used; please migrate to #-format');
+  }
 
   // Чистим URL ДО сетевой верификации: токен не должен висеть в адресной
   // строке ни секунды (история браузера, скриншоты, логи расширений).
@@ -546,8 +556,11 @@ async function consumeInviteTokenFromUrl() {
 // Проверяет ?owner=<code> (или #owner=<code>) в URL, валидирует через бэкенд,
 // сохраняет как owner-токен. Чистит URL. Возвращает true, если успешно стали owner.
 // Поддерживаются оба формата:
-//   - старые/розданные:  /?owner=<code>   (логируется серверами)
-//   - новые:             /#owner=<code>   (hash не попадает в логи серверов)
+//   - старые/розданные (LEGACY):  /?owner=<code>   (попадал в логи серверов)
+//   - новые:                       /#owner=<code>   (hash не попадает в логи
+//     серверов). Новые ссылки генерируются только в #-формате; legacy-формат
+//     продолжает работать для уже выданных ссылок, но при его использовании
+//     логируется console.warn.
 async function consumeOwnerCodeFromUrl() {
   let code = (new URLSearchParams(location.search).get('owner') || '').trim();
   let fromHash = false;
@@ -556,6 +569,13 @@ async function consumeOwnerCodeFromUrl() {
     if (hashMatch) { code = decodeURIComponent(hashMatch[1]).trim(); fromHash = true; }
   }
   if (!code) return false;
+
+  // Legacy query-формат (?owner=): уже распределённые ссылки продолжают
+  // работать, но новые ссылки генерируются только в #-формате (#owner=).
+  // Однократно логируем факт использования legacy-ссылки.
+  if (!fromHash) {
+    console.warn('[deprecated] legacy ?owner= link used; please migrate to #-format');
+  }
 
   // Чистим URL ДО сетевой верификации, в любом случае (успех или нет —
   // код не должен висеть в адресной строке ни секунды).
@@ -604,7 +624,7 @@ async function becomeOwner(code, opts = {}) {
 }
 
 // Восстановление роли владельца после перезагрузки страницы. JS не видит
-// HttpOnly-cookie owner_code, поэтому роль приходит с сервера через лёгкий
+// HttpOnly-cookie __Host-owner_code, поэтому роль приходит с сервера через лёгкий
 // /api/owner/status (без обращения к D1). Без этого вызова права owner
 // пропадали бы при загрузке из тёплых клиентских кешей, когда /api/bootstrap
 // не дёргается вовсе. При ошибке сети роль оставляем как есть — следующий
@@ -3547,6 +3567,7 @@ function setupHomeworkModal() {
       originalHwFields = null;
       renderHomework();
       if (state.schedule) renderDayTabs();
+      resetDeleteState(); // не оставляем визуал подтверждения удаления на след. раз
       closeModal(modal);
       invalidateHwCache(); // ДЗ изменилось — сбрасываем клиентский кеш
     } catch (e) {
@@ -3643,13 +3664,15 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
   saveBtn.textContent = existingHw ? 'Сохранить' : 'Добавить';
   const deleteBtn = document.getElementById('deleteHomework');
   const deleteConfirm = document.getElementById('deleteConfirm');
+  // Сброс состояния удаления — могло остаться от предыдущего открытия
+  // (doDelete закрывает модалку без resetDeleteState).
+  deleteConfirm.classList.add('hidden');
+  deleteBtn.textContent = 'Удалить';
+  deleteBtn.disabled = false;
   if (existingHw) {
     deleteBtn.classList.remove('hidden');
   } else {
     deleteBtn.classList.add('hidden');
-    deleteConfirm.classList.add('hidden');
-    deleteBtn.textContent = 'Удалить';
-    deleteBtn.disabled = false;
   }
 
   // Build subject list from loadedSubjects + today + current schedule
@@ -4083,8 +4106,10 @@ setupTgSection._refresh = function () {
 // Видно только когда isWriter(). Содержит:
 //  - кнопку «Создать ссылку-приглашение» (writer и owner)
 //  - список активных ссылок с кнопками «Отозвать»
-// Права владельца (owner) получают через ссылку ?owner=<code> (или #owner=<code>)
+// Права владельца (owner) получают через ссылку #owner=<code> (legacy — ?owner=<code>)
 // либо ручным вводом кода в настройках (см. becomeOwner / consumeOwnerCodeFromUrl).
+// Новые ссылки генерируются только в #-формате; legacy query-формат — только для
+// уже выданных ссылок (логируется console.warn).
 
 function setupInviteSection() {
   const section = document.getElementById('inviteSection');
