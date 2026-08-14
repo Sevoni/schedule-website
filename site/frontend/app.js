@@ -78,24 +78,12 @@ let state = {
   tgChatId: localStorage.getItem('tgChatId') || '',
   tgBotUsername: localStorage.getItem('tgBotUsername') || '',
   tgSubgroup: localStorage.getItem('tgSubgroup') || '',
-  // writerTokens — токены ссылок-приглашений per-group: { "group": "token" }.
-  // Сохраняется в localStorage, чтобы не вводить ссылку каждый раз.
-  // isWriter = !!writerTokens[group].
-  writerTokens: (() => {
-    try {
-      const obj = JSON.parse(localStorage.getItem('writerTokens') || '{}');
-      const old = localStorage.getItem('writerToken');
-      const grp = (localStorage.getItem('group') || '').toLowerCase();
-      if (old && grp && !obj[grp]) {
-        obj[grp] = old;
-        localStorage.setItem('writerTokens', JSON.stringify(obj));
-        localStorage.removeItem('writerToken');
-      }
-      return obj;
-    } catch {
-      return {};
-    }
-  })(),
+  // writerGroup — группа, для которой сервер подтвердил роль редактора
+  // (HttpOnly-cookie __Host-writer_tokens, которую JS не видит). Роль
+  // восстанавливается через GET /api/writer/status. В localStorage токены
+  // НЕ хранятся (закрывает XSS-кражу) — старые ключи writerTokens/writerToken
+  // мигрируются в куку один раз (migrateLegacyWriterTokens).
+  writerGroup: '',
   // ownerCode — никогда не хранится в localStorage/state: код владельца живёт
   // в HttpOnly-cookie на сервере, JS его не знает. Поле оставлено для памяти.
   ownerRole: false,
@@ -245,40 +233,86 @@ function isValidGroup(g) {
   return typeof g === 'string' && GROUP_RE.test(g.trim());
 }
 
-// isWriter — true, если у пользователя есть token для записи (writer/owner).
-// Чисто UI-флаг: показывать кнопки редактирования или нет. Авторизацию
-// всё равно проверяет бэкенд (requireWriter) — фронтенд здесь не критичен.
+// isWriter — true, если сервер подтвердил роль редактора для текущей группы
+// (writerGroup) или пользователь owner. Чисто UI-флаг: показывать кнопки
+// редактирования или нет. Авторизацию всё равно проверяет бэкенд
+// (requireWriter) — фронтенд здесь не критичен.
 function isWriter() {
-  return !!state.writerTokens[state.group] || state.ownerRole;
+  return state.writerGroup === state.group || state.ownerRole;
 }
 function isOwner() {
   return state.ownerRole;
 }
 function getAuthToken() {
-  // Код владельца никогда не уходит в Bearer-заголовок: owner-запросы идут без
-  // него, а роль подтверждает HttpOnly-cookie, прикрепляемая браузером сама.
-  return state.writerTokens[state.group] || '';
+  // Токенов в JS больше нет: роль writer подтверждает HttpOnly-cookie
+  // __Host-writer_tokens, прикрепляемая браузером сама. Bearer-заголовок
+  // не шлём — GET'ы остаются reader-кэшируемыми (без preflight).
+  return '';
 }
 
-// Ревалидация токена-приглашения при возврате в группу.
-// Вызывается при переключении группы, если есть сохранённый токен для этой группы.
-async function revalidateInviteToken(token, group) {
+// Проверяет у сервера роль редактора для группы (GET /api/writer/status,
+// куку прикладывает браузер). state.writerGroup обновляется по ответу;
+// при падении роли прячем UI редактирования и показываем toast.
+async function refreshWriterStatus(group) {
+  const target = group || state.group;
+  let isW = false;
   try {
-    const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token })
+    const resp = await fetchTimeout(state.apiBase + '/api/writer/status?group=' + encodeURIComponent(target), {
+      headers: { 'Cache-Control': 'no-store' },
     });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok || normalizeGroup(data.group) !== normalizeGroup(group)) {
-      // Токен невалиден/отозван/не для этой группы — удаляем
-      delete state.writerTokens[group];
-      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
-      refreshEditVisibility();
-    }
+    const data = await resp.json().catch(() => ({}));
+    isW = data.isWriter === true;
   } catch (e) {
-    // Сеть недоступна — оставляем токен, при следующем действии API вернёт 403
-    console.warn('[revalidateInviteToken] network error:', e.message);
+    // Сеть недоступна — роль оставляем как есть; следующее действие решит на сервере.
+    console.warn('[refreshWriterStatus] network error:', e.message);
+    return;
+  }
+  const was = isWriter();
+  state.writerGroup = isW ? target : '';
+  if (isWriter() !== was) {
+    refreshEditVisibility();
+    if (was && !isW) {
+      const section = document.getElementById('inviteSection');
+      if (section) section.style.display = 'none';
+      showToast('Права на редактирование отозваны', 'warn');
+    }
+  }
+}
+
+// Разовый перенос старых токенов из localStorage в HttpOnly-cookie.
+// До перехода на куку токены лежали в localStorage (ключи writerTokens /
+// writerToken) — отправляем их на /api/invite/verify (сервер сам поставит
+// куку), затем чистим localStorage. Вызывается при старте до loadData.
+async function migrateLegacyWriterTokens() {
+  let legacy = {};
+  try {
+    legacy = JSON.parse(localStorage.getItem('writerTokens') || '{}') || {};
+  } catch (_) {
+    legacy = {};
+  }
+  const oldToken = localStorage.getItem('writerToken');
+  if (oldToken && legacy && typeof legacy === 'object') {
+    const grp = (localStorage.getItem('group') || '').toLowerCase();
+    if (grp && !legacy[grp]) legacy[grp] = oldToken;
+  }
+  const entries = Object.entries(legacy);
+  if (entries.length === 0) return;
+  for (const [group, token] of entries) {
+    if (!token) continue;
+    try {
+      await fetchTimeout(state.apiBase + '/api/invite/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+    } catch (e) {
+      console.warn('[migrateLegacyWriterTokens] verify failed:', e.message);
+    }
+  }
+  localStorage.removeItem('writerTokens');
+  localStorage.removeItem('writerToken');
+  if (entries.length) {
+    console.log('[migrate] writer-токены перенесены из localStorage в HttpOnly-cookie');
   }
 }
 
@@ -451,8 +485,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   const startPageShown = !state.group;
   if (startPageShown) showStartPage();
 
+  // Одноразовая миграция старых токенов из localStorage в HttpOnly-cookie
+  // (до перехода на куку токены жили в localStorage). Сервер сам поставит куку.
+  migrateLegacyWriterTokens();
+
   // Если в URL есть ?token= или #invite= — это переход по ссылке-приглашению.
-  // Валидируем через бэкенд, при успехе сохраняем токен как writerToken.
+  // Валидируем через бэкенд, при успехе сервер ставит HttpOnly-cookie.
   await consumeInviteTokenFromUrl();
 
   // Если в URL есть ?owner= или #owner= — сразу пробуем стать владельцем
@@ -572,11 +610,11 @@ async function consumeInviteTokenFromUrl() {
     const data = await resp.json();
     const isOwner = await ownerCheck;
     if (resp.ok && data.ok && data.group) {
-      // Сохраняем токен writer'а per-group.
-      // ownerRole не трогаем — он глобальный.
+      // Токен подтверждён — сервер поставил HttpOnly-cookie __Host-writer_tokens
+      // (JS её не видит). Роль редактора для группы фиксируем в state.writerGroup;
+      // в localStorage токен не кладём. ownerRole не трогаем — он глобальный.
       const group = data.group.toLowerCase();
-      state.writerTokens[group] = data.token;
-      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
+      state.writerGroup = group;
 
       // Подставляем группу из приглашения — но только не владельцу: он не
       // должен переезжать на чужую группу, а после перезагрузки — тем более
@@ -759,7 +797,8 @@ function renderRoleStatus() {
     '<svg class="role-icon"><use href="#icon-' + icon + '"></use></svg>' +
     '<div><div class="role-label">' + role + '</div>' +
     '<div class="role-desc">' + desc + '</div>' +
-    (isOwner() ? '<button id="ownerLogoutBtn" class="btn-secondary role-action">Выйти из роли владельца</button>' : '') +
+    (isOwner() ? '<button id="ownerLogoutBtn" class="btn-secondary role-action">Выйти из роли владельца</button>'
+               : (isWriter() ? '<button id="writerLogoutBtn" class="btn-secondary role-action">Выйти из роли редактора</button>' : '')) +
     '</div>';
   const logoutBtn = el.querySelector('#ownerLogoutBtn');
   if (logoutBtn) {
@@ -770,6 +809,18 @@ function renderRoleStatus() {
         console.warn('owner logout error:', e.message);
       }
       state.ownerRole = false;
+      refreshEditVisibility();
+    };
+  }
+  const writerLogoutBtn = el.querySelector('#writerLogoutBtn');
+  if (writerLogoutBtn) {
+    writerLogoutBtn.onclick = async () => {
+      try {
+        await apiPost('/api/writer/logout', { group: state.group });
+      } catch (e) {
+        console.warn('writer logout error:', e.message);
+      }
+      state.writerGroup = '';
       refreshEditVisibility();
     };
   }
@@ -860,6 +911,9 @@ async function loadData() {
     // кешах /api/bootstrap не вызывается, и без этого права owner после
     // перезагрузки страницы пропадали бы.
     await restoreOwnerRole();
+    // Роль редактора — тоже в HttpOnly-cookie (__Host-writer_tokens).
+    // Восстанавливаем аналогично: /api/writer/status читает куку на сервере.
+    await refreshWriterStatus();
     state.scheduleCache = {};
     applyGroupDisplay(state.group);
 
@@ -2043,40 +2097,11 @@ function rateLimitToast(retryAfter) {
   showToast(msg, 'warn');
 }
 
-// Если сервер вернул 403 при наличии writer-токена — токен стал
-// невалиден (ссылка отозвана / неверный). Сбрасываем права и
-// переключаем UI в режим «только чтение».
-function invalidateWriterAccess(reason) {
-  const group = state.group;
-  if (!state.writerTokens[group]) return;
-  delete state.writerTokens[group];
-  localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
-  refreshEditVisibility();
-  const section = document.getElementById('inviteSection');
-  if (section) section.style.display = 'none';
-  showToast(reason || 'Права на редактирование отозваны', 'warn');
-}
-
-// Ревалидация сохранённого токена при возврате в группу.
-// Вызывает /api/invite/verify, если токен невалиден/отозван/не для этой группы — удаляет.
-async function revalidateInviteToken(token, group) {
-  try {
-    const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token })
-    });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok || normalizeGroup(data.group) !== normalizeGroup(group)) {
-      // Токен невалиден/отозван/не для этой группы — удаляем
-      delete state.writerTokens[group];
-      localStorage.setItem('writerTokens', JSON.stringify(state.writerTokens));
-      refreshEditVisibility();
-    }
-  } catch (e) {
-    // Сеть недоступна — оставляем токен, при следующем действии API вернёт 403
-    console.warn('[revalidate] network error', e.message);
-  }
+// Если сервер вернул 403 — роль редактора могла отозвана (ссылка отозвана /
+// токен истёк). Проверяем актуальное состояние по /api/writer/status:
+// refreshWriterStatus сам спрячет UI и покажет toast при реальной потере роли.
+async function invalidateWriterAccess() {
+  await refreshWriterStatus();
 }
 
 async function apiFetch(path, params = {}) {
@@ -2084,16 +2109,14 @@ async function apiFetch(path, params = {}) {
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
   }
-  const headers = {};
-  const auth = getAuthToken();
-  if (auth) headers['Authorization'] = 'Bearer ' + auth;
-  const resp = await fetchTimeout(url.toString(), { headers });
+  // GET без Authorization: кука (owner/writer) прикладывается браузером сама,
+  // а без неё запрос остаётся reader-кэшируемым и без preflight.
+  const resp = await fetchTimeout(url.toString(), { headers: {} });
   if (resp.status === 429) {
     rateLimitToast(resp.headers.get('Retry-After'));
     throw new Error('Слишком много запросов');
   }
   if (!resp.ok) {
-    if (resp.status === 403 && auth) invalidateWriterAccess();
     throw new Error('API ' + resp.status);
   }
   return resp.json();
@@ -2101,8 +2124,6 @@ async function apiFetch(path, params = {}) {
 
 async function apiPost(path, body) {
   const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' };
-  const auth = getAuthToken();
-  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(state.apiBase + path, {
     method: 'POST',
     headers,
@@ -2114,7 +2135,7 @@ async function apiPost(path, body) {
   }
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && auth) invalidateWriterAccess();
+    if (resp.status === 403) await invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -2126,8 +2147,6 @@ async function apiDelete(path, params = {}) {
     if (v) url.searchParams.set(k, v);
   }
   const headers = { 'X-Requested-With': 'fetch' };
-  const auth = getAuthToken();
-  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(url.toString(), { method: 'DELETE', headers });
   if (resp.status === 429) {
     rateLimitToast(resp.headers.get('Retry-After'));
@@ -2135,7 +2154,7 @@ async function apiDelete(path, params = {}) {
   }
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && auth) invalidateWriterAccess();
+    if (resp.status === 403) await invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -2143,8 +2162,6 @@ async function apiDelete(path, params = {}) {
 
 async function apiPut(path, body) {
   const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' };
-  const auth = getAuthToken();
-  if (auth) headers['Authorization'] = 'Bearer ' + auth;
   const resp = await fetchTimeout(state.apiBase + path, {
     method: 'PUT',
     headers,
@@ -2156,7 +2173,7 @@ async function apiPut(path, body) {
   }
   const data = await resp.json();
   if (!resp.ok) {
-    if (resp.status === 403 && auth) invalidateWriterAccess();
+    if (resp.status === 403) await invalidateWriterAccess();
     throw new Error(data.error || 'API ' + resp.status);
   }
   return data;
@@ -4555,7 +4572,8 @@ function setupSettingsModal() {
     localStorage.setItem('group', state.group);
     closeModal(modal);
 
-    // Смена группы: writerToken привязан к группе (хранится per-group в writerTokens).
+    // Смена группы: роль редактора подтверждается сервером для новой группы
+    // (HttpOnly-cookie __Host-writer_tokens прикладывается браузером сама).
     if (groupChanged && !state.ownerRole) {
       refreshEditVisibility();
       state.scheduleCache = {};
@@ -4566,10 +4584,9 @@ function setupSettingsModal() {
     }
 
     if (groupChanged && !state.ownerRole) {
-      const savedToken = state.writerTokens[newGroup.toLowerCase()];
-      if (savedToken) {
-        revalidateInviteToken(savedToken, newGroup.toLowerCase());
-      }
+      // loadData() ниже тоже проверит роль — здесь fire-and-forget для раннего
+      // скрытия/показа кнопок редактирования до завершения загрузки.
+      refreshWriterStatus(newGroup.toLowerCase());
     }
 
     // Полный сброс состояния — чтобы старые данные группы не мелькали.

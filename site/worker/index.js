@@ -69,6 +69,18 @@ function weekCodeMatchesGroup(weekCode, group) {
 // умолчанию 30с): если критический участок не завершился, блокировка всё
 // равно освобождается, а вызов получает ошибку. Ошибка fn освобождает
 // блокировку через finally, не блокируя следующих в очереди.
+//
+// ⚠️ ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ (VULN-005): при таймауте Promise.race возвращает
+// ошибку и освобождает lock, НО fn() не отменяется — он продолжает
+// выполняться в фоне («зомби») параллельно со следующим запросом по тому же
+// ключу. Отменить fn() невозможно: D1 не поддерживает AbortController /
+// AbortSignal (см. store.js — ни один метод не принимает signal и не
+// прокидывает его в db.prepare(...)), а fn() здесь — только неотменяемые
+// D1-записи. Принято как допустимое: таймаут 30с щедрый (D1-операции по
+// одному ключу — миллисекунды), а все критические участки (hw:/inv-by-group:/
+// tg:subs:/tg:groups:) делают только D1-записи без внешних side-эффектов —
+// TG-уведомления и purge CDN вынесены ВНЕ блоков withKeyLock. Не пытайтесь
+// «исправить» это добавлением AbortController — он не сработает для D1.
 const KEY_LOCKS = new Map();
 
 async function withKeyLock(key, fn, timeoutMs = 30000) {
@@ -592,6 +604,12 @@ export default {
       if (path === '/api/owner/status' && method === 'GET') {
         return await handleOwnerStatus(request, env, corsHeaders);
       }
+      if (path === '/api/writer/status' && method === 'GET') {
+        return await handleWriterStatus(request, env, corsHeaders);
+      }
+      if (path === '/api/writer/logout' && method === 'POST') {
+        return await handleWriterLogout(request, env, corsHeaders);
+      }
       if (path === '/api/invite/verify' && method === 'POST') {
         return await handleInviteVerify(request, env, corsHeaders);
       }
@@ -666,6 +684,9 @@ const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
 //     * иначе null
 //   - без заголовка, но с валидной HttpOnly-cookie __Host-owner_code → owner (viaCookie).
 //     Cookie сверяется за постоянное время, D1 не трогается.
+//   - без заголовка, но с валидной HttpOnly-cookie __Host-writer_tokens → writer
+//     (viaCookie). Токены проверяются по D1 (inv:{token}), сопоставляются с
+//     группой из запроса (см. parseWriterCookie).
 //   - иначе null (аноним = reader)
 async function resolveAuth(request, env) {
   const store = createStore(env);
@@ -674,14 +695,23 @@ async function resolveAuth(request, env) {
   const authHeader = request.headers.get('Authorization');
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7).trim();
-    if (token) {
-      // Owner: секретный код из env. Группу берём из query/body — за это
-      // отвечает вызывающий код.
-      if (env.OWNER_CODE && await timingSafeEqualStr(token, env.OWNER_CODE)) {
-        return { role: 'owner', token };
-      }
+    // Защита от гигантских токенов: не даём тратить CPU на timingSafeEqualStr
+    // (owner) и D1-запросы (writer) с токенами произвольной длины. OWNER_CODE
+    // генерируется длиной 24 (см. generate_owner_code.py), writer-инвайты — 32-hex,
+    // так что разумный потолок 64 не ломает ни одну из веток.
+    if (!token || token.length > 64) return null;
+    // Owner: секретный код из env. Группу берём из query/body — за это
+    // отвечает вызывающий код. OWNER_CODE не обязан быть 32-hex (алфавит
+    // ascii_letters+digits+"-_"), поэтому здесь 32-hex НЕ требуем — только
+    // постоянное по времени сравнение.
+    if (env.OWNER_CODE && await timingSafeEqualStr(token, env.OWNER_CODE)) {
+      return { role: 'owner', token };
+    }
 
-      // Writer: ищем inv:{token} в KV.
+    // Writer: ищем inv:{token} в KV. Инвайт-токены всегда 32-hex (crypto.randomUUID
+    // без дефисов), поэтому заранее отбрасываем мусорные ключи, чтобы не делать
+    // лишних D1-запросов.
+    if (/^[0-9a-f]{32}$/i.test(token)) {
       try {
         const inv = await store.get(`inv:${token}`, { type: 'json' });
         if (inv && inv.group) {
@@ -698,6 +728,28 @@ async function resolveAuth(request, env) {
   // Код владельца JS не знает, D1 не затрагиваем.
   if (await ownerFromCookie(request, env)) {
     return { role: 'owner', viaCookie: true };
+  }
+
+  // HttpOnly-cookie __Host-writer_tokens: массив { g: группа, t: токен }.
+  // Редактор может владеть токенами нескольких групп — ищем запись,
+  // совпадающую с группой из запроса (иначе мультигрупповой редактор
+  // получал бы 403 group mismatch при работе с любой группой, кроме
+  // первой в куке). Валидность токена проверяем в D1 (inv:{token}).
+  const writerEntries = parseWriterCookie(request);
+  if (writerEntries.length > 0) {
+    let targetGroup = null;
+    try { targetGroup = await groupFromBodyOrQuery(request); } catch (_) { targetGroup = null; }
+    for (const { g, t } of writerEntries) {
+      if (targetGroup && g !== targetGroup) continue;
+      try {
+        const inv = await store.get(`inv:${t}`, { type: 'json' });
+        if (inv && inv.group && normalizeGroup(inv.group) === g) {
+          return { role: 'writer', group: g, viaCookie: true };
+        }
+      } catch (e) {
+        console.log('resolveAuth writer-cookie inv-read failed:', e.message);
+      }
+    }
   }
 
   return null;
@@ -722,6 +774,69 @@ async function ownerFromCookie(request, env) {
     return await timingSafeEqualStr(value, expected);
   }
   return false;
+}
+
+// ── Writer-cookie (__Host-writer_tokens) ────────────────────────
+//
+// Токены приглашений редактора лежат в HttpOnly-cookie, а не в localStorage:
+// JS их не видит (закрывает XSS-кражу токена), кука прикладывается браузером
+// сама. В отличие от owner'а, у редактора может быть несколько групп — в куке
+// хранится JSON-массив записей { g: группа, t: токен }:
+//   __Host-writer_tokens = encodeURIComponent('[{"g":"131-ибо","t":"<32hex>"},...]')
+// Токен лежит как есть: он и так случайный 32-hex (перебор невозможен), а
+// кража куки = кража сессии — хэширование не добавило бы защиты. Срок жизни
+// куки (6 мес) короче срока инвайта в D1 (365 дней) — роль восстанавливается
+// повторным открытием той же #invite=-ссылки.
+
+const WRITER_COOKIE_TTL = 15552000; // 6 месяцев (сек)
+const WRITER_COOKIE_MAX_ENTRIES = 20; // предохранитель от раздувания куки
+const WRITER_COOKIE_NAME = '__Host-writer_tokens';
+
+// Читает записи writer-куки из запроса. Возвращает массив { g, t }.
+// Невалидные записи отбрасываются — мусор в куке auth не ломает.
+function parseWriterCookie(request) {
+  const cookieHeader = request.headers.get('Cookie');
+  if (!cookieHeader) return [];
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() !== WRITER_COOKIE_NAME) continue;
+    let raw = part.slice(eq + 1).trim();
+    try { raw = decodeURIComponent(raw); } catch (_) { return []; }
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      const out = [];
+      for (const item of arr) {
+        const g = normalizeGroup(item && item.g);
+        const t = typeof (item && item.t) === 'string' ? item.t.trim() : '';
+        if (!g || !isValidGroup(g) || !/^[0-9a-f]{32}$/i.test(t)) continue;
+        out.push({ g, t });
+        if (out.length >= WRITER_COOKIE_MAX_ENTRIES) break;
+      }
+      return out;
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+// Строка Set-Cookie для writer-куки. entries — массив { g, t }.
+// Пустой массив → удаление куки.
+function writerCookieSetHeader(entries) {
+  if (!entries || entries.length === 0) {
+    return `${WRITER_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  }
+  const value = encodeURIComponent(JSON.stringify(entries.map(({ g, t }) => ({ g, t }))));
+  return `${WRITER_COOKIE_NAME}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${WRITER_COOKIE_TTL}`;
+}
+
+// Upsert записи { g, t } в writer-куку запроса (другие группы сохраняются).
+function writerCookieUpsert(request, g, t) {
+  const entries = parseWriterCookie(request).filter((e) => e.g !== g);
+  entries.push({ g, t });
+  return writerCookieSetHeader(entries.slice(-WRITER_COOKIE_MAX_ENTRIES));
 }
 
 // Извлекает группу для owner из query (GET/DELETE) или body (POST/PUT).
@@ -757,7 +872,7 @@ async function groupFromBodyOrQuery(request) {
 // а заголовка нет — отбиваем 403. Bearer-авторизация заголовка не требует
 // (формы его тоже не умеют слать). Возвращает Response (403) или null (ок).
 function csrfGuardForCookieAuth(auth, request, corsHeaders) {
-  if (auth && auth.role === 'owner' && auth.viaCookie &&
+  if (auth && auth.viaCookie && (auth.role === 'owner' || auth.role === 'writer') &&
       request.headers.get('X-Requested-With') !== 'fetch') {
     return jsonResponse({ error: 'Forbidden: CSRF header required' }, corsHeaders, 403);
   }
@@ -833,11 +948,16 @@ async function handleInviteCreate(request, env, corsHeaders) {
     expirationTtl: INVITE_TTL,
   });
 
-  // Добавляем в inv-by-group:{group}
-  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
-  listRaw.push({ id, token, createdAt, label: label || undefined });
-  await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
-    expirationTtl: INVITE_TTL,
+  // Добавляем в inv-by-group:{group}. RMW-цикл (get → push → put) сериализуем
+  // withKeyLock — иначе два параллельных запроса owner'а на одну группу могут
+  // перезаписать список (потеря записи). Сама запись inv:{token} выше уникальна
+  // (случайный токен), ей блокировка не нужна, поэтому остаётся вне этого участка.
+  await withKeyLock(`inv-by-group:${group}`, async () => {
+    const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+    listRaw.push({ id, token, createdAt, label: label || undefined });
+    await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+      expirationTtl: INVITE_TTL,
+    });
   });
 
   // Формируем ссылку. ORIGIN — origin текущего запроса (та же Workers-домена).
@@ -909,8 +1029,11 @@ async function handleOwnerLogin(request, env, corsHeaders) {
 // ни в браузерный, ни в CDN-кеш.
 async function handleOwnerStatus(request, env, corsHeaders) {
   const authHeader = request.headers.get('Authorization');
+  // OWNER_CODE генерируется длиной 24 (generate_owner_code.py) — гигантские
+  // Bearer-токены отбрасываем, чтобы не тратить CPU на timingSafeEqualStr.
   const viaBearer = !!(env.OWNER_CODE &&
     authHeader && authHeader.startsWith('Bearer ') &&
+    authHeader.slice(7).trim().length <= 64 &&
     await timingSafeEqualStr(authHeader.slice(7).trim(), env.OWNER_CODE));
   const isOwner = viaBearer || await ownerFromCookie(request, env);
   const headers = {
@@ -942,6 +1065,76 @@ async function handleOwnerLogout(request, env, corsHeaders) {
     ...corsHeaders,
     'Content-Type': 'application/json',
     'Set-Cookie': `${OWNER_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+  };
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+}
+
+// GET /api/writer/status?group=...
+// Публичный. Лёгкая проверка роли writer: возвращает { isWriter } по
+// HttpOnly-cookie __Host-writer_tokens. Токена в куке нет/невалиден/не для
+// этой группы → false. Нужен фронтенду, чтобы восстановить права редактора
+// после перезагрузки (JS куку не видит). Ответ всегда приватный
+// (private, no-store) — как /api/owner/status, в общий кэш не попадает.
+async function handleWriterStatus(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const group = normalizeGroup(url.searchParams.get('group'));
+  if (!group || !isValidGroup(group)) {
+    return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
+  }
+
+  let isWriter = false;
+  const store = createStore(env);
+  if (env.DB) {
+    for (const { g, t } of parseWriterCookie(request)) {
+      if (g !== group) continue;
+      try {
+        const inv = await store.get(`inv:${t}`, { type: 'json' });
+        if (inv && inv.group && normalizeGroup(inv.group) === g) {
+          isWriter = true;
+          break;
+        }
+      } catch (e) {
+        console.log('handleWriterStatus inv-read failed:', e.message);
+      }
+    }
+  }
+
+  const headers = {
+    ...securityHeaders,
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Cache-Control': 'private, no-store',
+  };
+  return new Response(JSON.stringify({ isWriter: !!isWriter, group }), { status: 200, headers });
+}
+
+// POST /api/writer/logout
+// Body: { group }. Публичный. Удаляет токен указанной группы из HttpOnly-cookie
+// __Host-writer_tokens (токены других групп сохраняются). CSRF-защита как у
+// /api/owner/logout: если роль пришла из куки (auth.viaCookie), требуем
+// X-Requested-With: fetch — иначе same-site form-POST с поддомена dpdns.org
+// мог бы молча вылогинить редактора. Без group — чистит куку целиком.
+async function handleWriterLogout(request, env, corsHeaders) {
+  const auth = await resolveAuth(request, env);
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return csrf;
+
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+  const group = normalizeGroup((bb.json || {}).group);
+  let setCookie;
+  if (group && isValidGroup(group)) {
+    setCookie = writerCookieSetHeader(parseWriterCookie(request).filter((e) => e.g !== group));
+  } else {
+    setCookie = writerCookieSetHeader([]);
+  }
+
+  const headers = {
+    ...securityHeaders,
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Set-Cookie': setCookie,
   };
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
 }
@@ -991,7 +1184,18 @@ async function handleInviteVerify(request, env, corsHeaders) {
     console.log(`[legacy] invite verified via legacy ?token= link; group=${normalizeGroup(inv.group)} — перевыпустите ссылку (#invite=)`);
   }
 
-  return jsonResponse({ ok: true, group: normalizeGroup(inv.group), token }, corsHeaders);
+  // Успешная верификация ставит HttpOnly-cookie __Host-writer_tokens (upsert
+  // по группе, 6 месяцев): роль редактора восстанавливается после перезагрузки
+  // без повторного ввода ссылки, а токен недоступен JavaScript'у. Тело ответа
+  // не меняем — токен в ответе остаётся для обратной совместимости (старые
+  // клиенты и curl), фронтенд больше не кладёт его в localStorage.
+  const headers = {
+    ...securityHeaders,
+    ...corsHeaders,
+    'Content-Type': 'application/json',
+    'Set-Cookie': writerCookieUpsert(request, normalizeGroup(inv.group), token),
+  };
+  return new Response(JSON.stringify({ ok: true, group: normalizeGroup(inv.group), token }), { status: 200, headers });
 }
 
 // GET /api/invite?group=...
@@ -2492,6 +2696,10 @@ async function cacheControlForGet(request, env) {
   // Owner с HttpOnly-cookie тоже приватный: bootstrap в этом случае несёт
   // isOwner, и его нельзя пускать в публичный CDN-кеш.
   if (await ownerFromCookie(request, env)) return CC_WRITER_GET;
+  // Writer с HttpOnly-cookie тоже приватный: /api/invite, /api/subjects и прочие
+  // writer-GET могут нести данные, привязанные к роли/группе редактора,
+  // поэтому их нельзя пускать в публичный CDN-кеш.
+  if (parseWriterCookie(request).length > 0) return CC_WRITER_GET;
   return CC_READER_GET;
 }
 
@@ -2664,6 +2872,11 @@ function jsonResponse(data, corsHeaders, status = 200, opts = {}) {
     // CDN (считает ключ кеша зависимым от заголовка, которого у анонимных
     // запросов нет), и CF-Cache-Status остаётся пустым.
     if (opts.isPrivate) headers['Vary'] = 'Authorization';
+  } else if (status >= 400) {
+    // VULN-006: 4xx/5xx не должны кэшироваться. Если cacheControl задан явно —
+    // уважаем его (не переопределяем). Без явного cacheControl на ошибках
+    // ставим no-store по умолчанию, чтобы исключить кеширование по недосмотру.
+    headers['Cache-Control'] = 'no-store';
   }
   return new Response(JSON.stringify(data), { status, headers });
 }
@@ -3179,7 +3392,12 @@ async function handleTgWebhook(request, env) {
     // callback» — «мёртвая» подписка (никогда не совпадёт при рассылке)
     // не создаётся.
     const cbMatch = data.match(/^sub_(any|[12]):(.+)$/);
-    if (cbMatch && chatId) {
+    // Валидируем chatId: Telegram может прислать callback_query без поля
+    // message (напр. при кнопке "Delete" в боте на iOS/Android). Тогда
+    // String(undefined) === 'undefined' — truthy, и без этой проверки
+    // создалась бы «мёртвая» подписка с chatId='undefined'. Число с
+    // нецифровыми символами отбрасываем заодно (защита от мусора).
+    if (cbMatch && chatId && chatId !== 'undefined' && /^\d+$/.test(chatId)) {
       const subgroup = cbMatch[1] === 'any' ? 'any' : cbMatch[1];
       // Defense-in-depth: regex уже отсекает всё кроме any/1/2, но write-путь
       // дополнительно страхуем проверкой по константе — на случай будущих
@@ -3793,7 +4011,8 @@ function rateLimitResponse(corsHeaders, retryAfter, details) {
 // D1-read oracle / оракул кода владельца. Для них — fail-closed (см. checkRateLimit).
 function isVerifyPath(path) {
   return path === '/api/invite/verify' || path === '/api/invite/create' ||
-         path === '/api/owner/login' || path === '/api/owner/logout';
+         path === '/api/owner/login' || path === '/api/owner/logout' ||
+         path === '/api/writer/logout';
 }
 
 async function applyRateLimits(store, request, path, method, corsHeaders) {

@@ -95,10 +95,11 @@ Local secrets go in `site/.dev.vars` (gitignored).
 
 ### Auth (role-based access)
 
-`resolveAuth(request, env)` reads `Authorization: Bearer <token>` and, if absent, the **HttpOnly cookie `__Host-owner_code`**:
+`resolveAuth(request, env)` reads `Authorization: Bearer <token>` and, if absent, the **HttpOnly cookies `__Host-owner_code` / `__Host-writer_tokens`**:
 
 - no header + no cookie → **reader** (anonymous; group from query/body). GET only.
 - token ∈ D1 `inv:{token}` → **writer** (group from the invite record). POST/PUT/DELETE.
+- valid `__Host-writer_tokens` cookie → **writer** (viaCookie). Cookie = `encodeURIComponent(JSON.stringify([{g:"группа",t:"<32hex>"}, ...]))` (per-group, до 20 записей — редактор может иметь токены нескольких групп). Токены проверяются по D1 (`inv:{token}`) и сопоставляются с группой из запроса. Живёт 6 месяцев (`WRITER_COOKIE_TTL`).
 - token === `env.OWNER_CODE` OR valid `__Host-owner_code` cookie (constant-time compare of SHA-256 hash via `ownerFromCookie`, **no D1 hit**) → **owner** (writer + invite management for any group).
 
 All write endpoints are wrapped with `requireWriter()` → 403 for reader.
@@ -106,17 +107,18 @@ All write endpoints are wrapped with `requireWriter()` → 403 for reader.
 - **Owner login**: `POST /api/owner/login` `{ code }` → on success sets HttpOnly `__Host-owner_code` cookie (30 days, `Secure; SameSite=Lax; Path=/`, no Domain — `__Host-` prefix locks these attributes). The code is **never stored in localStorage or JS state** — JS can't read it (`document.cookie` won't see HttpOnly). The frontend restores `ownerRole` on every load via a lightweight `GET /api/owner/status` (computed from the cookie server-side, no D1) — this runs at the start of `loadData()` because the cache-only fast path (warm localStorage caches) skips `/api/bootstrap` entirely. `isOwner` is also returned in `/api/bootstrap`. Requests from an owner with cookie bypass CDN cache (`cachedGet`/`cacheControlForGet` treat cookie like Bearer).
 - **Owner logout**: `POST /api/owner/logout` → clears the cookie (button in settings «Ваша роль»).
 - **Owner login via link**: frontend reads `#owner=<OWNER_CODE>` (new links, hash not logged) or `?owner=<OWNER_CODE>` (LEGACY, still parsed for already-distributed links — logs `console.warn('[deprecated] legacy ?owner= link used; please migrate to #-format')`) on load → `becomeOwner()` → `POST /api/owner/login`. New owner links are only referenced in `#owner=` form (`index.html` shows `…/#owner=<код>`).
-- **Invite link**: **all new links are generated ONLY in hash form** `#invite=<token>` (avoids server logs/history/caches) — both in the worker (`handleInviteCreate`) and on the frontend (`copyInviteLink`). The legacy `?token=<invToken>` format is still **parsed** for already-distributed links (logs `console.warn('[deprecated] legacy ?token= link used; please migrate to #-format')`), but never generated. Frontend reads the link on load, validates via `/api/invite/verify`, saves as writer token; legacy `?token=` is accepted for already-distributed links only.
+- **Invite link**: **all new links are generated ONLY in hash form** `#invite=<token>` (avoids server logs/history/caches) — both in the worker (`handleInviteCreate`) and on the frontend (`copyInviteLink`). The legacy `?token=<invToken>` format is still **parsed** for already-distributed links (logs `console.warn('[deprecated] legacy ?token= link used; please migrate to #-format')`), but never generated. Frontend reads the link on load, validates via `/api/invite/verify` — on success the server sets the HttpOnly cookie `__Host-writer_tokens` (JS больше не хранит токены: ни в localStorage, ни в state). Legacy `?token=` is accepted for already-distributed links only.
+- **Writer role restore**: JS не видит `__Host-writer_tokens`, поэтому роль редактора фронтенд восстанавливает через `GET /api/writer/status?group=` (1 D1-чтение) в начале `loadData()` и при смене группы (`refreshWriterStatus`). Старые токены из localStorage (ключи `writerTokens`/`writerToken`) мигрируются в куку один раз при старте (`migrateLegacyWriterTokens`) и удаляются.
 - `INVITE_ORIGIN` (var) — canonical origin for invite links (`https://kampussgu.dpdns.org`).
 
 ### CSRF protection (не ломать!)
 
-Two layers on top of cookie-based owner auth (cookie `__Host-owner_code` is auto-attached by the browser, incl. same-site form-POST from any `*.dpdns.org` subdomain):
+Two layers on top of cookie-based auth (cookies `__Host-owner_code`/`__Host-writer_tokens` are auto-attached by the browser, incl. same-site form-POST from any `*.dpdns.org` subdomain):
 
 1. **`readJsonBody()` rejects any non-`application/json` Content-Type** (`parseError` → 400). HTML forms can't send JSON, so text/plain JSON-smuggling is dead. All body-reading handlers get this via `readJsonBody` — don't bypass it.
-2. **`csrfGuardForCookieAuth(auth, request, corsHeaders)`** — requires header `X-Requested-With: fetch` when owner role came from cookie (`auth.viaCookie`). Used in `requireWriter` + invite handlers (create/delete/rename — NOT list: it's a read-only GET, no side effects, no CSRF value). Frontend sends this header in `apiPost`/`apiPut`/`apiDelete` (app.js) — keep it there. Bearer-auth (writer/owner via `Authorization`) doesn't need the header. `apiFetch` (GETs) doesn't send it on purpose — keeps preview-domain GETs preflight-free.
+2. **`csrfGuardForCookieAuth(auth, request, corsHeaders)`** — requires header `X-Requested-With: fetch` when owner **or writer** role came from cookie (`auth.viaCookie`). Used in `requireWriter` + invite handlers (create/delete/rename — NOT list: it's a read-only GET, no side effects, no CSRF value). Frontend sends this header in `apiPost`/`apiPut`/`apiDelete` (app.js) — keep it there. Bearer-auth (writer/owner via `Authorization`) doesn't need the header. `apiFetch` (GETs) doesn't send it on purpose — keeps preview-domain GETs preflight-free.
 
-Rule: **every new write/owner-powerful endpoint** that can be reached with cookie auth must call `csrfGuardForCookieAuth` after `resolveAuth`, and the frontend call must go through one of the `api*` helpers (they add the header). Public endpoints (`/api/owner/login|logout|status`, `/api/invite/verify`) don't use the guard.
+Rule: **every new write/owner-powerful endpoint** that can be reached with cookie auth must call `csrfGuardForCookieAuth` after `resolveAuth`, and the frontend call must go through one of the `api*` helpers (they add the header). Public endpoints (`/api/owner/login|logout|status`, `/api/invite/verify`, `/api/writer/status`) don't use the guard (`/api/writer/logout` — использует).
 
 ### D1 key patterns
 
@@ -161,10 +163,12 @@ D1 access is logged per request as `[db-summary]` (count + total ms) — see `wr
 | POST | `/api/check-campus-update` | writer | Check if campus data changed |
 | POST | `/api/sync-from-campus` | writer | Full sync: save + update subjects + recalc HW |
 | POST | `/api/invite/create` | writer | Create invite link |
-| POST | `/api/invite/verify` | — | Verify invite token → group (public) |
+| POST | `/api/invite/verify` | — | Verify invite token → group (public). On success sets HttpOnly cookie `__Host-writer_tokens` (see below) |
 | POST | `/api/owner/login` | — | Owner login: sets HttpOnly `__Host-owner_code` cookie (public, rate-limited) |
 | POST | `/api/owner/logout` | — | Owner logout: clears `__Host-owner_code` cookie (public, rate-limited) |
 | GET | `/api/owner/status` | — | Owner role check: `{ isOwner }` from HttpOnly cookie / Bearer (public, no D1, always `private, no-store`) |
+| GET | `/api/writer/status?group=` | — | Writer role check: `{ isWriter }` from HttpOnly cookie `__Host-writer_tokens` (public, checks `inv:{token}` in D1, always `private, no-store`) |
+| POST | `/api/writer/logout` | — | Writer logout: removes current group's token from `__Host-writer_tokens` cookie (CSRF-guarded, in verify rate-limit) |
 | GET | `/api/invite?group=` | writer | List group invites |
 | PUT | `/api/invite` | writer | Rename invite label |
 | DELETE | `/api/invite?id=&group=` | writer | Revoke invite |
@@ -175,7 +179,7 @@ No `/api/auth`, `/api/group/register`, `/api/tg/subscribe`, `/api/tg/unsubscribe
 
 ## Rate limiting
 
-D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 600** (all requests — щадящий лимит из-за CGNAT/NAT: за одним cf-connecting-ip сидят сотни людей, 120 давало ложные 429), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`), **tg 60** (`/api/tg/webhook`), **tgstatus 30** (`/api/tg/status`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. Each 429 logs `[rate-limited] kind=… ip=… windowStart=… count=… limit=…` (see `rateLimitResponse`) — track the 429 share via `wrangler tail`. If D1 errors, limits fail **open** (bounded): `verify` is fail-closed (429 `degraded`), while `global`/`tg`/`tgstatus` fall back to an in-memory per-isolate counter (`memRateLimitCheck`) so an outage doesn't become «unlimited» while preserving availability. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
+D1-based fixed-window counters stored in the same `kv` table (`rl:{kind}:{ip}:{windowStart}`, TTL ≈120s). Applied to every request before routing (see `applyRateLimits` in `worker/index.js`). Per-IP, 60s window: **global 600** (all requests — щадящий лимит из-за CGNAT/NAT: за одним cf-connecting-ip сидят сотни людей, 120 давало ложные 429), **verify 10** (`/api/invite/verify`, `/api/invite/create`, `/api/owner/login`, `/api/owner/logout`, `/api/writer/logout`), **tg 60** (`/api/tg/webhook`), **tgstatus 30** (`/api/tg/status`). Over limit → `429` + `Retry-After` header; the frontend shows a toast on 429. Each 429 logs `[rate-limited] kind=… ip=… windowStart=… count=… limit=…` (see `rateLimitResponse`) — track the 429 share via `wrangler tail`. If D1 errors, limits fail **open** (bounded): `verify` is fail-closed (429 `degraded`), while `global`/`tg`/`tgstatus` fall back to an in-memory per-isolate counter (`memRateLimitCheck`) so an outage doesn't become «unlimited» while preserving availability. Don't hammer endpoints in loops while testing — bursty scripts hit 429 quickly.
 
 ## Data model
 
