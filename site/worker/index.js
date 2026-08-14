@@ -937,7 +937,9 @@ async function handleInviteCreate(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing group' }, corsHeaders, 400);
   }
 
-  const label = (body.label || '').toString().slice(0, 100);
+  // label — опциональное название ссылки: чистим через sanitizeString
+  // (лимит длины 100 + удаление управляющих символов), не-строки отбрасываем.
+  const label = sanitizeString(body.label, 100);
   const token = crypto.randomUUID().replace(/-/g, '');
   const id = token.slice(0, 8);
   const createdAt = new Date().toISOString();
@@ -990,6 +992,15 @@ async function handleOwnerLogin(request, env, corsHeaders) {
   if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
   const body = bb.json;
   const code = (body.code || '').toString();
+  // Защита от CPU-нагрузки: в timingSafeEqualStr пользовательский код
+  // хешируется SHA-256 (sha256Digest), поэтому гигантский body.code (тело
+  // ограничено только readJsonBody) заставлял бы воркер хешировать мегабайты
+  // на каждый запрос. OWNER_CODE по умолчанию длиной 24 (generate_owner_code.py,
+  // минимум 8), потолок 128 с большим запасом не ломает легальные коды.
+  // Тот же приём, что лимит ≤64 в resolveAuth — проверка ДО хеширования.
+  if (code.length > 128) {
+    return jsonResponse({ error: 'Bad Request: owner code too long' }, corsHeaders, 400);
+  }
   if (!code || !(await timingSafeEqualStr(code, env.OWNER_CODE))) {
     return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
   }
@@ -1142,14 +1153,19 @@ async function handleWriterLogout(request, env, corsHeaders) {
 // POST /api/invite/verify
 // Body: { token }. Публичный (без auth).
 // Валидный токен  → 200 { ok: true, group, token }.
-// Невалидный/отозванный → 200 { ok: false } — ТОТ ЖЕ статус 200, что и для
-// других «невалидных» исходов (пустой токен → 400). Одинаковый статус/тело
-// для всех невалидных ответов убирает оракул по статус-коду (404 vs 400) и
-// не позволяет отличить «токен не существует» от «токен отозван» (и от
-// неверного формата). Фронтенд (revalidateInviteToken / consumeInviteTokenFromUrl)
-// проверяет `!resp.ok || !data.ok` симметрично — унификация для него прозрачна.
-// Сама проверка «валиден ли предъявленный токен» остаётся — это и есть функция
-// эндпоинта. Перебор дополнительно закрыт rate limit 10/мин/IP (fail-closed)
+// Пустой токен или токен неверного формата (длина >64 или не 32-hex) → 400.
+// Токен корректного 32-hex формата, но несуществующий/отозванный → 200
+// { ok: false } — единый статус для всех «несуществующих» исходов убирает
+// оракул по статус-коду (404 vs 400): нельзя отличить «токен не существует»
+// от «токен отозван». 400 за неверный формат оракулом не является: вход, не
+// прошедший строгую 32-hex проверку, по построению не может быть валидным
+// токеном (все токены генерируются как crypto.randomUUID без дефисов — см.
+// handleInviteCreate), поэтому по нему нельзя ничего узнать о реальных
+// токенах. Фронтенд (consumeInviteTokenFromUrl) проверяет `resp.ok && data.ok`
+// симметрично — для него 400 и 200 {ok:false} неразличимы и оба означают
+// «ссылка недействительна». Проверка формата выполняется ДО обращения к D1
+// и защищает хранилище от мусорных ключей (в теле может быть токен до 1 МБ).
+// Перебор дополнительно закрыт rate limit 10/мин/IP (fail-closed)
 // и 32-hex пространством токенов.
 async function handleInviteVerify(request, env, corsHeaders) {
   const store = createStore(env);
@@ -1161,16 +1177,30 @@ async function handleInviteVerify(request, env, corsHeaders) {
   if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
   if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
   const body = bb.json;
-  const token = (body.token || '').toString().trim();
+  const token = ((body || {}).token || '').toString().trim();
   if (!token) {
     return jsonResponse({ error: 'Missing token' }, corsHeaders, 400);
+  }
+  // Валидируем формат ДО обращения к D1: инвайт-токены всегда 32-hex
+  // (crypto.randomUUID без дефисов — см. handleInviteCreate; тот же паттерн
+  // и лимит ≤64 уже применяется в resolveAuth). Мусор (aaaa) или гигантское
+  // значение (до 1 МБ в теле) не должны превращаться в ключ inv:{token} —
+  // это лишний D1-read и мусор в таблице. Не-32-hex вход по построению не
+  // может быть валидным токеном, поэтому 400 здесь оракулом не является
+  // (см. комментарий функции).
+  if (token.length > 64 || !/^[0-9a-f]{32}$/i.test(token)) {
+    return jsonResponse({ error: 'Invalid token' }, corsHeaders, 400);
   }
 
   const inv = await store.get(`inv:${token}`, { type: 'json' });
   if (!inv || !inv.group) {
     // 200 (не 404): не даём оракул по статус-коду и не различаем
-    // «не существует» / «отозван» / «битый формат». См. комментарий функции.
-    return jsonResponse({ ok: false, error: 'Invite not found or revoked' }, corsHeaders, 200);
+    // «не существует» / «отозван». Сюда попадают только токены корректного
+    // 32-hex формата (битый формат отсечён выше — 400). См. комментарий функции.
+    // cacheControl: 'no-store' — результат verify зависит от состояния инвайта
+    // и не должен кэшироваться (jsonResponse ставит no-store для 4xx/5xx, для
+    // 200 — только по явному cacheControl).
+    return jsonResponse({ ok: false, error: 'Invite not found or revoked' }, corsHeaders, 200, { cacheControl: 'no-store' });
   }
 
   // Observability для планового отзыва legacy-ссылок (?token=). Фронтенд шлёт
@@ -1193,6 +1223,9 @@ async function handleInviteVerify(request, env, corsHeaders) {
     ...securityHeaders,
     ...corsHeaders,
     'Content-Type': 'application/json',
+    // Явный no-store: ответ содержит полный токен и ставит Set-Cookie —
+    // кэшироваться (CDN/браузером) он не должен ни при каких условиях.
+    'Cache-Control': 'no-store',
     'Set-Cookie': writerCookieUpsert(request, normalizeGroup(inv.group), token),
   };
   return new Response(JSON.stringify({ ok: true, group: normalizeGroup(inv.group), token }), { status: 200, headers });
@@ -1280,23 +1313,38 @@ async function handleInviteDelete(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
-  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
-  const item = listRaw.find(it => it.id === id);
-  if (!item) {
+  // RMW-цикл (get → filter → put/delete) сериализуем withKeyLock — иначе два
+  // параллельных запроса owner'а на одну группу (удаление разных инвайтов)
+  // могут перезаписать список и потерять запись (см. handleInviteCreate).
+  // Удаление inv:{token} — одиночная операция по уникальному ключу, но
+  // оставляем её внутри блокировки: список и токен удаляются как одно целое
+  // относительно других операций с этой группой. Ошибка блокировки (таймаут)
+  // уходит в общий catch роутера → 500, как в остальных хендлерах.
+  const lockResult = await withKeyLock(`inv-by-group:${group}`, async () => {
+    const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+    const item = listRaw.find(it => it.id === id);
+    if (!item) {
+      return { notFound: true };
+    }
+
+    // Удаляем токен
+    await store.delete(`inv:${item.token}`);
+
+    // Чистим список
+    const filtered = listRaw.filter(it => it.id !== id);
+    if (filtered.length) {
+      await store.put(`inv-by-group:${group}`, JSON.stringify(filtered), {
+        expirationTtl: INVITE_TTL,
+      });
+    } else {
+      await store.delete(`inv-by-group:${group}`);
+    }
+
+    return { notFound: false };
+  });
+
+  if (lockResult.notFound) {
     return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
-  }
-
-  // Удаляем токен
-  await store.delete(`inv:${item.token}`);
-
-  // Чистим список
-  const filtered = listRaw.filter(it => it.id !== id);
-  if (filtered.length) {
-    await store.put(`inv-by-group:${group}`, JSON.stringify(filtered), {
-      expirationTtl: INVITE_TTL,
-    });
-  } else {
-    await store.delete(`inv-by-group:${group}`);
   }
 
   return jsonResponse({ ok: true }, corsHeaders);
@@ -1329,32 +1377,47 @@ async function handleInviteRename(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
-  const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
-  const idx = listRaw.findIndex(it => it.id === id);
-  if (idx === -1) {
+  // RMW-цикл (get → findIndex → обновить label → put) сериализуем withKeyLock —
+  // иначе два параллельных запроса owner'а на одну группу (переименование
+  // разных инвайтов) могут перезаписать список и потерять запись (см.
+  // handleInviteCreate). Синхронизация label в inv:{token} тоже внутри
+  // блокировки: токен принадлежит ровно одной группе, сериализация по
+  // inv-by-group:{group} исключает гонки по обоим ключам. Ошибка блокировки
+  // (таймаут) уходит в общий catch роутера → 500, как в остальных хендлерах.
+  const lockResult = await withKeyLock(`inv-by-group:${group}`, async () => {
+    const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
+    const idx = listRaw.findIndex(it => it.id === id);
+    if (idx === -1) {
+      return { notFound: true };
+    }
+
+    const newLabel = sanitizeString(body.label, 100).trim();
+    listRaw[idx].label = newLabel || undefined;
+    await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
+      expirationTtl: INVITE_TTL,
+    });
+
+    // Синхронизируем label в inv:{token} (для консистентности).
+    const token = listRaw[idx].token;
+    if (token) {
+      const inv = await store.get(`inv:${token}`, { type: 'json' });
+      if (inv) {
+        if (newLabel) inv.label = newLabel;
+        else delete inv.label;
+        await store.put(`inv:${token}`, JSON.stringify(inv), {
+          expirationTtl: INVITE_TTL,
+        });
+      }
+    }
+
+    return { notFound: false, newLabel };
+  });
+
+  if (lockResult.notFound) {
     return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
   }
 
-  const newLabel = (body.label || '').toString().slice(0, 100).trim();
-  listRaw[idx].label = newLabel || undefined;
-  await store.put(`inv-by-group:${group}`, JSON.stringify(listRaw), {
-    expirationTtl: INVITE_TTL,
-  });
-
-  // Синхронизируем label в inv:{token} (для консистентности).
-  const token = listRaw[idx].token;
-  if (token) {
-    const inv = await store.get(`inv:${token}`, { type: 'json' });
-    if (inv) {
-      if (newLabel) inv.label = newLabel;
-      else delete inv.label;
-      await store.put(`inv:${token}`, JSON.stringify(inv), {
-        expirationTtl: INVITE_TTL,
-      });
-    }
-  }
-
-  return jsonResponse({ ok: true, id, label: newLabel || '' }, corsHeaders);
+  return jsonResponse({ ok: true, id, label: lockResult.newLabel || '' }, corsHeaders);
 }
 
 // ── Constant-time string comparison ────────────────────────────
@@ -2243,6 +2306,17 @@ async function handleDeleteHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Missing id or group' }, corsHeaders, 400);
   }
 
+  // Валидируем формат id ДО обращения к D1. Допустимы оба формата:
+  //  - новые hw-ids: 32-hex (crypto.randomUUID без дефисов — см. handleAddHw);
+  //  - legacy hw-ids (до перехода на randomUUID): base36 ~12-13 символов
+  //    (Date.now().toString(36) + Math.random().toString(36).slice(2,6)).
+  // Мусор (aaaa) или гигантское значение из query не должны превращаться
+  // в поиск по массиву и лишний D1-read. Лимит ≤64 — защита от гигантских
+  // ключей, как для инвайт-токенов (handleInviteVerify) и writer-куки.
+  if (id.length > 64 || !(/^[0-9a-f]{32}$/i.test(id) || /^[0-9a-z]{8,16}$/i.test(id))) {
+    return jsonResponse({ error: 'Invalid id' }, corsHeaders, 400);
+  }
+
   const key = `hw:${group}`;
   const { removed, count } = await withKeyLock(key, async () => {
     const existing = await store.get(key, { type: 'json' }) || [];
@@ -2730,11 +2804,14 @@ async function finalCacheControlForGet(request, env) {
 }
 
 // Есть ли у запроса аутентификация (writer/owner): Bearer-токен ИЛИ
-// валидная HttpOnly-cookie __Host-owner_code. Для таких ответов isPrivate=true:
-// Vary:Authorization + private, чтобы CDN не смешивал их с reader-кешем.
+// валидная HttpOnly-cookie __Host-owner_code ИЛИ непустая HttpOnly-cookie
+// __Host-writer_tokens (та же логика, что в cacheControlForGet). Для таких
+// ответов isPrivate=true: Vary:Authorization + private, чтобы CDN не смешивал
+// их с reader-кешем.
 async function isAuthRequest(request, env) {
   return (request.headers.get('Authorization') || '').startsWith('Bearer ') ||
-    await ownerFromCookie(request, env);
+    await ownerFromCookie(request, env) ||
+    parseWriterCookie(request).length > 0;
 }
 
 // Инвалидация CDN-кеша для группы после записи. Удаляем кешированные GET-
@@ -2789,8 +2866,10 @@ async function purgeGroupCdnCache(env, group, changedWeeks = []) {
 async function cachedGet(request, env, corsHeaders, builder) {
   const hasBearer = (request.headers.get('Authorization') || '').startsWith('Bearer ');
   const isOwnerCookie = await ownerFromCookie(request, env);
-  if (hasBearer || isOwnerCookie) {
-    // Writer/owner — без кеша.
+  // Writer/owner — без кеша: Bearer-токен, owner-кука ИЛИ writer-кука
+  // (__Host-writer_tokens). Writer-GET могут нести данные, привязанные к роли
+  // редактора, — их нельзя ни отдавать из общего CDN-кеша, ни класть в него.
+  if (hasBearer || isOwnerCookie || parseWriterCookie(request).length > 0) {
     return builder();
   }
 
@@ -2834,8 +2913,14 @@ async function cachedGet(request, env, corsHeaders, builder) {
 
   const resp = await builder();
 
-  // Кешируем только успешные JSON-ответы.
-  if (cache && resp.ok && resp.headers.get('Content-Type') === 'application/json') {
+  // Кешируем только успешные JSON-ответы с публичной Cache-Control-политикой.
+  // private/no-store в Cache-Control — защита от регрессий: приватный ответ
+  // (например, writer/owner) НЕ должен попасть в общий CDN-кеш, даже если
+  // дойдёт до этой ветки (обычно такие запросы отсекаются выше). Заголовок
+  // может отсутствовать — тогда кешируем как раньше.
+  const respCacheControl = resp.headers.get('Cache-Control');
+  const cacheable = !(respCacheControl && /\b(?:private|no-store)\b/i.test(respCacheControl));
+  if (cache && resp.ok && resp.headers.get('Content-Type') === 'application/json' && cacheable) {
     try {
       const h = new Headers(resp.headers);
       h.set('CF-Cache-Status', 'MISS');
