@@ -8,6 +8,13 @@
   <link rel="preconnect" href="https://kampussgu.dpdns.org">
   <link rel="dns-prefetch" href="//campus.syktsu.ru">
   <link rel="preconnect" href="https://campus.syktsu.ru">
+  <!-- SRI (integrity="sha384-...") для app.js/style.css сознательно НЕ добавляется:
+       ресурсы same-origin + CSP script-src 'self' — при компрометации хостинга
+       злоумышленник меняет и index.html (хэш лежит рядом), т.е. ценность SRI ~0.
+       При этом без build-системы хэш пришлось бы пересчитывать вручную при КАЖДОЙ
+       правке app.js/style.css (деплой вручную, без CI) — риск сломать прод выше
+       выгоды. Если появится сборка с автопересчётом хэшей — добавить integrity
+       (без crossorigin: ресурсы same-origin), SRI с script-src 'self' совместим. -->
   <link rel="preload" href="style.css" as="style">
   <link rel="preload" href="app.js" as="script">
   <link rel="stylesheet" href="style.css">
@@ -441,6 +448,7 @@
     </symbol>
   </svg>
 
+  <!-- SRI для app.js не добавляем — см. комментарий в <head> про style.css/app.js. -->
   <script src="app.js"></script>
 </body>
 </html>

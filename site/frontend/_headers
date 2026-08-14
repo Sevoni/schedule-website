@@ -1,10 +1,28 @@
 # Cloudflare Pages security headers (статика: index.html, app.js, style.css).
 # Worker на /api/* отдаёт свои заголовки отдельно (см. corsHeaders в index.js).
+# COOP/CORP добавлены для защиты статики от XS-Leaks — значения совпадают с
+# securityHeaders в worker/index.js (API и Pages не противоречат).
+#
+# style-src 'unsafe-inline' (см. CSP ниже) — ОСОЗНАННО и ОБЯЗАТЕЛЬНО:
+# app.js задаёт инлайн-стили программно (38 мест): style.setProperty для CSS-переменных
+# --accent/--accent-dim и анимаций --from-x/--from-y, а также прямые присваивания
+# el.style.display/transform/background/color/position/top/left/width/minHeight/cursor/
+# overflow/transition/transformOrigin. Все они блокируются style-src без 'unsafe-inline'.
+# Убирать 'unsafe-inline' НЕЛЬЗЯ без рефакторинга. Условие ужесточения: перевести стили
+# на CSS-классы/переменные или точечно на 'unsafe-hashes' для конкретных присваиваний,
+# после чего убрать 'unsafe-inline' из style-src.
+#
+# HSTS БЕЗ preload — намеренно (см. Strict-Transport-Security ниже): включение preload
+# требует предварительной регистрации домена в списке https://hstspreload.org.
+# Добавление preload без регистрации может сломать HTTPS-доступ к домену.
+# Решение осознанное; preload добавить только после регистрации.
 
 /*
   X-Frame-Options: DENY
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
   Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
   Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
   Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-ZwQm2DvFzITZP8DlcrJzJ0u86bEGhGecCPIXZ8wdsuQ='; connect-src 'self' https://campus.syktsu.ru; base-uri 'self'; frame-ancestors 'none'; form-action 'self'

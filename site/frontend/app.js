@@ -12,8 +12,34 @@ const CAMPUS_CLASSROOM_URL = 'https://campus.syktsu.ru/schedule/classroom/';
 // с доменами вида attackerturbopages.org.
 const IS_TURBOPAGES = location.hostname.endsWith('.turbopages.org');
 
+// Таймаут HTTP-запросов (campus + API воркера), мс. Зависший запрос обрывается
+// через AbortController, чтобы не «висеть» бесконечно (задача №14). 15 c —
+// campus.syktsu.ru иногда отвечает медленно, но дольше ждать нет смысла.
+// Переопределяется per-call через opts.timeout (0 — отключить таймаут).
+const FETCH_TIMEOUT_MS = 15000;
+
 function fetchTimeout(url, opts = {}) {
-  return fetch(url, opts);
+  const { timeout = FETCH_TIMEOUT_MS, signal, ...rest } = opts;
+  const controller = new AbortController();
+
+  // Если вызывающий передал свой signal — не перезаписываем, а отменяем
+  // внутренний контроллер вместе с внешним (для будущих вызовов; сейчас
+  // signal никто не передаёт). Слушатель снимаем в finally — без утечек.
+  const onOuterAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+  }
+
+  const timer = timeout > 0 ? setTimeout(() => controller.abort(), timeout) : null;
+
+  return fetch(url, { ...rest, signal: controller.signal }).finally(() => {
+    if (timer) clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onOuterAbort);
+  });
 }
 
 // Удаляет перечисленные ключи из query-строки URL, не трогая остальные.
@@ -504,9 +530,16 @@ async function consumeInviteTokenFromUrl() {
 
   // Legacy query-формат (?token=): уже распределённые ссылки продолжают
   // работать, но новые ссылки генерируются только в #-формате (#invite=).
-  // Однократно логируем факт использования legacy-ссылки.
+  // Однократно логируем факт использования legacy-ссылки и передаём источник
+  // на бэкенд (source: 'legacy') — воркер залогирует это в wrangler tail без
+  // самого токена, чтобы владелец видел, какие группы ещё сидят на legacy и
+  // что их ссылки пора отозвать и перевыпустить (легаси-токен уже мог попасть
+  // в логи серверов/историю браузера до зачистки URL).
   if (!fromHash) {
-    console.warn('[deprecated] legacy ?token= link used; please migrate to #-format');
+    console.warn(
+      '[deprecated] legacy ?token= link used; please migrate to #-format. ' +
+      'Токен уже мог попасть в логи сервера/историю браузера — попросите владельца отозвать и перевыпустить ссылку.'
+    );
   }
 
   // Чистим URL ДО сетевой верификации: токен не должен висеть в адресной
@@ -534,7 +567,7 @@ async function consumeInviteTokenFromUrl() {
     const resp = await fetchTimeout(state.apiBase + '/api/invite/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, source: fromHash ? 'hash' : 'legacy' }),
     });
     const data = await resp.json();
     const isOwner = await ownerCheck;
@@ -592,9 +625,16 @@ async function consumeOwnerCodeFromUrl() {
 
   // Legacy query-формат (?owner=): уже распределённые ссылки продолжают
   // работать, но новые ссылки генерируются только в #-формате (#owner=).
-  // Однократно логируем факт использования legacy-ссылки.
+  // Однократно логируем факт использования legacy-ссылки и передаём источник
+  // на бэкенд (source: 'legacy') — воркер залогирует это в wrangler tail без
+  // самого кода, чтобы владелец знал: legacy-код ещё используется, и его стоит
+  // сменить/перевыпустить (легаси-код уже мог попасть в логи серверов/историю
+  // браузера до зачистки URL).
   if (!fromHash) {
-    console.warn('[deprecated] legacy ?owner= link used; please migrate to #-format');
+    console.warn(
+      '[deprecated] legacy ?owner= link used; please migrate to #-format. ' +
+      'Код владельца уже мог попасть в логи сервера/историю браузера — владельцу стоит сменить OWNER_CODE.'
+    );
   }
 
   // Чистим URL ДО сетевой верификации, в любом случае (успех или нет —
@@ -605,7 +645,7 @@ async function consumeOwnerCodeFromUrl() {
     clearUrlParams(['owner']);
   }
 
-  const ok = await becomeOwner(code, { silent: false });
+  const ok = await becomeOwner(code, { silent: false, source: fromHash ? 'hash' : 'legacy' });
   return ok;
 }
 
@@ -617,10 +657,16 @@ async function becomeOwner(code, opts = {}) {
   const silent = opts.silent !== false; // по умолчанию показываем toast
   if (!code) return false;
   try {
+    // opts.source ('hash'|'legacy') приходит из consumeOwnerCodeFromUrl и
+    // передаётся на бэкенд для observability (воркер логирует legacy-использование
+    // без самого кода). Ручной ввод кода в настройках source не задаёт —
+    // поле в body просто отсутствует, API-поведение не меняется.
+    const body = { code };
+    if (opts.source) body.source = opts.source;
     const resp = await fetchTimeout(state.apiBase + '/api/owner/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.ok) {
@@ -4182,7 +4228,7 @@ function setupInviteSection() {
         const created = it.createdAt ? formatDateTime(it.createdAt) : '';
         const label = it.label ? escHtml(it.label) : '';
         return `
-          <div class="invite-item" data-id="${escHtml(it.id)}" data-token="${escHtml(it.token || '')}">
+          <div class="invite-item" data-id="${escHtml(it.id)}">
             <div class="invite-meta">
               <span class="invite-id invite-copy" title="Нажмите, чтобы скопировать ссылку">#${escHtml(it.id)}</span>
               <span class="invite-label-text">${label || '<i>без названия</i>'}</span>
@@ -4593,13 +4639,29 @@ function parseDate(str) {
 
 // Копирует пригласительную ссылку в буфер обмена несколькими способами
 // (clipboard API → execCommand → contentEditable) и показывает тост о результате.
-function copyInviteLink(el) {
+// Полный токен в DOM не хранится — подтягиваем его отдельным запросом по id
+// (/api/invite?id=...) только в момент копирования.
+async function copyInviteLink(el) {
   const item = el.closest('.invite-item');
-  const token = item ? item.dataset.token : '';
-  if (!token) {
-    showToast('Нет токена для копирования', 'warn');
+  const id = item ? item.dataset.id : '';
+  if (!id) {
+    showToast('Нет id ссылки для копирования', 'warn');
     return;
   }
+
+  let token = '';
+  try {
+    const data = await apiFetch('/api/invite', { group: state.group, id });
+    token = data.item && data.item.token;
+  } catch (e) {
+    showToast('Не удалось получить токен', 'warn');
+    return;
+  }
+  if (!token) {
+    showToast('Не удалось получить токен', 'warn');
+    return;
+  }
+
   const origin = DEFAULT_API.replace(/\/api\/?$/, '').replace(/\/+$/, '');
   const link = origin + '/#invite=' + encodeURIComponent(token);
 

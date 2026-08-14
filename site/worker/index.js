@@ -46,6 +46,55 @@ function isValidWeekCode(w) {
   return typeof w === 'string' && (w === 'current' || WEEK_CODE_RE.test(w));
 }
 
+// Проверка привязки weekCode к группе: часть после '_' должна совпадать с
+// (lowercase) группой. Защищает от загрязнения пространства ключей
+// schedule:{group}:* чужими weekCode — writer группы A не сможет записать
+// weekCode с группой B (см. handleUpload / handleSyncFromCampus).
+// Спецзначение 'current' (легаси-ключ schedule:{group}:current) пропускается.
+function weekCodeMatchesGroup(weekCode, group) {
+  if (weekCode === 'current') return true;
+  if (!isValidWeekCode(weekCode) || !group) return false;
+  return weekCode.endsWith('_' + group);
+}
+
+// ════════════════════════════════════════════════════════════════
+// ── Single-flight / per-key mutex ────────────────────────────────
+// Сериализует read-modify-write циклы (get → modify → put) по одному ключу
+// внутри isolate'а Cloudflare Worker. Worker обрабатывает запросы без
+// многопоточности (кооперативная concurrency через await), поэтому цепочки
+// промисов достаточно для взаимного исключения: глобальная Map обещаний
+// персистентна в рамках isolate. Блокировка покрывает весь read→modify→write
+// цикл (D1-запись асинхронная), что исключает потерю данных при параллельных
+// запросах из разных вкладок/вебхуков. Защита от зависания — таймаут (по
+// умолчанию 30с): если критический участок не завершился, блокировка всё
+// равно освобождается, а вызов получает ошибку. Ошибка fn освобождает
+// блокировку через finally, не блокируя следующих в очереди.
+const KEY_LOCKS = new Map();
+
+async function withKeyLock(key, fn, timeoutMs = 30000) {
+  const prev = KEY_LOCKS.get(key) || Promise.resolve();
+  let release;
+  const tail = new Promise((res) => { release = res; });
+  const chain = prev.then(() => tail);
+  KEY_LOCKS.set(key, chain);
+  try {
+    // Ждём освобождения предыдущего критического участка (разрешение его tail).
+    await prev;
+    let timer = null;
+    const timeoutP = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`key lock timeout: ${key}`)), timeoutMs);
+    });
+    try {
+      return await Promise.race([fn(), timeoutP]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  } finally {
+    release();
+    if (KEY_LOCKS.get(key) === chain) KEY_LOCKS.delete(key);
+  }
+}
+
 // ── Валидация/санитизация данных при заливке (defense in depth) ─────────
 // Фронтенд экранирует вывод (escHtml), но writer'ы присылают произвольный
 // JSON. Здесь «мягко» приводим поля к ожидаемой форме: строки обрезаем и
@@ -58,6 +107,80 @@ function sanitizeString(v, maxLen = 200) {
   if (typeof v === 'number') v = String(v);
   if (typeof v !== 'string') return '';
   return v.slice(0, maxLen).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+}
+
+// Санитизация campusUpdatedAt (метка времени обновления кампуса).
+// Ожидаемый формат — ISO-дата "yyyy-MM-ddTHH:mm:ss" (локальное время кампуса)
+// с возможными суффиксами ".mmm" / "Z" / "+hh:mm" — см. extractCampusUpdatedAt
+// и parseCampusUpdatedAtTs на фронте; легаси-строки кампуса в том же формате
+// проходят как есть. Мусор (произвольные строки, гигантские значения,
+// управляющие символы) отбрасываем — возвращаем null, чтобы вызывающий код
+// не записал его в мету группы.
+function sanitizeCampusUpdatedAt(v) {
+  if (typeof v !== 'string') return null;
+  const s = sanitizeString(v, 64).trim();
+  if (!s) return null;
+  const ok = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/.test(s);
+  return ok ? s : null;
+}
+
+// Лимиты санитизации списка предметов (POST /api/subjects), чтобы нельзя было
+// залить гигантские объекты/массивы.
+const MAX_SUBJECTS = 300;         // максимум элементов в списке
+const MAX_SUBJECT_TYPES = 20;     // максимум pairTypes у одного предмета
+const MAX_SUBGROUP_CODES = 10;    // максимум кодов подгрупп на один тип
+const SUBJECT_SUBGROUP_RE = /^[12]$/; // допустимые коды подгрупп: "1" / "2"
+
+// Whitelist-санитизация массива предметов subjects:{group}:{sem}.
+// Валидный элемент (см. serializeSubjects / computeWeekSubjects, и тот же
+// формат на фронте в app.js):
+//   { subject: string, pairTypes: [code...], subgroups: { [code]: [code...] } }
+// Невалидные элементы отбрасываем, строки ограничиваем по длине и чистим от
+// управляющих символов, типы пар — только из ALLOWED_PAIR_TYPES, коды подгрупп
+// — только "1"/"2". Семантика валидных данных не меняется.
+function sanitizeSubjects(subjects) {
+  if (!Array.isArray(subjects)) return [];
+  const out = [];
+  for (const s of subjects) {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) continue;
+    const subject = sanitizeString(s.subject, 200).trim();
+    if (!subject) continue;
+
+    const pairTypes = [];
+    const seenTypes = new Set();
+    for (const t of Array.isArray(s.pairTypes) ? s.pairTypes : []) {
+      const ts = sanitizeString(t, 20);
+      if (ALLOWED_PAIR_TYPES.has(ts) && !seenTypes.has(ts)) {
+        seenTypes.add(ts);
+        pairTypes.push(ts);
+        if (pairTypes.length >= MAX_SUBJECT_TYPES) break;
+      }
+    }
+
+    const subgroups = {};
+    if (s.subgroups && typeof s.subgroups === 'object' && !Array.isArray(s.subgroups)) {
+      for (const [k, codes] of Object.entries(s.subgroups)) {
+        const kk = sanitizeString(k, 20);
+        if (!ALLOWED_PAIR_TYPES.has(kk)) continue; // не-whitelist тип — пропускаем
+        if (!Array.isArray(codes)) continue;
+        const cleanCodes = [];
+        const seen = new Set();
+        for (const c of codes) {
+          const cs = sanitizeString(c, 10);
+          if (SUBJECT_SUBGROUP_RE.test(cs) && !seen.has(cs)) {
+            seen.add(cs);
+            cleanCodes.push(cs);
+            if (cleanCodes.length >= MAX_SUBGROUP_CODES) break;
+          }
+        }
+        if (cleanCodes.length) subgroups[kk] = cleanCodes;
+      }
+    }
+
+    out.push({ subject, pairTypes, subgroups });
+    if (out.length >= MAX_SUBJECTS) break;
+  }
+  return out;
 }
 
 const SCHEDULE_PAIR_KEYS = ['subject', 'teacher', 'room', 'type', 'subgroup', 'num', 'time'];
@@ -129,17 +252,28 @@ function sanitizeScheduleData(data) {
   return out;
 }
 
-function sanitizeWeeks(weeks) {
+function sanitizeWeeks(weeks, group) {
   if (!Array.isArray(weeks)) return null;
-  return weeks
+  const out = weeks
     .map((w) => {
       if (!w || typeof w !== 'object' || Array.isArray(w)) return null;
-      const out = {};
-      if (w.value != null) out.value = sanitizeString(w.value, 60);
-      if (w.text != null) out.text = sanitizeString(w.text, 250);
-      return Object.keys(out).length ? out : null;
+      // Допустимый weekCode для списка недель: реальная неделя по WEEK_CODE_RE
+      // (не спецзначение 'current') И привязанная к этой группе (часть после
+      // '_' === group). Мусорные значения и weekCode чужой группы молча
+      // отбрасываем — так же, как это делают GET-пути (isValidWeekCode).
+      // Это защищает weeks:{group} от само-загрязнения произвольными ключами.
+      if (!w.value || typeof w.value !== 'string' || !WEEK_CODE_RE.test(w.value) || !weekCodeMatchesGroup(w.value, group)) {
+        return null;
+      }
+      const rec = {};
+      rec.value = sanitizeString(w.value, 60);
+      if (w.text != null) rec.text = sanitizeString(w.text, 250);
+      return rec;
     })
     .filter((w) => w !== null);
+  // Если после фильтрации не осталось ни одной валидной недели — считаем
+  // payload невалидным (не сохраняем пустой/мусорный список weeks).
+  return out.length ? out : null;
 }
 
 function sanitizeHwFields(body) {
@@ -152,6 +286,28 @@ function sanitizeHwFields(body) {
   if (body.subgroup != null) out.subgroup = sanitizeString(body.subgroup, 10);
   if (body.dueDate != null) out.dueDate = sanitizeString(body.dueDate, 40);
   return out;
+}
+
+// Валидация dueDate для ДЗ с dueMode='date'. Единственный допустимый формат —
+// строгая локальная дата "YYYY-MM-DD" (именно так её формирует календарь на
+// фронте, formatDateISO, и именно в этом формате сервер пересчитывает nextPair
+// в findNextPairDate). Проверяем реальную календарную дату: месяц 01-12, день
+// 01-31 с учётом числа дней в месяце и високосных годов (февраль 28/29).
+// Разумный диапазон года (1900-9999) отсекает мусор вроде "0000-01-01".
+// Возвращает нормализованную строку "YYYY-MM-DD" или null (невалидно/мусор).
+function sanitizeDueDate(v) {
+  if (typeof v !== 'string') return null;
+  const s = sanitizeString(v, 40).trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = +m[1], month = +m[2], day = +m[3];
+  if (year < 1900 || year > 9999) return null;
+  if (month < 1 || month > 12) return null;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day < 1 || day > daysInMonth) return null;
+  return s;
 }
 
 // Валидация enum-полей ДЗ (pairType / subgroup). Возвращает null, если оба поля
@@ -183,6 +339,7 @@ const MAX_BODY_BYTES = 1024 * 1024; // 1 МБ
 const MAX_BATCH_SCHEDULES = 30; // sync-from-campus / schedule-batch (фронт шлёт ≤5)
 const MAX_BATCH_HW_UPDATES = 500; // /api/hw/batch
 const MAX_WEEKS_LIST = 300; // upload type=weeks
+const MAX_WEEKS_PER_GET = 60; // максимум weekCode на /api/schedules и /api/bootstrap
 
 async function readJsonBody(request, maxBytes = MAX_BODY_BYTES) {
   if (!request.body) return { ok: true, json: {} };
@@ -717,6 +874,17 @@ async function handleOwnerLogin(request, env, corsHeaders) {
     return jsonResponse({ error: 'Forbidden: wrong owner code' }, corsHeaders, 403);
   }
 
+  // Observability для планового отзыва legacy-ссылок (?owner=). Фронтенд шлёт
+  // source: 'legacy' только когда код пришёл из query-строки (легаси-ссылка,
+  // код уже мог попасть в логи серверов). Логируем ТОЛЬКО факт — сам код не
+  // логируем (не светим секрет повторно). Владелец видит это в `wrangler tail`
+  // и знает, что legacy-код ещё используется — стоит сменить OWNER_CODE и
+  // раздать новые #owner= ссылки. Поле необязательное: без него (ручной ввод
+  // в настройках, curl) поведение не меняется.
+  if (body.source === 'legacy') {
+    console.log('[legacy] owner login via legacy ?owner= link — смените OWNER_CODE и раздайте новые #owner= ссылки');
+  }
+
   // В куку кладём не сам код, а его SHA-256 хэш (base64url): утечка куки
   // больше не раскрывает секрет владельца и не даёт вечной компрометации.
   const ownerHash = await getOwnerCodeHash(env);
@@ -779,7 +947,17 @@ async function handleOwnerLogout(request, env, corsHeaders) {
 }
 
 // POST /api/invite/verify
-// Body: { token }. Публичный (без auth). Возвращает { ok, group, token } либо 404.
+// Body: { token }. Публичный (без auth).
+// Валидный токен  → 200 { ok: true, group, token }.
+// Невалидный/отозванный → 200 { ok: false } — ТОТ ЖЕ статус 200, что и для
+// других «невалидных» исходов (пустой токен → 400). Одинаковый статус/тело
+// для всех невалидных ответов убирает оракул по статус-коду (404 vs 400) и
+// не позволяет отличить «токен не существует» от «токен отозван» (и от
+// неверного формата). Фронтенд (revalidateInviteToken / consumeInviteTokenFromUrl)
+// проверяет `!resp.ok || !data.ok` симметрично — унификация для него прозрачна.
+// Сама проверка «валиден ли предъявленный токен» остаётся — это и есть функция
+// эндпоинта. Перебор дополнительно закрыт rate limit 10/мин/IP (fail-closed)
+// и 32-hex пространством токенов.
 async function handleInviteVerify(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) {
@@ -797,7 +975,20 @@ async function handleInviteVerify(request, env, corsHeaders) {
 
   const inv = await store.get(`inv:${token}`, { type: 'json' });
   if (!inv || !inv.group) {
-    return jsonResponse({ error: 'Invite not found or revoked' }, corsHeaders, 404);
+    // 200 (не 404): не даём оракул по статус-коду и не различаем
+    // «не существует» / «отозван» / «битый формат». См. комментарий функции.
+    return jsonResponse({ ok: false, error: 'Invite not found or revoked' }, corsHeaders, 200);
+  }
+
+  // Observability для планового отзыва legacy-ссылок (?token=). Фронтенд шлёт
+  // source: 'legacy' только когда токен пришёл из query-строки (легаси-ссылка,
+  // токен уже мог попасть в логи серверов). Логируем ТОЛЬКО факт и группу —
+  // сам токен не логируем (не светим секрет повторно). Владелец видит это в
+  // `wrangler tail` и знает, какие группы ещё сидят на legacy — их ссылки
+  // пора отозвать и перевыпустить. Поле необязательное: без него (старые
+  // клиенты, curl, revalidateInviteToken) поведение не меняется.
+  if (body.source === 'legacy') {
+    console.log(`[legacy] invite verified via legacy ?token= link; group=${normalizeGroup(inv.group)} — перевыпустите ссылку (#invite=)`);
   }
 
   return jsonResponse({ ok: true, group: normalizeGroup(inv.group), token }, corsHeaders);
@@ -805,6 +996,12 @@ async function handleInviteVerify(request, env, corsHeaders) {
 
 // GET /api/invite?group=...
 // Только owner. Writer не имеет доступа к управлению ссылками.
+//
+// Без параметра id — список инвайтов БЕЗ полного токена (только id/createdAt/label):
+// полный токен не должен постоянно лежать в DOM, чтобы при XSS/расширении на
+// странице owner'а не утёк целиком.
+// С параметром id — возвращает один инвайт вместе с полным токеном (вызывается
+// фронтендом только в момент копирования ссылки).
 async function handleInviteList(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) {
@@ -823,9 +1020,30 @@ async function handleInviteList(request, env, corsHeaders) {
   }
 
   const listRaw = await store.get(`inv-by-group:${group}`, { type: 'json' }) || [];
-  const items = listRaw.map(({ id, token, createdAt, label }) => ({
+
+  const id = (url.searchParams.get('id') || '').toString().trim();
+
+  if (id) {
+    // Один инвайт с полным токеном — только для копирования ссылки.
+    const item = listRaw.find(it => it.id === id);
+    if (!item) {
+      return jsonResponse({ error: 'Invite not found' }, corsHeaders, 404);
+    }
+    const one = {
+      id: item.id,
+      token: item.token,
+      createdAt: item.createdAt,
+      ...(item.label ? { label: item.label } : {}),
+    };
+    return jsonResponse({ ok: true, item: one }, corsHeaders, 200, {
+      cacheControl: CC_WRITER_GET,
+      isPrivate: true,
+    });
+  }
+
+  // Список БЕЗ токенов — токен подтягивается отдельным запросом по id.
+  const items = listRaw.map(({ id, createdAt, label }) => ({
     id,
-    token,
     createdAt,
     ...(label ? { label } : {}),
   }));
@@ -1071,6 +1289,11 @@ async function handleGetSchedules(request, env, corsHeaders) {
   if (validWeeks.length === 0) {
     return jsonResponse({ error: 'Missing weeks parameter' }, corsHeaders, 400);
   }
+  // Жёсткий лимит числа weekCode: защита от гигантских IN(...) в D1
+  // (лимит SQL-переменных 999) и от DoS на себя через большой weeks=.
+  if (validWeeks.length > MAX_WEEKS_PER_GET) {
+    return jsonResponse({ error: `Too many weeks (max ${MAX_WEEKS_PER_GET})` }, corsHeaders, 400);
+  }
 
   const store = createStore(env);
   if (!env.DB) {
@@ -1125,6 +1348,11 @@ async function handleBootstrap(request, env, corsHeaders) {
   }
   // Отбрасываем мусорные weekCode (защита от cachebusting CDN-кэша).
   const validWeeks = weeks.filter((w) => isValidWeekCode(w));
+  // Жёсткий лимит числа weekCode: защита от гигантского db.batch() в D1
+  // (лимит SQL-переменных 999 / размера batch) и от DoS на себя.
+  if (validWeeks.length > MAX_WEEKS_PER_GET) {
+    return jsonResponse({ error: `Too many weeks (max ${MAX_WEEKS_PER_GET})` }, corsHeaders, 400);
+  }
 
   const store = createStore(env);
   if (!env.DB) {
@@ -1194,7 +1422,7 @@ async function handleUpload(request, env, corsHeaders) {
     if (weeks.length > MAX_WEEKS_LIST) {
       return jsonResponse({ error: 'Too many weeks (max 300)' }, corsHeaders, 400);
     }
-    const cleanWeeks = sanitizeWeeks(weeks);
+    const cleanWeeks = sanitizeWeeks(weeks, group);
     if (!cleanWeeks) {
       return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
     }
@@ -1214,7 +1442,7 @@ async function handleUpload(request, env, corsHeaders) {
       return jsonResponse({ error: 'invalid payload' }, corsHeaders, 400);
     }
     const cleanWeekCode = sanitizeString(weekCode, 60);
-    if (cleanWeekCode && !isValidWeekCode(cleanWeekCode)) {
+    if (cleanWeekCode && !weekCodeMatchesGroup(cleanWeekCode, group)) {
       return jsonResponse({ error: 'Invalid weekCode' }, corsHeaders, 400);
     }
     const key = cleanWeekCode ? `schedule:${group}:${cleanWeekCode}` : `schedule:${group}:current`;
@@ -1257,7 +1485,7 @@ async function handleUpload(request, env, corsHeaders) {
       if (!weekCode || !data) continue;
       const cleanWeekCode = sanitizeString(weekCode, 60);
       const cleanData = sanitizeScheduleData(data);
-      if (!cleanWeekCode || !isValidWeekCode(cleanWeekCode) || !cleanData) continue;
+      if (!cleanWeekCode || !weekCodeMatchesGroup(cleanWeekCode, group) || !cleanData) continue;
       validWeekCodes.push(cleanWeekCode);
 
       const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
@@ -1395,7 +1623,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
     if (!weekCode || !data) continue;
     const cleanWeekCode = sanitizeString(weekCode, 60);
     const cleanData = sanitizeScheduleData(data);
-    if (!cleanWeekCode || !isValidWeekCode(cleanWeekCode) || !cleanData) continue;
+    if (!cleanWeekCode || !weekCodeMatchesGroup(cleanWeekCode, group) || !cleanData) continue;
 
     const existing = await store.get(`schedule:${group}:${cleanWeekCode}`, { type: 'json' });
     const existingStr = existing ? JSON.stringify(stripComparable(existing)) : '';
@@ -1473,9 +1701,10 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   // и прислана новая дата; иначе сохраняем ПРЕЖНЕЕ значение — не стираем,
   // чтобы индикатор «Расписание обновлено …» не терял данные.
   const changed = updated.length > 0;
+  const cleanCampus = sanitizeCampusUpdatedAt(campusUpdatedAt);
   const prevCampusMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
   await store.put(`campus-updated:${group}`, JSON.stringify({
-    campusUpdatedAt: (changed && campusUpdatedAt) ? campusUpdatedAt : (prevCampusMeta?.campusUpdatedAt || null),
+    campusUpdatedAt: (changed && cleanCampus) ? cleanCampus : (prevCampusMeta?.campusUpdatedAt || null),
     lastSync: new Date().toISOString(),
     lastWeek: 'batch',
   }), { expirationTtl: 21600000 });
@@ -1556,6 +1785,18 @@ async function handleAddHw(request, env, corsHeaders) {
 
   const clean = sanitizeHwFields(body);
 
+  // dueDate для dueMode='date' обязан быть валидной календарной датой
+  // "YYYY-MM-DD" — мусор/произвольные строки отбиваем 400 до записи в БД.
+  // Для 'nextPair' dueDate пересчитывается сервером ниже, клиентское значение
+  // игнорируется.
+  if (dueMode === 'date') {
+    const d = sanitizeDueDate(body.dueDate);
+    if (d === null) {
+      return jsonResponse({ error: 'Invalid dueDate (expected YYYY-MM-DD)' }, corsHeaders, 400);
+    }
+    clean.dueDate = d;
+  }
+
   const item = {
     id: crypto.randomUUID().replace(/-/g, ''),
     subject: clean.subject || '',
@@ -1576,9 +1817,11 @@ async function handleAddHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await store.get(key, { type: 'json' }) || [];
-  existing.push(item);
-  await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
+  await withKeyLock(key, async () => {
+    const existing = await store.get(key, { type: 'json' }) || [];
+    existing.push(item);
+    await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
+  });
 
   notifyGroupFilteredBg(env, group, buildHwText('add', group, item, null));
   await purgeGroupCdnCache(env, group);
@@ -1622,37 +1865,62 @@ async function handleUpdateHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await store.get(key, { type: 'json' }) || [];
-  const idx = existing.findIndex(h => h.id === id);
-  if (idx === -1) {
+  const lockResult = await withKeyLock(key, async () => {
+    const existing = await store.get(key, { type: 'json' }) || [];
+    const idx = existing.findIndex(h => h.id === id);
+    if (idx === -1) {
+      return { notFound: true };
+    }
+
+    const prev = existing[idx];
+    const clean = sanitizeHwFields(body);
+
+    // Валидация dueDate: если итоговый режим ДЗ — 'date' и клиент передал
+    // dueDate, тот обязан быть валидной датой "YYYY-MM-DD". Мусор отбиваем 400
+    // до записи в БД. Частичные обновления без dueDate проходят (прежняя дата
+    // сохраняется ниже), а для 'nextPair' dueDate пересчитывается сервером.
+    const effectiveDueMode = body.dueMode != null ? body.dueMode : prev.dueMode;
+    if (effectiveDueMode === 'date' && body.dueDate != null) {
+      const d = sanitizeDueDate(body.dueDate);
+      if (d === null) {
+        return { invalidDueDate: true };
+      }
+      clean.dueDate = d;
+    }
+
+    const item = {
+      ...prev,
+      subject: clean.subject != null ? clean.subject : prev.subject,
+      pairType: clean.pairType != null ? clean.pairType : prev.pairType,
+      subgroup: clean.subgroup != null ? clean.subgroup : prev.subgroup,
+      task: clean.task != null ? clean.task : prev.task,
+      dueMode: body.dueMode != null ? body.dueMode : prev.dueMode,
+      author: clean.author != null ? clean.author : prev.author,
+    };
+
+    if (item.dueMode === 'nextPair') {
+      item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(prev.createdAt), item.subgroup);
+    } else {
+      item.dueDate = clean.dueDate != null ? clean.dueDate : prev.dueDate;
+    }
+
+    existing[idx] = item;
+    await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
+
+    return { prev, item };
+  });
+  if (lockResult.invalidDueDate) {
+    return jsonResponse({ error: 'Invalid dueDate (expected YYYY-MM-DD)' }, corsHeaders, 400);
+  }
+  const { prev, item } = lockResult;
+  if (!item) {
     return jsonResponse({ error: 'Homework not found' }, corsHeaders, 404);
   }
-
-  const prev = existing[idx];
-  const clean = sanitizeHwFields(body);
-  const item = {
-    ...prev,
-    subject: clean.subject != null ? clean.subject : prev.subject,
-    pairType: clean.pairType != null ? clean.pairType : prev.pairType,
-    subgroup: clean.subgroup != null ? clean.subgroup : prev.subgroup,
-    task: clean.task != null ? clean.task : prev.task,
-    dueMode: body.dueMode != null ? body.dueMode : prev.dueMode,
-    author: clean.author != null ? clean.author : prev.author,
-  };
-
-  if (item.dueMode === 'nextPair') {
-    item.dueDate = await computeNextPairDate(env, group, item.subject, item.pairType, new Date(prev.createdAt), item.subgroup);
-  } else {
-    item.dueDate = clean.dueDate != null ? clean.dueDate : prev.dueDate;
-  }
-
-  existing[idx] = item;
-  await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
 
   notifyGroupFilteredBg(env, group, buildHwText('update', group, item, prev));
   await purgeGroupCdnCache(env, group);
 
-  return jsonResponse({ ok: true, item: existing[idx] }, corsHeaders);
+  return jsonResponse({ ok: true, item }, corsHeaders);
 }
 
 // ── PUT /api/hw/batch ─────────────────────────────────────────
@@ -1684,42 +1952,64 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Too many updates (max 500)' }, corsHeaders, 400);
   }
 
-  const key = `hw:${group}`;
-  const existing = await store.get(key, { type: 'json' }) || [];
-
-  // Индекс для быстрого поиска
-  const indexById = new Map();
-  for (let i = 0; i < existing.length; i++) {
-    indexById.set(existing[i].id, i);
-  }
-
-  const updated = [];
-  const notFound = [];
-  let changed = false;
-
+  // Валидация dueDate в батче до записи в БД: null — очистка даты (кампус
+  // закончился, фронт шлёт null), строка должна быть валидной датой
+  // "YYYY-MM-DD". Мусор/произвольные строки отбиваем 400 целиком.
   for (const upd of updates) {
-    if (!upd || !upd.id) continue;
-    const idx = indexById.get(upd.id);
-    if (idx === undefined) {
-      notFound.push(upd.id);
-      continue;
-    }
-    const prev = existing[idx];
-    // Только dueDate пока поддерживаем — пересчёт nextPair использует только
-    // дату. Если понадобится менять другие поля — расширить здесь.
-    const newDate = upd.dueDate === undefined ? prev.dueDate : sanitizeString(upd.dueDate, 40);
-    if (newDate !== prev.dueDate) {
-      existing[idx] = { ...prev, dueDate: newDate };
-      updated.push(existing[idx]);
-      changed = true;
-    } else {
-      // Не изменилось — не пишем в updated, но и в notFound тоже не относим.
+    if (upd && upd.dueDate !== undefined && upd.dueDate !== null && sanitizeDueDate(upd.dueDate) === null) {
+      return jsonResponse({ error: 'Invalid dueDate (expected YYYY-MM-DD or null)' }, corsHeaders, 400);
     }
   }
 
-  if (changed) {
-    await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
-  }
+  const key = `hw:${group}`;
+  const { updated, notFound, changed, existing } = await withKeyLock(key, async () => {
+    const existing = await store.get(key, { type: 'json' }) || [];
+
+    // Индекс для быстрого поиска
+    const indexById = new Map();
+    for (let i = 0; i < existing.length; i++) {
+      indexById.set(existing[i].id, i);
+    }
+
+    const updated = [];
+    const notFound = [];
+    let changed = false;
+
+    for (const upd of updates) {
+      if (!upd || !upd.id) continue;
+      const idx = indexById.get(upd.id);
+      if (idx === undefined) {
+        notFound.push(upd.id);
+        continue;
+      }
+      const prev = existing[idx];
+      // Только dueDate пока поддерживаем — пересчёт nextPair использует только
+      // дату. Если понадобится менять другие поля — расширить здесь.
+      // undefined — дата не меняется, null — очистка ('' = «следующая пара»),
+      // строка — валидная дата "YYYY-MM-DD" (проверена выше до лока).
+      let newDate;
+      if (upd.dueDate === undefined) {
+        newDate = prev.dueDate;
+      } else if (upd.dueDate === null) {
+        newDate = '';
+      } else {
+        newDate = sanitizeDueDate(upd.dueDate);
+      }
+      if (newDate !== prev.dueDate) {
+        existing[idx] = { ...prev, dueDate: newDate };
+        updated.push(existing[idx]);
+        changed = true;
+      } else {
+        // Не изменилось — не пишем в updated, но и в notFound тоже не относим.
+      }
+    }
+
+    if (changed) {
+      await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
+    }
+
+    return { updated, notFound, changed, existing };
+  });
 
   if (changed) {
     await purgeGroupCdnCache(env, group);
@@ -1750,18 +2040,22 @@ async function handleDeleteHw(request, env, corsHeaders) {
   }
 
   const key = `hw:${group}`;
-  const existing = await store.get(key, { type: 'json' }) || [];
-  const removed = existing.find(h => h.id === id);
-  const filtered = existing.filter(h => h.id !== id);
+  const { removed, count } = await withKeyLock(key, async () => {
+    const existing = await store.get(key, { type: 'json' }) || [];
+    const removed = existing.find(h => h.id === id);
+    const filtered = existing.filter(h => h.id !== id);
 
-  await store.put(key, JSON.stringify(filtered), { expirationTtl: 21600000 });
+    await store.put(key, JSON.stringify(filtered), { expirationTtl: 21600000 });
+
+    return { removed, count: filtered.length };
+  });
 
   if (removed) {
     notifyGroupFilteredBg(env, group, buildHwText('delete', group, removed, null));
   }
   await purgeGroupCdnCache(env, group);
 
-  return jsonResponse({ ok: true, count: filtered.length }, corsHeaders);
+  return jsonResponse({ ok: true, count }, corsHeaders);
 }
 
 // ── GET /api/subjects?group=... ─────────────────────────────────
@@ -1813,11 +2107,12 @@ async function handlePutSubjects(request, env, corsHeaders) {
   }
 
   const sem = semester || currentSemesterKey();
-  await store.put(`subjects:${group}:${sem}`, JSON.stringify(subjects), {
+  const cleanSubjects = sanitizeSubjects(subjects);
+  await store.put(`subjects:${group}:${sem}`, JSON.stringify(cleanSubjects), {
     expirationTtl: 365 * 24 * 60 * 60,
   });
   await purgeGroupCdnCache(env, group);
-  return jsonResponse({ ok: true, semester: sem, count: subjects.length }, corsHeaders);
+  return jsonResponse({ ok: true, semester: sem, count: cleanSubjects.length }, corsHeaders);
 }
 
 // ── POST /api/hw/recalc ─────────────────────────────────────────
@@ -1983,7 +2278,7 @@ async function reaggregateSubjects(env, group, semester) {
 // чтобы не делать N последовательных put в цикле синхронизации.
 function addSubjectsFromWeekStmt(env, group, weekCode, weekData) {
   if (!weekCode || !weekData || !weekData.days) return null;
-  if (!isValidWeekCode(weekCode)) return null;
+  if (!weekCodeMatchesGroup(weekCode, group)) return null;
 
   const semester = semesterFromWeekDates(weekData.weekStart, weekData.weekEnd)
     || currentSemesterKey();
@@ -2042,54 +2337,56 @@ async function updateSubjectsForCurrentSemester(env, group) {
 async function recalcHomeworkForGroup(env, group) {
   const store = createStore(env);
   const key = `hw:${group}`;
-  const homework = await store.get(key, { type: 'json' }) || [];
-  if (homework.length === 0) return { updated: 0, items: [] };
+  return withKeyLock(key, async () => {
+    const homework = await store.get(key, { type: 'json' }) || [];
+    if (homework.length === 0) return { updated: 0, items: [] };
 
-  // Загружаем все расписания группы одним запросом (list + N*get → listValues).
-  const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
-  const weekData = [];
-  for (const { key, value: data } of entries) {
-    const weekValue = key.split(`schedule:${group}:`)[1];
-    if (!weekValue || weekValue === 'current') continue;
-    if (!isValidWeekCode(weekValue)) continue;
-    if (data && data.days && data.weekStart) {
-      const startDate = parseDateLocal(data.weekStart);
-      if (startDate) weekData.push({ startDate, data });
+    // Загружаем все расписания группы одним запросом (list + N*get → listValues).
+    const { entries } = await store.listValues({ prefix: `schedule:${group}:`, type: 'json' });
+    const weekData = [];
+    for (const { key, value: data } of entries) {
+      const weekValue = key.split(`schedule:${group}:`)[1];
+      if (!weekValue || weekValue === 'current') continue;
+      if (!isValidWeekCode(weekValue)) continue;
+      if (data && data.days && data.weekStart) {
+        const startDate = parseDateLocal(data.weekStart);
+        if (startDate) weekData.push({ startDate, data });
+      }
     }
-  }
-  weekData.sort((a, b) => a.startDate - b.startDate);
+    weekData.sort((a, b) => a.startDate - b.startDate);
 
-  let changed = false;
-  const updatedItems = [];
-  for (const hw of homework) {
-    if (hw.dueMode !== 'nextPair') {
-      updatedItems.push(hw);
-      continue;
+    let changed = false;
+    const updatedItems = [];
+    for (const hw of homework) {
+      if (hw.dueMode !== 'nextPair') {
+        updatedItems.push(hw);
+        continue;
+      }
+      // Ищем следующую пару относительно ДНЯ СОЗДАНИЯ ДЗ, а не относительно
+      // сегодня. Так dueDate остаётся привязанным к той паре, для которой
+      // было задано ДЗ, и не «переезжает» вперёд при каждой синхронизации.
+      const fromDate = new Date(hw.createdAt);
+      let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate, hw.subgroup || 'any');
+      if (!newDate) {
+        // Пара после дня создания не найдена в сохранённом расписании —
+        // оставляем прежнюю дату, чтобы ДЗ не теряло привязку к своему дню.
+        updatedItems.push(hw);
+        continue;
+      }
+      if (newDate === hw.dueDate) {
+        updatedItems.push(hw);
+        continue;
+      }
+      changed = true;
+      const upd = { ...hw, dueDate: newDate };
+      updatedItems.push(upd);
     }
-    // Ищем следующую пару относительно ДНЯ СОЗДАНИЯ ДЗ, а не относительно
-    // сегодня. Так dueDate остаётся привязанным к той паре, для которой
-    // было задано ДЗ, и не «переезжает» вперёд при каждой синхронизации.
-    const fromDate = new Date(hw.createdAt);
-    let newDate = findNextPairDate(weekData, hw.subject, hw.pairType, fromDate, hw.subgroup || 'any');
-    if (!newDate) {
-      // Пара после дня создания не найдена в сохранённом расписании —
-      // оставляем прежнюю дату, чтобы ДЗ не теряло привязку к своему дню.
-      updatedItems.push(hw);
-      continue;
-    }
-    if (newDate === hw.dueDate) {
-      updatedItems.push(hw);
-      continue;
-    }
-    changed = true;
-    const upd = { ...hw, dueDate: newDate };
-    updatedItems.push(upd);
-  }
 
-  if (changed) {
-    await store.put(key, JSON.stringify(updatedItems), { expirationTtl: 21600000 });
-  }
-  return { updated: changed ? updatedItems.length : 0, items: updatedItems, changed };
+    if (changed) {
+      await store.put(key, JSON.stringify(updatedItems), { expirationTtl: 21600000 });
+    }
+    return { updated: changed ? updatedItems.length : 0, items: updatedItems, changed };
+  });
 }
 
 // ── Найти следующую дату пары для предмета с учётом типа ──────────
@@ -2396,6 +2693,12 @@ const TG_API_BASE = 'https://api.telegram.org';
 // (cleanupExpired), что ограничивает неконтролируемый рост D1.
 const TG_SUBS_TTL_SECONDS = 15552000; // 180 * 24 * 60 * 60
 
+// Допустимые значения подгруппы в tg:subs:{group}: 'any' | '1' | '2'.
+// Используется при обработке callback'ов выбора подгруппы (handleTgWebhook):
+// всё остальное (sub_5:… и т.п.) НЕ создаёт подписку — «мёртвой» подписки,
+// которая никогда не совпадёт при рассылке, быть не должно.
+const TG_ALLOWED_SUBGROUPS = new Set(['1', '2', 'any']);
+
 function maskChatId(id) {
   const s = String(id);
   return s.length <= 4 ? '***' : '***' + s.slice(-4);
@@ -2456,22 +2759,26 @@ async function getGroupSubscribers(env, group) {
 
 async function addGroupSubscriber(env, group, chatId, subgroup) {
   const store = createStore(env);
-  const list = await getGroupSubscribers(env, group);
-  const existing = list.find(s => String(s.chatId) === String(chatId));
-  if (existing) {
-    if (subgroup) existing.subgroup = subgroup;
-  } else {
-    list.push({ chatId: String(chatId), subgroup: subgroup || 'any' });
-  }
-  await store.put(`tg:subs:${group}`, JSON.stringify(list), { expirationTtl: TG_SUBS_TTL_SECONDS });
+  await withKeyLock(`tg:subs:${group}`, async () => {
+    const list = await getGroupSubscribers(env, group);
+    const existing = list.find(s => String(s.chatId) === String(chatId));
+    if (existing) {
+      if (subgroup) existing.subgroup = subgroup;
+    } else {
+      list.push({ chatId: String(chatId), subgroup: subgroup || 'any' });
+    }
+    await store.put(`tg:subs:${group}`, JSON.stringify(list), { expirationTtl: TG_SUBS_TTL_SECONDS });
+  });
 }
 
 async function removeGroupSubscriber(env, group, chatId) {
   const store = createStore(env);
-  const list = await getGroupSubscribers(env, group);
-  const filtered = list.filter(s => String(s.chatId) !== String(chatId));
-  if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered), { expirationTtl: TG_SUBS_TTL_SECONDS });
-  else await store.delete(`tg:subs:${group}`);
+  await withKeyLock(`tg:subs:${group}`, async () => {
+    const list = await getGroupSubscribers(env, group);
+    const filtered = list.filter(s => String(s.chatId) !== String(chatId));
+    if (filtered.length) await store.put(`tg:subs:${group}`, JSON.stringify(filtered), { expirationTtl: TG_SUBS_TTL_SECONDS });
+    else await store.delete(`tg:subs:${group}`);
+  });
 }
 
 // Фоновая отправка уведомления: не блокирует ответ клиенту (через
@@ -2507,7 +2814,7 @@ async function notifyGroup(env, group, text, opts = {}) {
   const chunks = splitForTg(text, 4000);
   for (const sub of subs) {
     for (const c of chunks) {
-      await sendTgRichMessage(env, sub.chatId, c, { parseMode: opts.parseMode || 'HTML' });
+      await sendTgRichMessagePaced(env, sub.chatId, c, { parseMode: opts.parseMode || 'HTML' });
       console.log('[tg] notifyGroup: send to', maskChatId(sub.chatId), 'ok');
     }
   }
@@ -2534,22 +2841,186 @@ async function sendTgRichMessage(env, chatId, htmlText, opts = {}) {
   return res;
 }
 
+// ── Защита рассылки от лимитов Telegram (~30 msg/сек на бота) ──
+// Большие рассылки (много подписчиков × много чанков) уходят в фоне через
+// ctx.waitUntil, поэтому лёгкая пауза между сообщениями не влияет на время
+// ответа клиенту, но не даёт упереться в лимит и получить 429 по флуд-контролю.
+
+// Межсообщенческая пауза: 70 мс → ~14 msg/сек, комфортный запас под ~30 msg/сек.
+const TG_MESSAGE_INTERVAL_MS = 70;
+// Кап ожидания по 429 retry_after (Telegram может прислать и большие значения;
+// ждать дольше не имеет смысла — после капа просто выходим с ошибкой).
+const TG_RETRY_MAX_WAIT_MS = 5000;
+// Максимум попыток отправки одного сообщения (учёт ретраев по 429).
+const TG_MAX_SEND_ATTEMPTS = 3;
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Отправка одного сообщения с защитой от лимитов Telegram:
+//   1) пауза TG_MESSAGE_INTERVAL_MS перед каждой отправкой — разносит
+//      запросы к Bot API во времени (подписчики и чанки не летят «пачкой»);
+//   2) при 429 с parameters.retry_after — ждём retry_after (с капом
+//      TG_RETRY_MAX_WAIT_MS) и повторяем, до TG_MAX_SEND_ATTEMPTS раз;
+//   3) прочие ошибки (битый текст и т.п.) НЕ ретраим — иначе можно вечно
+//      долбить Telegram; выходим с результатом.
+async function sendTgRichMessagePaced(env, chatId, htmlText, opts = {}) {
+  await sleepMs(TG_MESSAGE_INTERVAL_MS);
+  let res;
+  for (let attempt = 1; attempt <= TG_MAX_SEND_ATTEMPTS; attempt++) {
+    res = await sendTgRichMessage(env, chatId, htmlText, opts);
+    if (res && res.ok) return res;
+    const retryAfter =
+      res && res.error && res.error.parameters && res.error.parameters.retry_after;
+    if (typeof retryAfter === 'number' && retryAfter > 0 && attempt < TG_MAX_SEND_ATTEMPTS) {
+      const waitMs = Math.min(retryAfter * 1000, TG_RETRY_MAX_WAIT_MS);
+      console.log(`[tg] 429 retry_after=${retryAfter}s, waiting ${waitMs}ms (attempt ${attempt + 1}/${TG_MAX_SEND_ATTEMPTS})`);
+      await sleepMs(waitMs);
+      continue;
+    }
+    break;
+  }
+  return res;
+}
+
+// Самозакрывающиеся (void) HTML-теги — не «открывают» вложенность и не
+// требуют закрывающего тега. В наших сообщениях их нет (используются только
+// <b>/<i>/<code> и переносы строк '\n'), набор добавлен defense-in-depth:
+// чтобы открытый тег такого рода не «завис» в стеке открытых тегов при
+// разрезании длинного сообщения и не породил лишний </br> в конце куска.
+const TG_VOID_TAGS = new Set(['br', 'hr', 'img', 'input', 'meta', 'link', 'wbr', 'source', 'area', 'base', 'col', 'embed', 'param', 'track']);
+
+// Разбивает HTML-текст на атомарные токены: HTML-теги (<b>, </code>,
+// <a href="…">), HTML-сущности (&amp;, &lt;, &#39;, …) и обычный текст между
+// ними. Нужно для безопасного разрезания длинных HTML-сообщений по границам
+// тегов/сущностей — кусок никогда не должен разорвать тег или сущность,
+// иначе Telegram отдаёт 400 на sendMessage с parse_mode=HTML.
+// Битый тег без '>' и длинный '&…' без ';' (не похожий на сущность)
+// остаются в текстовом токене как есть — их режем как обычный текст.
+function tokenizeTgHtml(text) {
+  const tokens = [];
+  let i = 0;
+  let buf = '';
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '<') {
+      const gt = text.indexOf('>', i + 1);
+      if (gt === -1) { buf += text.slice(i); break; }
+      if (buf) { tokens.push({ type: 'text', raw: buf }); buf = ''; }
+      const raw = text.slice(i, gt + 1);
+      const m = raw.match(/^<\s*\/?\s*([A-Za-z][A-Za-z0-9]*)/);
+      const name = m ? m[1].toLowerCase() : '';
+      tokens.push({
+        type: 'tag',
+        raw,
+        name,
+        closing: /^<\s*\//.test(raw),
+        selfClosing: /\/>$/.test(raw) || TG_VOID_TAGS.has(name),
+      });
+      i = gt + 1;
+    } else if (ch === '&') {
+      const semi = text.indexOf(';', i + 1);
+      // Короткие «&…;» (длиной до 12 симв.) — это сущность (&amp;, &lt;,
+      // &gt;, &#39; …); атомарна, резать нельзя. Всё прочее — текст.
+      if (semi !== -1 && semi - i <= 12) {
+        if (buf) { tokens.push({ type: 'text', raw: buf }); buf = ''; }
+        tokens.push({ type: 'entity', raw: text.slice(i, semi + 1) });
+        i = semi + 1;
+      } else { buf += ch; i++; }
+    } else {
+      buf += ch;
+      i++;
+    }
+  }
+  if (buf) tokens.push({ type: 'text', raw: buf });
+  return tokens;
+}
+
+// Выбирает точку разреза в текстовом фрагменте: не дальше max символов и не
+// разрывая суррогатную пару (эмодзи). При возможности режем по границе
+// абзаца (\n\n), строки (\n) или слова (пробел) — так куски читаются лучше.
+function safeTgCut(s, max) {
+  if (max <= 0) return 0;
+  if (s.length <= max) return s.length;
+  const doubleNl = s.lastIndexOf('\n\n', max - 1);
+  if (doubleNl > 0 && doubleNl + 2 <= max) return doubleNl + 2;
+  const nl = s.lastIndexOf('\n', max - 1);
+  if (nl > 0 && nl + 1 <= max) return nl + 1;
+  const sp = s.lastIndexOf(' ', max - 1);
+  if (sp > 0 && sp + 1 <= max) return sp + 1;
+  let cut = max;
+  const code = s.charCodeAt(cut - 1);
+  if (code >= 0xd800 && code <= 0xdbff && cut < s.length) cut -= 1; // не резать эмодзи
+  return cut;
+}
+
+// Разбивает длинное HTML-сообщение для Telegram на куски ≤ maxLen (лимит
+// sendMessage 4096, режем с запасом в 4000). Гарантии:
+//   * куски НЕ разрывают HTML-тег (<b>, </code>, <a href="…">) и сущность
+//     (&amp;, &lt;, …) — иначе Telegram отдаёт 400 на parse_mode=HTML;
+//   * теги, оставшиеся открытыми к концу куска, в его хвосте закрываются
+//     (</b></i>), а следующий кусок начинается с их повторного открытия
+//     (<b><i>) — каждый кусок самодостаточно валиден;
+//   * не разрывается суррогатная пара (эмодзи).
+// Короткие сообщения (≤ maxLen) и пустые возвращаются как раньше — поведение
+// обычного пути (уведомления короче 4000 символов) не меняется.
 function splitForTg(text, maxLen) {
   if (!text) return [];
   if (text.length <= maxLen) return [text];
+
+  const tokens = tokenizeTgHtml(text);
   const out = [];
-  const paragraphs = text.split('\n\n');
-  let buf = '';
-  for (const p of paragraphs) {
-    if (p.length > maxLen) {
-      if (buf) { out.push(buf); buf = ''; }
-      for (let i = 0; i < p.length; i += maxLen) out.push(p.slice(i, i + maxLen));
+  const stack = []; // открытые теги в порядке вложенности
+  let cur = '';
+  let dirty = false; // был ли реальный контент (не только переоткрытые теги)
+
+  const closeTags = () => {
+    let s = '';
+    for (let i = stack.length - 1; i >= 0; i--) s += `</${stack[i]}>`;
+    return s;
+  };
+  const openTags = () => {
+    let s = '';
+    for (const name of stack) s += `<${name}>`;
+    return s;
+  };
+  const flush = () => {
+    // Не публикуем «пустой» кусок-скобку (<b></b> без контента).
+    if (!cur || !dirty) return;
+    out.push(cur + closeTags());
+    cur = openTags(); // следующий кусок продолжает открытые теги
+    dirty = false;
+  };
+
+  for (const tok of tokens) {
+    if (tok.type === 'text') {
+      let rest = tok.raw;
+      while (rest.length) {
+        let room = maxLen - cur.length;
+        if (room <= 0) { flush(); room = maxLen - cur.length; }
+        if (rest.length <= room) { cur += rest; dirty = true; rest = ''; break; }
+        const cut = safeTgCut(rest, room);
+        cur += rest.slice(0, cut); dirty = true;
+        rest = rest.slice(cut);
+        flush();
+      }
       continue;
     }
-    if ((buf + '\n\n' + p).length > maxLen) { out.push(buf); buf = p; }
-    else { buf = buf ? buf + '\n\n' + p : p; }
+    // Тег или сущность — атомарный токен, добавляем целиком.
+    if (cur.length + tok.raw.length > maxLen && cur) flush();
+    cur += tok.raw; dirty = true;
+    if (tok.type === 'tag') {
+      if (tok.selfClosing) continue;
+      if (tok.closing) {
+        const idx = stack.lastIndexOf(tok.name);
+        if (idx !== -1) stack.splice(idx, 1);
+      } else if (tok.name) {
+        stack.push(tok.name);
+      }
+    }
   }
-  if (buf) out.push(buf);
+  if (cur && dirty) flush();
   return out;
 }
 
@@ -2614,7 +3085,7 @@ async function notifyGroupFiltered(env, group, buildText) {
     if (!text) continue;
     const chunks = splitForTg(text, 4000);
     for (const c of chunks) {
-      await sendTgRichMessage(env, sub.chatId, c, { parseMode: 'HTML' });
+      await sendTgRichMessagePaced(env, sub.chatId, c, { parseMode: 'HTML' });
     }
   }
 }
@@ -2635,17 +3106,16 @@ function buildScheduleDiffText(group, diffs) {
     const filteredWeeks = [];
     for (const w of diffs) {
       const filteredLines = [];
-      for (const line of w.lines) {
-        const pairMatch = line.match(/^  [➕➖] (.+)$/);
-        if (pairMatch) {
-          const pairText = pairMatch[1];
-          const subMatch = pairText.match(/ · подгруппа (\d)/);
-          const pairSubgroup = subMatch ? subMatch[1] : '';
-          if (!matchesSubgroup(pref, pairSubgroup)) continue;
-        }
-        filteredLines.push(line);
+      for (const item of w.lines) {
+        // Строка-пара начинается с двух пробелов и несёт СТРУКТУРНУЮ подгруппу
+        // в item.subgroup ('1' | '2' | ''). Заголовок дня (не пара) всегда
+        // сохраняется. Фильтруем по полю, а не по regex на тексте — название
+        // предмета не может дать ложного срабатывания (например, если сам
+        // предмет содержит «· подгруппа 1»).
+        if (item.text.startsWith('  ') && !matchesSubgroup(pref, item.subgroup)) continue;
+        filteredLines.push(item);
       }
-      const hasPairs = filteredLines.some(l => l.startsWith('  '));
+      const hasPairs = filteredLines.some(l => l.text.startsWith('  '));
       if (hasPairs) filteredWeeks.push({ weekLabel: w.weekLabel, lines: filteredLines });
     }
     if (!filteredWeeks.length) return null;
@@ -2704,19 +3174,28 @@ async function handleTgWebhook(request, env) {
     const chatId = String(cq.message && cq.message.chat && cq.message.chat.id);
     const data = cq.data || '';
     // data = "sub_any:GROUP" | "sub_1:GROUP" | "sub_2:GROUP"
-    const cbMatch = data.match(/^sub_(any|\d):(.+)$/);
+    // [12] вместо \d: callback с несуществующей подгруппой (sub_5:… и т.п.)
+    // не распознаётся как выбор подгруппы и уходит в ветку «неизвестный
+    // callback» — «мёртвая» подписка (никогда не совпадёт при рассылке)
+    // не создаётся.
+    const cbMatch = data.match(/^sub_(any|[12]):(.+)$/);
     if (cbMatch && chatId) {
       const subgroup = cbMatch[1] === 'any' ? 'any' : cbMatch[1];
-      const group = normalizeGroup(cbMatch[2]);
+      // Defense-in-depth: regex уже отсекает всё кроме any/1/2, но write-путь
+      // дополнительно страхуем проверкой по константе — на случай будущих
+      // ослаблений regex'а (группа не нормализуется, подписка не создаётся).
+      const group = TG_ALLOWED_SUBGROUPS.has(subgroup) ? normalizeGroup(cbMatch[2]) : null;
       if (group && isValidGroup(group)) {
         // Сохраняем подписку + subgroup в tg:subs:{group}
         await addGroupSubscriber(env, group, chatId, subgroup);
         // Обновляем обратный индекс tg:groups:{chatId}
-        const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
-        if (!groupsRaw.includes(group)) {
-          groupsRaw.push(group);
-          await store.put(`tg:groups:${chatId}`, JSON.stringify(groupsRaw), { expirationTtl: TG_SUBS_TTL_SECONDS });
-        }
+        await withKeyLock(`tg:groups:${chatId}`, async () => {
+          const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+          if (!groupsRaw.includes(group)) {
+            groupsRaw.push(group);
+            await store.put(`tg:groups:${chatId}`, JSON.stringify(groupsRaw), { expirationTtl: TG_SUBS_TTL_SECONDS });
+          }
+        });
 
         const subLabel = subgroup === 'any' ? 'обе подгруппы' : `подгруппа ${subgroup}`;
         await tgApi(env, 'sendMessage', {
@@ -2857,13 +3336,15 @@ async function handleTgWebhook(request, env) {
 
 async function unbindChat(env, chatId) {
   const store = createStore(env);
-  const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
-  for (const g of groupsRaw) {
-    const cur = await store.get(`tg:chat:${g}`);
-    if (String(cur) === String(chatId)) await store.delete(`tg:chat:${g}`);
-    await removeGroupSubscriber(env, g, chatId);
-  }
-  await store.delete(`tg:groups:${chatId}`);
+  await withKeyLock(`tg:groups:${chatId}`, async () => {
+    const groupsRaw = await store.get(`tg:groups:${chatId}`, { type: 'json' }) || [];
+    for (const g of groupsRaw) {
+      const cur = await store.get(`tg:chat:${g}`);
+      if (String(cur) === String(chatId)) await store.delete(`tg:chat:${g}`);
+      await removeGroupSubscriber(env, g, chatId);
+    }
+    await store.delete(`tg:groups:${chatId}`);
+  });
 }
 
 // ── POST /api/tg/status { group, chatId } ───────────────────────
@@ -2945,6 +3426,14 @@ function pairTypeLabel(t) {
   return TG_PAIR_TYPES[t] || (t ? t : '');
 }
 
+// Структурный номер подгруппы пары: 'подгруппа 1' → '1', 'подгруппа 2' → '2',
+// иначе '' (без подгруппы). Используется в diff для фильтрации по подгруппе
+// подписчика — по полю пары, а не по regex на тексте (название предмета само
+// может содержать «· подгруппа 1», что давало ложные срабатывания).
+function pairSubgroupNum(p) {
+  return p && p.subgroup ? String(p.subgroup).replace(/\D/g, '') : '';
+}
+
 // Краткая human строка одной пары для diff.
 function pairBrief(p) {
   const subject = escTg(p.subject || '(без названия)');
@@ -2961,8 +3450,10 @@ function pairKey(p) {
   return [p.time || '', p.subject || '', p.type || '', p.subgroup || '', p.room || '', p.teacher || ''].join('␟');
 }
 
-// Сравнивает старую и новую неделю, возвращает массив строк-изменений по дням.
-// Возвращает null, если изменений нет, либо структуру { weekLabel, lines: [...] }.
+// Сравнивает старую и новую неделю, возвращает изменения по дням.
+// Возвращает null, если изменений нет, либо структуру
+// { weekLabel, lines: [{ text, subgroup }, ...] }, где subgroup — структурный
+// номер подгруппы пары ('1' | '2' | '') для фильтрации при рассылке.
 function diffScheduleWeek(oldWeek, newWeek) {
   const oldDays = (oldWeek && oldWeek.days) || {};
   const newDays = (newWeek && newWeek.days) || {};
@@ -2998,14 +3489,13 @@ function diffScheduleWeek(oldWeek, newWeek) {
 
     if (removed.length === 0 && added.length === 0) continue;
 
-    const dayLines = [];
-    dayLines.push(`<b>${dayHeader}</b>:`);
-    for (const p of removed) dayLines.push(`  ➖ ${pairBrief(p)}`);
-    for (const p of added) dayLines.push(`  ➕ ${pairBrief(p)}`);
-
-    // Если day целиком «новая» — весь блок пойдёт в added.
-    // Если day целиком «пропала» — весь блок в removed. Это уже покрыто выше.
-    lines.push(dayLines.join('\n'));
+    // Каждая строка diff несёт СТРУКТУРНУЮ подгруппу пары (item.subgroup:
+    // '1' | '2' | '') — фильтрация в buildScheduleDiffText идёт по полю,
+    // а не по regex на тексте (предмет может сам содержать «· подгруппа 1»
+    // в названии). Заголовок дня — не пара, у него subgroup ''.
+    lines.push({ text: `<b>${dayHeader}</b>:`, subgroup: '' });
+    for (const p of removed) lines.push({ text: `  ➖ ${pairBrief(p)}`, subgroup: pairSubgroupNum(p) });
+    for (const p of added) lines.push({ text: `  ➕ ${pairBrief(p)}`, subgroup: pairSubgroupNum(p) });
   }
 
   if (lines.length === 0) return null;
@@ -3014,7 +3504,7 @@ function diffScheduleWeek(oldWeek, newWeek) {
 
 // Формирует итоговое сообщение об изменениях расписания.
 function formatScheduleDiffBroadcast(group, changedWeeks) {
-  // changedWeeks: [{ weekLabel, lines: [...] }, ...]
+  // changedWeeks: [{ weekLabel, lines: [{ text, subgroup }, ...] }, ...]
   const parts = [];
   parts.push(`🔔 <b>Расписание группы ${escTg(group)} изменилось</b>`);
   parts.push('');
@@ -3025,7 +3515,7 @@ function formatScheduleDiffBroadcast(group, changedWeeks) {
     }
     parts.push(`📅 <b>Неделя ${w.weekLabel}</b>`);
     for (const l of w.lines) {
-      parts.push(l);
+      parts.push(l.text);
     }
     parts.push('');
   }
@@ -3101,6 +3591,42 @@ function formatHwMessage(action, group, hw, prevHw) {
 //   verify  — 10/мин по IP, на публичные POST /api/invite/verify,
 //             /api/invite/create (D1-read oracle / owner-код).
 //   tg      — 60/мин по IP, на POST /api/tg/webhook.
+//
+// Политика недоступности D1 (см. checkRateLimit / memRateLimitCheck):
+//   verify (owner login/logout, invite verify/create) — fail-closed:
+//     лимит проверить нельзя → 429 (degraded).
+//   global/tg/tgstatus — fail-open, но ОГРАНИЧЕННЫЙ: обычный трафик
+//     продолжает обслуживаться (не ломаем доступность сайта при аварии
+//     D1 — за cf-connecting-ip сидят сотни честных людей за CGNAT/NAT),
+//     однако включается in-memory fallback-счётчик, чтобы сбой D1 не
+//     превращался в «безлимит» для чувствительных точек.
+//
+// ── Fixed-window: burst на границе окна (аудит, задача 11) ──
+// Fixed-window counter допускает до 2× лимита за короткий промежуток у
+// границы окна (600 в конце окна N + 600 в начале N+1 ≈ 1200 за ~2 сек).
+// Это ПРИЗНАННЫЙ компромисс, алгоритм намеренно не меняется:
+//   • Лимиты намеренно щадящие (global 600/мин, verify 10, tg 60,
+//     tgstatus 30) и уже поднимались с 120, чтобы не давать ложных 429 за
+//     CGNAT/NAT — за одним cf-connecting-ip сидят сотни честных людей.
+//   • Burst 1200/2с с одного IP (или NAT-узла) поглощается самим
+//     Cloudflare-краем и не является DoS-уровнем: лимит здесь — антиспам,
+//     а не анти-DoS (см. RATE_LIMIT_GLOBAL).
+//   • Любое ужесточение на границе вреднее, чем сам burst:
+//       - sliding-window через D1 (вариант «а») — многократно больше
+//         ключей/запросов к БД, а global-лимит применяется к КАЖДОМУ
+//         запросу (горячий путь) — удвоение нагрузки на D1;
+//       - сумма с соседним окном windowStart-1 (вариант «в») — из-за TTL
+//         ключа (windowSec+60) счётчик прошлого окна живёт ещё минуту,
+//         т.е. эффективный лимит нового окна режется почти вдвое → рост
+//         ложных 429 у тяжёлых NAT-узлов (запрещено политикой доступности).
+//   • Чувствительные оракулы (verify/tgstatus) защищают от перебора, а 2×
+//     на границе (20–60 попыток) для 32-hex токенов и цифровых chatId всё
+//     равно не даёт атакующему практического выигрыша.
+// Решение: fixed-window оставляем как есть, ОБА пути счётчика (D1
+// checkRateLimit и memory memRateLimitCheck) остаются согласованными.
+// Если в будущем понадобится бороться с граничным burst — рассматривать
+// вариант «в» (проверка/суммирование соседнего окна) с обязательным
+// учётом рисков ложных 429, описанных выше.
 
 // Именованные константы лимитов (окно 60 сек). Точечные лимиты (verify/tg/
 // tgstatus) — антиспам-защита чувствительных публичных POST, их значения
@@ -3133,13 +3659,53 @@ function warnRlFailOpen(kind, id) {
   const now = Date.now();
   if (now - lastRlWarnTime < 30000) return;
   lastRlWarnTime = now;
-  console.warn(`[ratelimit] no db (${kind}:${id}) — fail-open для категории, verify — fail-closed`);
+  console.warn(`[ratelimit] no db (${kind}:${id}) — fail-open (bounded in-memory), verify — fail-closed`);
+}
+
+// ── In-memory fallback для fail-open категорий (global/tg/tgstatus) ──
+// Когда D1 недоступен (нет биндинга или SQL-сбой), лимиты НЕ отключаем
+// полностью («fail-open = безлимит»), а переходим на приблизительный
+// счётчик в памяти ТЕКУЩЕГО изолята Worker. Это сохраняет доступность
+// (лимит мягче, не нагружает D1, не даёт ложных 429 честным пользователям
+// за CGNAT/NAT), но не позволяет во время аварии D1 забивать чувствительные
+// точки без всякого ограничения.
+// Ограничения (осознанно): счётчик per-isolate — изолятов несколько на
+// локацию, и они пересоздаются, потому это лишь defense-in-depth ВЕРХНЕЙ
+// границы, а не точный лимит. Ключ — `kind:id:windowStart`; старые окна
+// чистятся оппортунистически, чтобы Map не рос бесконечно.
+const memRlCounts = new Map();
+const MEM_RL_MAX_KEYS = 2048;
+function memRateLimitCheck(id, kind, limit, windowSec) {
+  const now = Date.now();
+  const windowStart = Math.floor(now / (windowSec * 1000));
+  const key = `${kind}:${id}:${windowStart}`;
+  const count = (memRlCounts.get(key) || 0) + 1;
+  memRlCounts.set(key, count);
+
+  // Оппортунистическая очистка: убираем протухшие окна, когда Map достиг порога,
+  // чтобы память изолята не росла бесконечно при интенсивном трафике.
+  if (memRlCounts.size >= MEM_RL_MAX_KEYS) {
+    const cutoffWindow = Math.floor((now - 2 * windowSec * 1000) / (windowSec * 1000));
+    for (const [k, c] of memRlCounts) {
+      const ws = Number(k.slice(k.lastIndexOf(':') + 1));
+      if (Number.isFinite(ws) && ws < cutoffWindow) memRlCounts.delete(k);
+    }
+  }
+
+  if (count > limit) {
+    const windowEndMs = (windowStart + 1) * windowSec * 1000;
+    const retryAfter = Math.max(1, Math.ceil((windowEndMs - now) / 1000));
+    return { limited: true, retryAfter, kind, id, count, limit, windowStart, degraded: true };
+  }
+  return { limited: false };
 }
 
 // Атомарно инкрементирует счётчик и проверяет лимит.
 // Возвращает { limited: false } или { limited: true, retryAfter: <сек> }.
 // Политика при недоступности D1:
-//   failClosed=false (global/tg/tgstatus) — fail-open ({ limited: false }),
+//   failClosed=false (global/tg/tgstatus) — fail-open, но ОГРАНИЧЕННЫЙ:
+//     переходим на in-memory fallback-счётчик (memRateLimitCheck), чтобы
+//     авария D1 не превращалась в «безлимит» для чувствительных точек.
 //   failClosed=true (verify: owner login/invite) — fail-closed
 //     ({ limited: true, retryAfter: 60, degraded: true }): лимит проверить нельзя → отказ.
 async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
@@ -3147,7 +3713,7 @@ async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
   if (!store || !store._db || !id) {
     warnRlFailOpen(kind, id);
     if (failClosed) return { limited: true, retryAfter: 60, degraded: true, kind, id };
-    return { limited: false };
+    return memRateLimitCheck(id, kind, limit, windowSec);
   }
   const now = Date.now();
   const windowStart = Math.floor(now / (windowSec * 1000));
@@ -3182,10 +3748,11 @@ async function checkRateLimit(store, id, kind, limit, windowSec, opts = {}) {
     }
     return { limited: false };
   } catch (err) {
-    // D1-сбой на уровне SQL: та же политика, что при недоступности базы.
+    // D1-сбой на уровне SQL: та же политика, что при недоступности базы —
+    // fail-open, но ограниченный in-memory fallback-счётчиком (см. выше).
     console.warn(`[ratelimit] db error (${kind}:${id}): ${err.message}`);
     if (failClosed) return { limited: true, retryAfter: 60, degraded: true, kind, id };
-    return { limited: false };
+    return memRateLimitCheck(id, kind, limit, windowSec);
   }
 }
 
