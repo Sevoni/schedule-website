@@ -8,6 +8,7 @@
 - Дата создания: 2026-08-14
 - Аудит: совет двух экспертов (план A + план B + взаимная рецензия)
 - Режим: read-only (код, git-история, прод-проверки curl)
+- Итерация 2 (2026-08-15): фиксы A9-A12 (`b8ae276`) — код + прод-проверка
 
 ---
 
@@ -56,6 +57,10 @@
 | A6 | Инфо | `wrangler ^3.0.0` — CVE-проверка не выполнена (внешние API недоступны); devDependency, в проде не исполняется | `package.json:12` | **инфо** | — | — |
 | A7 | Инфо | `ALLOWED_ORIGINS = translated.turbopages.org` (Яндекс.Перевод) | `wrangler.toml:33` | **принятый риск** | — | curl 2026-08-14 |
 | A8 | Medium | Регрессия после A3: валидация строгого 32-hex в `handleDeleteHw` блокировала удаление legacy ДЗ с base36-id (`Date.now().toString(36) + Math.random().toString(36).slice(2,6)`, ~12 символов, напр. `mryzo5pd1pv9`) — найдено на проде (удаление ДЗ не работало) | `index.js:2309-2316` | **исправлено** | `f92c6bf` (2026-08-14) | прод: DELETE legacy-id → 403 (проходит валидацию), мусорный → 400 |
+| A9 | Medium | Полный инвайт-токен возвращается в теле ответа `/api/invite/verify` и `/api/invite/create` (избыточная поверхность утечки при XSS/расширении браузера; фронтенду нужны только `group`/`link`) | `index.js:973`, `1231` | **исправлено** | `b8ae276` (2026-08-15) | node --check + прод: verify с 32-hex → `{ok:false,...}` без token; grep app.js — `data.token` от verify/create не читается |
+| A10 | Medium | Bearer-оракул существования инвайт-токенов вне verify-лимита: `resolveAuth` с `Authorization: Bearer <32-hex>` делает D1-read `inv:{token}` без точечного rate-limit (только общий 600/мин) | `index.js:714-723`, `4103-4142` | **исправлено** | `b8ae276` (2026-08-15) | node --check + прод: 11×GET с Bearer <32-hex> → 429 (общий счётчик verify); мусорные Bearer в счётчик не попадают |
+| A11 | Low | Ошибка конфигурации раскрывает имя секретной переменной: 503 `/api/tg/webhook` = «Webhook misconfigured: TG_WEBHOOK_SECRET is required» | `index.js:3456` | **исправлено** | `b8ae276` (2026-08-15) | node --check + grep: имя переменной только в server-логе `console.error`; тело 503 = «Webhook disabled: configuration error» |
+| A12 | Low | Модульный глобал `currentCtx` — риск «прицепить» фоновое уведомление запроса A к контексту запроса B при конкурентной обработке в одном изоляте | `index.js:393`, `503`, `2936-2940`, `3086-3095`, `3391-3399` | **исправлено** | `b8ae276` (2026-08-15) | node --check + grep: `currentCtx` = 0 совпадений; context параметром в `cachedGet`/`notifyGroupBg`/`notifyGroupFilteredBg` |
 
 ---
 
@@ -63,6 +68,7 @@
 
 | Коммит | Содержимое |
 |---|---|
+| `b8ae276` (2026-08-15) | итерация 2 (A9-A12): токен инвайта не возвращается в теле `/api/invite/verify` (только `{ok,group}`) и `/api/invite/create` (только `{ok,link,id}`), Bearer-путь `resolveAuth` включён в rate-limit категории verify (`INVITE_TOKEN_RE`/`isBearerInviteToken`, fail-closed при отсутствии IP), нейтральный текст 503 при отсутствии `TG_WEBHOOK_SECRET`, `context` передаётся параметром вместо глобала `currentCtx` |
 | `baf12c8` (2026-08-14) | no-store для `__Host-writer_tokens` (кеш-отравление), валидация chatId в TG-callback, withKeyLock для inv-by-group RMW (**только create**), валидация длины/формата Bearer (32-hex/64), no-store на 4xx/5xx (VULN-006) |
 | `f92c6bf` (2026-08-14) | пакет фиксов по реестру (задачи 1–7) + регрессия A8: валидация токена `invite/verify` (32-hex ≤64 → 400), `withKeyLock` для `invite` delete/rename, `cachedGet` не кеширует `private`/`no-store` + учёт writer-куки в `cachedGet`/`isAuthRequest`, `no-store` на 200-ответах verify, `sanitizeString` для `label`, лимит ≤128 для `owner/login` code, валидация `id` в `handleDeleteHw` (**оба формата**: новый 32-hex + legacy base36) |
 | `eb676ce` | per-key mutex для ДЗ, привязка weekCode к группе при записи, санитизация subjects/campusUpdatedAt/weeks/dueDate, токены инвайтов не в DOM, in-memory fallback rate-limit, COOP/CORP |
