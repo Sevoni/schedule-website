@@ -1123,6 +1123,7 @@ header {
 }
 
 .delete-btn {
+  width: 100%;
   padding: 10px;
   background: transparent;
   color: var(--danger);
@@ -1141,14 +1142,19 @@ header {
 
 .delete-confirm {
   margin-bottom: 8px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+}
+
+.delete-confirm.confirming {
   padding: 12px;
   border: 1px solid var(--danger);
-  border-radius: 8px;
   background: rgba(229, 72, 77, 0.08);
 }
 
 .delete-warning {
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   font-size: 0.88rem;
   color: var(--text);
   line-height: 1.4;

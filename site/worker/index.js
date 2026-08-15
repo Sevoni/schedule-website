@@ -1719,11 +1719,13 @@ async function handleUpload(request, env, corsHeaders) {
     await store.put(key, JSON.stringify(cleanData), { expirationTtl: 21600000 });
 
     const prevMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
-    await store.put(`campus-updated:${group}`, JSON.stringify({
+    // putMetaMerge — атомарный merge по максимуму: при параллельных записях
+    // мета не теряет более актуальные campusUpdatedAt/lastSync (см. store.js).
+    await store.putMetaMerge(`campus-updated:${group}`, {
       campusUpdatedAt: prevMeta?.campusUpdatedAt || null,
       lastSync: new Date().toISOString(),
       lastWeek: cleanWeekCode || 'current',
-    }), { expirationTtl: 21600000 });
+    }, { expirationTtl: 21600000 });
 
     try {
       await updateSubjectsForCurrentSemester(env, group);
@@ -1794,11 +1796,11 @@ async function handleUpload(request, env, corsHeaders) {
     }
 
     const prevMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
-    await store.put(`campus-updated:${group}`, JSON.stringify({
+    await store.putMetaMerge(`campus-updated:${group}`, {
       campusUpdatedAt: prevMeta?.campusUpdatedAt || null,
       lastSync: new Date().toISOString(),
       lastWeek: 'batch',
-    }), { expirationTtl: 21600000 });
+    }, { expirationTtl: 21600000 });
 
     await purgeGroupCdnCache(env, group, updated);
 
@@ -1847,11 +1849,12 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
   // Обновляем lastSync при каждом вызове 🔄, даже если изменений нет.
   // Мета группы изолирована по ключу `campus-updated:{group}` — параллельные
   // вызовы для разных групп не затирают друг друга (раньше был общий sync:meta).
-  await store.put(`campus-updated:${group}`, JSON.stringify({
+  // putMetaMerge — атомарный merge по максимуму (см. store.js).
+  await store.putMetaMerge(`campus-updated:${group}`, {
     campusUpdatedAt: stored?.campusUpdatedAt || null,
     lastSync: new Date().toISOString(),
     lastWeek: stored?.lastWeek || 'check',
-  }), { expirationTtl: 21600000 });
+  }, { expirationTtl: 21600000 });
 
   return jsonResponse({ needUpdate, stored: stored?.campusUpdatedAt || null }, corsHeaders);
 }
@@ -1973,11 +1976,14 @@ async function handleSyncFromCampus(request, env, corsHeaders, context) {
   const changed = updated.length > 0;
   const cleanCampus = sanitizeCampusUpdatedAt(campusUpdatedAt);
   const prevCampusMeta = parseCampusMeta(await store.get(`campus-updated:${group}`));
-  await store.put(`campus-updated:${group}`, JSON.stringify({
+  // putMetaMerge — атомарный merge по максимуму: даже если параллельный запрос
+  // записал более свежую дату кампуса, «старый» sync (устаревший HTML/кеш) не
+  // затрёт её — БД оставит максимум из времён (см. store.js).
+  await store.putMetaMerge(`campus-updated:${group}`, {
     campusUpdatedAt: (changed && cleanCampus) ? cleanCampus : (prevCampusMeta?.campusUpdatedAt || null),
     lastSync: new Date().toISOString(),
     lastWeek: 'batch',
-  }), { expirationTtl: 21600000 });
+  }, { expirationTtl: 21600000 });
 
   // Уведомляем подписчиков группы об изменениях в расписании (если есть diff).
   if (diffs.length > 0) {

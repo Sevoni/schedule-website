@@ -115,6 +115,64 @@ async function put(db, logger, key, value, opts = {}) {
   });
 }
 
+// putMetaMerge(key, metaObj, { expirationTtl }) — атомарный upsert мета-записи
+// `campus-updated:{group}` с merge по максимуму.
+// Устраняет гонку при параллельных сохранениях расписания (несколько вкладок /
+// повторный клик «синхронизировать»): обычный put() перезаписывал бы мету
+// «последним записавшим» целиком и мог затереть более актуальные
+// campusUpdatedAt/lastSync значением из более «старого» запроса. Одиночный
+// SQL-запрос D1 выполняется атомарно (в т.ч. при параллельных запросах из
+// разных изолятов Worker), поэтому конфликт разрешает сама БД:
+//   - campusUpdatedAt = max(текущее, новое) — дата обновления кампуса;
+//   - lastSync        = max(текущее, новое) — время синхронизации;
+//   - lastWeek        = значение записи с максимальным lastSync.
+// Строковое сравнение корректно для ISO-меток времени одного формата
+// (campusUpdatedAt санитизируется sanitizeCampusUpdatedAt, lastSync всегда
+// new Date().toISOString()). Легаси-значение (голая строка даты, не JSON)
+// при конфликте просто перезаписывается новым JSON (миграция формата), а при
+// отсутствии ключа выполняется обычный INSERT.
+async function putMetaMerge(db, logger, key, metaObj, opts = {}) {
+  return logger.wrap('put', key, async () => {
+    const str = typeof metaObj === 'string' ? metaObj : JSON.stringify(metaObj);
+    const expiresAt = opts.expirationTtl
+      ? nowMs() + opts.expirationTtl * 1000
+      : null;
+    await db
+      .prepare(
+        `INSERT INTO kv (key, value, expires_at, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = CASE
+             WHEN json_valid(value) = 1 AND json_valid(excluded.value) = 1
+               THEN json_object(
+                 'campusUpdatedAt', CASE
+                   WHEN json_extract(value, '$.campusUpdatedAt') IS NULL THEN json_extract(excluded.value, '$.campusUpdatedAt')
+                   WHEN json_extract(excluded.value, '$.campusUpdatedAt') IS NULL THEN json_extract(value, '$.campusUpdatedAt')
+                   WHEN json_extract(excluded.value, '$.campusUpdatedAt') >= json_extract(value, '$.campusUpdatedAt') THEN json_extract(excluded.value, '$.campusUpdatedAt')
+                   ELSE json_extract(value, '$.campusUpdatedAt')
+                 END,
+                 'lastSync', CASE
+                   WHEN json_extract(value, '$.lastSync') IS NULL THEN json_extract(excluded.value, '$.lastSync')
+                   WHEN json_extract(excluded.value, '$.lastSync') IS NULL THEN json_extract(value, '$.lastSync')
+                   WHEN json_extract(excluded.value, '$.lastSync') >= json_extract(value, '$.lastSync') THEN json_extract(excluded.value, '$.lastSync')
+                   ELSE json_extract(value, '$.lastSync')
+                 END,
+                 'lastWeek', CASE
+                   WHEN json_extract(value, '$.lastSync') IS NULL THEN json_extract(excluded.value, '$.lastWeek')
+                   WHEN json_extract(excluded.value, '$.lastSync') IS NULL THEN json_extract(value, '$.lastWeek')
+                   WHEN json_extract(excluded.value, '$.lastSync') >= json_extract(value, '$.lastSync') THEN json_extract(excluded.value, '$.lastWeek')
+                   ELSE json_extract(value, '$.lastWeek')
+                 END
+               )
+             ELSE excluded.value
+           END,
+           expires_at = excluded.expires_at,
+           updated_at = excluded.updated_at`
+      )
+      .bind(key, str, expiresAt, nowMs())
+      .run();
+  });
+}
+
 async function del(db, logger, key) {
   return logger.wrap('del', key, async () => {
     await db.prepare('DELETE FROM kv WHERE key = ?').bind(key).run();
@@ -241,6 +299,7 @@ function createStore(env) {
     _db: db,
     get: (key, opts) => get(db, logger, key, opts),
     put: (key, value, opts) => put(db, logger, key, value, opts),
+    putMetaMerge: (key, value, opts) => putMetaMerge(db, logger, key, value, opts),
     delete: (key) => del(db, logger, key),
     list: (opts) => list(db, logger, opts),
     listValues: (opts) => listValues(db, logger, opts),

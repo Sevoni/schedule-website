@@ -274,6 +274,8 @@ async function refreshWriterStatus(group) {
     if (was && !isW) {
       const section = document.getElementById('inviteSection');
       if (section) section.style.display = 'none';
+      const divider = document.getElementById('inviteDivider');
+      if (divider) divider.style.display = 'none';
       showToast('Права на редактирование отозваны', 'warn');
     }
   }
@@ -950,6 +952,7 @@ async function loadData() {
       if (cachedSched && cachedHw && cachedSubj) {
         await loadInitialSchedules();
         recalcNextPairDates();
+        renderHomework();
         usedCacheOnly = true;
       } else {
         // Кеш недель есть, но остальное протухло — подгрузим одним
@@ -3520,7 +3523,8 @@ function setupHomeworkModal() {
       clearInterval(deleteTimer);
       deleteTimer = null;
     }
-    deleteConfirm.classList.add('hidden');
+    deleteConfirm.classList.remove('confirming');
+    document.getElementById('deleteWarning').classList.add('hidden');
     deleteBtn.textContent = 'Удалить';
     deleteBtn.disabled = false;
   }
@@ -3615,7 +3619,8 @@ function setupHomeworkModal() {
   // Delete (только в режиме редактирования)
   deleteBtn.onclick = () => {
     if (deleteBtn.textContent === 'Удалить') {
-      deleteConfirm.classList.remove('hidden');
+      deleteConfirm.classList.add('confirming');
+      document.getElementById('deleteWarning').classList.remove('hidden');
       deleteBtn.disabled = true;
       let remaining = 5;
       deleteBtn.textContent = 'Подтвердить удаление (' + remaining + ')';
@@ -3750,12 +3755,14 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
   // Сброс состояния удаления — могло остаться от предыдущего открытия
   // (doDelete закрывает модалку без resetDeleteState).
   deleteConfirm.classList.add('hidden');
+  deleteConfirm.classList.remove('confirming');
+  document.getElementById('deleteWarning').classList.add('hidden');
   deleteBtn.textContent = 'Удалить';
   deleteBtn.disabled = false;
   if (existingHw) {
-    deleteBtn.classList.remove('hidden');
+    deleteConfirm.classList.remove('hidden');
   } else {
-    deleteBtn.classList.add('hidden');
+    deleteBtn.disabled = true;
   }
 
   // Build subject list from loadedSubjects + today + current schedule
@@ -4341,9 +4348,14 @@ function setupInviteSection() {
     // Секция приглашений доступна ТОЛЬКО владельцу (owner).
     // Writer вообще не взаимодействует со ссылками — только редактирует
     // расписание и ДЗ. Поэтому для writer/reader секция скрыта.
-    section.style.display = isOwner() ? '' : 'none';
-    section.classList.toggle('is-owner', isOwner());
-    if (isOwner()) loadInvites();
+    const show = isOwner();
+    section.style.display = show ? '' : 'none';
+    section.classList.toggle('is-owner', show);
+    // Разделитель перед секцией прячем вместе с ней, чтобы у не-владельца
+    // не оставалось «пустой» линии-разделителя в настройках.
+    const divider = document.getElementById('inviteDivider');
+    if (divider) divider.style.display = show ? '' : 'none';
+    if (show) loadInvites();
   };
 }
 
@@ -4352,7 +4364,7 @@ function copyToClipboard(text, okMsg) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(
       () => { if (okMsg) showToast(okMsg, 'ok'); },
-      () => showToast('Не удалось скопировать: ' + text, 'warn')
+      () => showToast('Не удалось скопировать', 'warn')
     );
   } else {
     const ta = document.createElement('textarea');
@@ -4684,7 +4696,7 @@ async function copyInviteLink(el) {
 
   function done(ok) {
     if (ok) showToast('Ссылка скопирована', 'ok');
-    else showToast('Не удалось скопировать: ' + link, 'warn');
+    else showToast('Не удалось скопировать ссылку. Попробуйте ещё раз.', 'warn');
   }
 
   if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
