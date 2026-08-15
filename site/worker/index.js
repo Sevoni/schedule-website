@@ -388,10 +388,6 @@ async function readJsonBody(request, maxBytes = MAX_BODY_BYTES) {
   }
 }
 
-// Текущий request context (для ctx.waitUntil фоновых уведомлений).
-// Устанавливается в начале fetch и используется в notifyGroupBg.
-let currentCtx = null;
-
 // ── Заголовки безопасности: применяются ко ВСЕМ /api/* ответам ─────────
 const securityHeaders = {
   'X-Content-Type-Options': 'nosniff',
@@ -499,8 +495,8 @@ export default {
 
     // context.waitUntil позволяет дать фоновым задачам (Telegram-уведомления)
     // дойти до конца ПОСЛЕ отправки ответа клиенту — не блокируя его, но и не
-    // убивая висящий fetch при завершении handler'а.
-    currentCtx = context;
+    // убивая висящий fetch при завершении handler'а. context передаётся
+    // параметром в cachedGet и фоновые notify-функции (не через глобал).
 
     // ── Rate limiting (защита от спама) ──────────────────
     // Применяется ко всем запросам до маршрутизации. Возвращает Response(429)
@@ -520,19 +516,19 @@ export default {
     try {
       // ── Public endpoints ──────────────────────────────────
       if (path === '/api/status' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleStatus(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleStatus(request, env, corsHeaders), context);
       }
       if (path === '/api/schedule' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleGetSchedule(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSchedule(request, env, corsHeaders), context);
       }
       if (path === '/api/weeks' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleGetWeeks(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetWeeks(request, env, corsHeaders), context);
       }
       if (path === '/api/schedules' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleGetSchedules(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSchedules(request, env, corsHeaders), context);
       }
       if (path === '/api/bootstrap' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleBootstrap(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleBootstrap(request, env, corsHeaders), context);
       }
       if (path === '/api/upload' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -540,7 +536,7 @@ export default {
         return await handleUpload(request, env, corsHeaders);
       }
       if (path === '/api/subjects' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleGetSubjects(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetSubjects(request, env, corsHeaders), context);
       }
       if (path === '/api/subjects' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -548,17 +544,17 @@ export default {
         return await handlePutSubjects(request, env, corsHeaders);
       }
       if (path === '/api/hw' && method === 'GET') {
-        return await cachedGet(request, env, corsHeaders, () => handleGetHw(request, env, corsHeaders));
+        return await cachedGet(request, env, corsHeaders, () => handleGetHw(request, env, corsHeaders), context);
       }
       if (path === '/api/hw' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
-        return await handleAddHw(request, env, corsHeaders);
+        return await handleAddHw(request, env, corsHeaders, context);
       }
       if (path === '/api/hw' && method === 'PUT') {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
-        return await handleUpdateHw(request, env, corsHeaders);
+        return await handleUpdateHw(request, env, corsHeaders, context);
       }
       if (path === '/api/hw/batch' && method === 'PUT') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -568,7 +564,7 @@ export default {
       if (path === '/api/hw' && method === 'DELETE') {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
-        return await handleDeleteHw(request, env, corsHeaders);
+        return await handleDeleteHw(request, env, corsHeaders, context);
       }
       if (path === '/api/hw/recalc' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -585,7 +581,7 @@ export default {
       if (path === '/api/sync-from-campus' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
         if (guard) return guard;
-        return await handleSyncFromCampus(request, env, corsHeaders);
+        return await handleSyncFromCampus(request, env, corsHeaders, context);
       }
 
       // ── Invite endpoints (writer/owner only) ────────────
@@ -646,8 +642,6 @@ export default {
       console.error('[api] unhandled error requestId=' + requestId + ':', e && (e.stack || e.message));
       store._logger.flush(`${method} ${path} (error)`);
       return jsonResponse({ error: 'Internal Server Error', requestId }, corsHeaders, 500);
-    } finally {
-      currentCtx = null;
     }
   },
 
@@ -676,6 +670,13 @@ export default {
 // Код владельца — секрет env.OWNER_CODE (через `wrangler secret put`).
 
 const INVITE_TTL = 365 * 24 * 60 * 60; // 365 дней
+
+// Формат инвайт-токена: 32 hex-символа (crypto.randomUUID без дефисов).
+// Единый источник истины для resolveAuth (D1-read inv:{token}) и для
+// rate-limit категории verify (isBearerInviteToken) — чтобы условие
+// «запрос делает D1-read» и условие «запрос считается в verify-счётчике»
+// не могли разойтись при будущих правках.
+const INVITE_TOKEN_RE = /^[0-9a-f]{32}$/i;
 
 // Возвращает { group, role: 'owner'|'writer' } или null.
 //   - Authorization: Bearer <token>:
@@ -711,7 +712,7 @@ async function resolveAuth(request, env) {
     // Writer: ищем inv:{token} в KV. Инвайт-токены всегда 32-hex (crypto.randomUUID
     // без дефисов), поэтому заранее отбрасываем мусорные ключи, чтобы не делать
     // лишних D1-запросов.
-    if (/^[0-9a-f]{32}$/i.test(token)) {
+    if (INVITE_TOKEN_RE.test(token)) {
       try {
         const inv = await store.get(`inv:${token}`, { type: 'json' });
         if (inv && inv.group) {
@@ -910,7 +911,8 @@ async function requireWriter(request, env, corsHeaders) {
 
 // POST /api/invite/create
 // Body: { group, label? }. Требует owner. Для owner — group из body.
-// Возвращает { link, id, token }.
+// Возвращает { link, id }. Полный токен в теле ответа не возвращается:
+// он уже зашит в link (#invite=), а отдельной поверхностью утечки быть не должен.
 async function handleInviteCreate(request, env, corsHeaders) {
   const store = createStore(env);
   if (!env.DB) {
@@ -970,7 +972,7 @@ async function handleInviteCreate(request, env, corsHeaders) {
   const origin = env.INVITE_ORIGIN || new URL(request.url).origin;
   const link = `${origin}/#invite=${token}`;
 
-  return jsonResponse({ ok: true, link, id, token }, corsHeaders);
+  return jsonResponse({ ok: true, link, id }, corsHeaders);
 }
 
 // POST /api/owner/login
@@ -1217,18 +1219,19 @@ async function handleInviteVerify(request, env, corsHeaders) {
   // Успешная верификация ставит HttpOnly-cookie __Host-writer_tokens (upsert
   // по группе, 6 месяцев): роль редактора восстанавливается после перезагрузки
   // без повторного ввода ссылки, а токен недоступен JavaScript'у. Тело ответа
-  // не меняем — токен в ответе остаётся для обратной совместимости (старые
-  // клиенты и curl), фронтенд больше не кладёт его в localStorage.
+  // содержит только ok/group — полный токен в ответе не возвращается (JS он
+  // не нужен; фронтенд читает только data.group), это убирает лишнюю
+  // поверхность утечки секрета при XSS/расширении браузера.
   const headers = {
     ...securityHeaders,
     ...corsHeaders,
     'Content-Type': 'application/json',
-    // Явный no-store: ответ содержит полный токен и ставит Set-Cookie —
-    // кэшироваться (CDN/браузером) он не должен ни при каких условиях.
+    // Явный no-store: ответ ставит Set-Cookie — кэшироваться (CDN/браузером)
+    // он не должен ни при каких условиях.
     'Cache-Control': 'no-store',
     'Set-Cookie': writerCookieUpsert(request, normalizeGroup(inv.group), token),
   };
-  return new Response(JSON.stringify({ ok: true, group: normalizeGroup(inv.group), token }), { status: 200, headers });
+  return new Response(JSON.stringify({ ok: true, group: normalizeGroup(inv.group) }), { status: 200, headers });
 }
 
 // GET /api/invite?group=...
@@ -1861,7 +1864,7 @@ async function handleCheckCampusUpdate(request, env, corsHeaders) {
 //
 // Body: { group, campusUpdatedAt, schedules: [{ weekCode, data }, ...] }
 
-async function handleSyncFromCampus(request, env, corsHeaders) {
+async function handleSyncFromCampus(request, env, corsHeaders, context) {
   const store = createStore(env);
   if (!env.DB) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
@@ -1980,7 +1983,7 @@ async function handleSyncFromCampus(request, env, corsHeaders) {
   if (diffs.length > 0) {
     try {
       const buildText = buildScheduleDiffText(group, diffs);
-      notifyGroupFilteredBg(env, group, buildText);
+      notifyGroupFilteredBg(env, group, buildText, context);
     } catch (e) {
       console.log('schedule notify skipped:', e.message);
     }
@@ -2024,7 +2027,7 @@ async function handleGetHw(request, env, corsHeaders) {
 
 // ── POST /api/hw ───────────────────────────────────────────────
 
-async function handleAddHw(request, env, corsHeaders) {
+async function handleAddHw(request, env, corsHeaders, context) {
   const store = createStore(env);
   if (!env.DB) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
@@ -2090,7 +2093,7 @@ async function handleAddHw(request, env, corsHeaders) {
     await store.put(key, JSON.stringify(existing), { expirationTtl: 21600000 });
   });
 
-  notifyGroupFilteredBg(env, group, buildHwText('add', group, item, null));
+  notifyGroupFilteredBg(env, group, buildHwText('add', group, item, null), context);
   await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item }, corsHeaders);
@@ -2100,7 +2103,7 @@ async function handleAddHw(request, env, corsHeaders) {
 // Body: { id, group, subject, pairType, subgroup, task, dueMode, dueDate, author }
 // — обновляет все поля конкретного ДЗ.
 
-async function handleUpdateHw(request, env, corsHeaders) {
+async function handleUpdateHw(request, env, corsHeaders, context) {
   const store = createStore(env);
   if (!env.DB) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
@@ -2184,7 +2187,7 @@ async function handleUpdateHw(request, env, corsHeaders) {
     return jsonResponse({ error: 'Homework not found' }, corsHeaders, 404);
   }
 
-  notifyGroupFilteredBg(env, group, buildHwText('update', group, item, prev));
+  notifyGroupFilteredBg(env, group, buildHwText('update', group, item, prev), context);
   await purgeGroupCdnCache(env, group);
 
   return jsonResponse({ ok: true, item }, corsHeaders);
@@ -2292,7 +2295,7 @@ async function handleBatchUpdateHw(request, env, corsHeaders) {
 
 // ── DELETE /api/hw?id=...&group=... ────────────────────────────
 
-async function handleDeleteHw(request, env, corsHeaders) {
+async function handleDeleteHw(request, env, corsHeaders, context) {
   const store = createStore(env);
   if (!env.DB) {
     return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
@@ -2329,7 +2332,7 @@ async function handleDeleteHw(request, env, corsHeaders) {
   });
 
   if (removed) {
-    notifyGroupFilteredBg(env, group, buildHwText('delete', group, removed, null));
+    notifyGroupFilteredBg(env, group, buildHwText('delete', group, removed, null), context);
   }
   await purgeGroupCdnCache(env, group);
 
@@ -2863,7 +2866,7 @@ async function purgeGroupCdnCache(env, group, changedWeeks = []) {
 // Cache-Control (s-maxage).
 //
 // Возвращает Response. Если caches API недоступен — просто вызывает builder().
-async function cachedGet(request, env, corsHeaders, builder) {
+async function cachedGet(request, env, corsHeaders, builder, context) {
   const hasBearer = (request.headers.get('Authorization') || '').startsWith('Bearer ');
   const isOwnerCookie = await ownerFromCookie(request, env);
   // Writer/owner — без кеша: Bearer-токен, owner-кука ИЛИ writer-кука
@@ -2933,8 +2936,8 @@ async function cachedGet(request, env, corsHeaders, builder) {
         status: resp.status,
         headers: stripCorsHeaders(new Headers(h)),
       });
-      if (typeof currentCtx !== 'undefined' && currentCtx && currentCtx.waitUntil) {
-        currentCtx.waitUntil(cache.put(cacheKey, toStore).catch(() => {}));
+      if (context && typeof context.waitUntil === 'function') {
+        context.waitUntil(cache.put(cacheKey, toStore).catch(() => {}));
       } else {
         cache.put(cacheKey, toStore).catch(() => {});
       }
@@ -3083,13 +3086,14 @@ async function removeGroupSubscriber(env, group, chatId) {
 // context.waitUntil), но гарантирует, что fetch к Telegram дойдёт до конца
 // после отправки ответа — иначе при неблокирующем вызове Worker убивает
 // висящий fetch при завершении handler'а и уведомления теряются.
-function notifyGroupBg(env, group, text, opts = {}) {
-  console.log('[tg] notifyGroupBg called for', group, 'ctx.waitUntil=', !!(currentCtx && typeof currentCtx.waitUntil === 'function'));
+// context передаётся из fetch параметром (см. handleSyncFromCampus и др.).
+function notifyGroupBg(env, group, text, opts = {}, context) {
+  console.log('[tg] notifyGroupBg called for', group, 'ctx.waitUntil=', !!(context && typeof context.waitUntil === 'function'));
   const p = notifyGroup(env, group, text, opts).catch((e) =>
     console.log('[tg] notify skipped:', e && e.message)
   );
-  if (currentCtx && typeof currentCtx.waitUntil === 'function') {
-    currentCtx.waitUntil(p);
+  if (context && typeof context.waitUntil === 'function') {
+    context.waitUntil(p);
   } else {
     console.log('[tg] notifyGroupBg: NO ctx.waitUntil — promise may be killed on response end');
   }
@@ -3388,12 +3392,12 @@ async function notifyGroupFiltered(env, group, buildText) {
   }
 }
 
-function notifyGroupFilteredBg(env, group, buildText) {
+function notifyGroupFilteredBg(env, group, buildText, context) {
   const p = notifyGroupFiltered(env, group, buildText).catch((e) =>
     console.log('[tg] notifyFiltered skipped:', e && e.message)
   );
-  if (currentCtx && typeof currentCtx.waitUntil === 'function') {
-    currentCtx.waitUntil(p);
+  if (context && typeof context.waitUntil === 'function') {
+    context.waitUntil(p);
   }
   return p;
 }
@@ -3453,7 +3457,7 @@ async function handleTgWebhook(request, env) {
   // Секрет обязателен — без него webhook отключён (503), подделки не принимаются.
   if (!env.TG_WEBHOOK_SECRET) {
     console.error('[tg] FATAL: TG_WEBHOOK_SECRET not set — webhook disabled');
-    return tgWebhookResponse('Webhook misconfigured: TG_WEBHOOK_SECRET is required', 503);
+    return tgWebhookResponse('Webhook disabled: configuration error', 503);
   }
   const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
   if (!(await timingSafeEqualStr(provided, env.TG_WEBHOOK_SECRET))) {
@@ -4100,11 +4104,29 @@ function isVerifyPath(path) {
          path === '/api/writer/logout';
 }
 
+// true, если запрос несёт Authorization: Bearer <32-hex> — ровно те запросы,
+// которые в resolveAuth делают D1-read inv:{token} (поиск writer-инвайта).
+// Эта D1-проба не покрыта точечным лимитом verify-путей, поэтому считается
+// в той же категории verify (общий счётчик 10/мин/IP, fail-closed) для ЛЮБЫХ
+// методов (GET/POST/PUT/DELETE). Regex обязан совпадать с INVITE_TOKEN_RE в
+// resolveAuth: мусорные/короткие/не-32-hex Bearer не делают D1-read, поэтому
+// в счётчик не попадают (защита от DoS на счётчик мусорными заголовками).
+function isBearerInviteToken(request) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return false;
+  const token = authHeader.slice(7).trim();
+  return INVITE_TOKEN_RE.test(token);
+}
+
 async function applyRateLimits(store, request, path, method, corsHeaders) {
   const ip = getClientIp(request);
+  // Bearer-инвайт-проба считается в категории verify (см. isBearerInviteToken).
+  const bearerInvite = isBearerInviteToken(request);
   if (!ip) {
-    // fail-closed для чувствительных путей: без IP лимит не проверить (за CF не случается).
-    if (method === 'POST' && isVerifyPath(path)) {
+    // fail-closed для чувствительных запросов: без IP лимит не проверить
+    // (за CF не случается). Покрываем и verify-пути (POST), и Bearer-инвайт
+    // (любой метод — без IP не отличить легитимного владельца от оракула).
+    if ((method === 'POST' && isVerifyPath(path)) || bearerInvite) {
       return rateLimitResponse(corsHeaders, 60, { kind: 'verify' });
     }
     return null;
@@ -4115,15 +4137,20 @@ async function applyRateLimits(store, request, path, method, corsHeaders) {
   const global = await checkRateLimit(store, ip, 'global', RATE_LIMIT_GLOBAL, RATE_LIMIT_WINDOW_SEC);
   if (global.limited) return rateLimitResponse(corsHeaders, global.retryAfter, global);
 
-  // 2) Точечные лимиты на публичные POST (поверх глобального).
-  if (method === 'POST') {
-    if (isVerifyPath(path)) {
-      const rl = await checkRateLimit(store, ip, 'verify', RATE_LIMIT_VERIFY, RATE_LIMIT_WINDOW_SEC, { failClosed: true });
-      if (rl.limited) {
-        if (rl.degraded) console.warn('[ratelimit] verify degraded: D1 недоступен, запрос отклонён');
-        return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
-      }
+  // 2) Точечные лимиты (поверх глобального).
+  // verify-категория: публичные «оракулы» (invite verify/create, owner login/
+  // logout, writer logout) + любой запрос с Bearer-инвайт-токеном (D1-read
+  // inv:{token} в resolveAuth). Общий счётчик — заодно не даёт жечь D1
+  // перебором Bearer-токенов вне POST-ограничений. fail-closed (см. checkRateLimit).
+  if ((method === 'POST' && isVerifyPath(path)) || bearerInvite) {
+    const rl = await checkRateLimit(store, ip, 'verify', RATE_LIMIT_VERIFY, RATE_LIMIT_WINDOW_SEC, { failClosed: true });
+    if (rl.limited) {
+      if (rl.degraded) console.warn('[ratelimit] verify degraded: D1 недоступен, запрос отклонён');
+      return rateLimitResponse(corsHeaders, rl.retryAfter, rl);
     }
+  }
+  // Остальные точечные лимиты — только для POST.
+  if (method === 'POST') {
     // TG webhook — публичный, шлёт исходящие в Telegram.
     if (path === '/api/tg/webhook') {
       const rl = await checkRateLimit(store, ip, 'tg', RATE_LIMIT_TG_WEBHOOK, RATE_LIMIT_WINDOW_SEC);
