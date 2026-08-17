@@ -1535,7 +1535,7 @@ async function backgroundSyncSingle(idx, dbData) {
 // Обновляет отображение группы: заголовок в шапке + title страницы.
 function applyGroupDisplay(groupName) {
   document.getElementById('groupName').textContent = groupName || state.group;
-  document.title = 'Расписание — ' + (groupName || state.group);
+  document.title = 'kampussgu — ' + (groupName || state.group);
 }
 
 function applyScheduleHeader() {
