@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Расписание — 131-ИБо</title>
+  <meta name="theme-color" content="#0f1117">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="dns-prefetch" href="//kampussgu.dpdns.org">
   <link rel="preconnect" href="https://kampussgu.dpdns.org">
   <link rel="dns-prefetch" href="//campus.syktsu.ru">
@@ -62,7 +64,40 @@
     <nav id="dayTabs" class="day-tabs"></nav>
 
     <main id="scheduleContent" class="schedule-content">
-      <div class="loading">Загрузка расписания...</div>
+      <div class="schedule-skeleton">
+        <span class="visually-hidden" role="status">Загрузка расписания...</span>
+        <div class="skeleton skeleton-day" aria-hidden="true"></div>
+        <div class="skeleton-card" aria-hidden="true">
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w20 skeleton-h16"></span>
+            <span class="skeleton skeleton-w35 skeleton-h16"></span>
+          </div>
+          <span class="skeleton skeleton-w60 skeleton-h16"></span>
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w45 skeleton-h12"></span>
+          </div>
+        </div>
+        <div class="skeleton-card" aria-hidden="true">
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w20 skeleton-h16"></span>
+            <span class="skeleton skeleton-w35 skeleton-h16"></span>
+          </div>
+          <span class="skeleton skeleton-w55 skeleton-h16"></span>
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w40 skeleton-h12"></span>
+          </div>
+        </div>
+        <div class="skeleton-card" aria-hidden="true">
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w20 skeleton-h16"></span>
+            <span class="skeleton skeleton-w35 skeleton-h16"></span>
+          </div>
+          <span class="skeleton skeleton-w65 skeleton-h16"></span>
+          <div class="skeleton-row">
+            <span class="skeleton skeleton-w35 skeleton-h12"></span>
+          </div>
+        </div>
+      </div>
     </main>
 
     <section id="homeworkSection" class="homework-section">
@@ -74,10 +109,10 @@
     </section>
   </div>
 
-  <div id="settingsModal" class="modal hidden">
+  <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Настройки</h2>
+        <h2 id="settingsModalTitle">Настройки</h2>
         <button id="closeSettings" class="icon-btn" aria-label="Закрыть" data-anim="scale"><svg class="icon"><use href="#icon-x"></use></svg></button>
       </div>
       <div class="modal-body">
@@ -99,8 +134,8 @@
           <h3><svg class="icon icon-h3"><use href="#icon-palette"></use></svg> Тема оформления</h3>
           <div class="theme-radios">
             <label class="theme-radio"><input type="radio" name="theme-mode" value="light"><span class="theme-radio-icon"><svg class="icon"><use href="#icon-sun"></use></svg></span><span class="theme-radio-label">Светлая</span></label>
-            <label class="theme-radio"><input type="radio" name="theme-mode" value="dark" checked><span class="theme-radio-icon"><svg class="icon"><use href="#icon-moon"></use></svg></span><span class="theme-radio-label">Тёмная</span></label>
-            <label class="theme-radio"><input type="radio" name="theme-mode" value="auto"><span class="theme-radio-icon"><svg class="icon"><use href="#icon-monitor"></use></svg></span><span class="theme-radio-label">Авто</span></label>
+            <label class="theme-radio"><input type="radio" name="theme-mode" value="dark"><span class="theme-radio-icon"><svg class="icon"><use href="#icon-moon"></use></svg></span><span class="theme-radio-label">Тёмная</span></label>
+            <label class="theme-radio"><input type="radio" name="theme-mode" value="auto" checked><span class="theme-radio-icon"><svg class="icon"><use href="#icon-monitor"></use></svg></span><span class="theme-radio-label">Авто</span></label>
           </div>
         </div>
 
@@ -175,16 +210,23 @@
 
         <div class="hw-reset-section">
           <h3><svg class="icon icon-h3"><use href="#icon-trash-2"></use></svg> Данные</h3>
+          <div id="resetDoneConfirm" class="delete-confirm confirming hidden">
+            <p class="delete-warning">Сбросить все отметки «выполнено» для группы <b id="resetDoneGroup"></b>?</p>
+            <div class="reset-done-actions">
+              <button id="resetDoneYes" class="delete-btn">Сбросить</button>
+              <button id="resetDoneNo" class="btn-secondary">Отмена</button>
+            </div>
+          </div>
           <button id="resetDoneHw" class="btn-secondary">Сбросить отметки «выполнено»</button>
         </div>
       </div>
     </div>
   </div>
 
-  <div id="homeworkModal" class="modal hidden">
+  <div id="homeworkModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="homeworkModalTitle">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Новое задание</h2>
+        <h2 id="homeworkModalTitle">Новое задание</h2>
         <button id="closeHomework" class="icon-btn" aria-label="Закрыть" data-anim="scale"><svg class="icon"><use href="#icon-x"></use></svg></button>
       </div>
       <div class="modal-body">
@@ -276,7 +318,7 @@
     </div>
   </div>
 
-  <div id="hwViewModal" class="modal hidden">
+  <div id="hwViewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="hwViewTitle">
     <div class="modal-content hw-view-content">
       <div class="modal-header">
         <h2 id="hwViewTitle">Задание</h2>
@@ -293,7 +335,20 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
+  <div id="roomPrevModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="roomPrevTitle">Аудитория</h2>
+        <button id="closeRoomPrev" class="icon-btn" aria-label="Закрыть" data-anim="scale"><svg class="icon"><use href="#icon-x"></use></svg></button>
+      </div>
+      <div class="modal-body">
+        <p id="roomPrevText" class="room-prev-text"></p>
+        <button id="roomPrevOk" class="save-btn room-prev-ok">ОК</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 
   <!-- Вспышка при смене темы оформления -->
   <div id="themeSweep" class="theme-sweep"></div>

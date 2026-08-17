@@ -4,6 +4,22 @@
   box-sizing: border-box;
 }
 
+/* Кнопки, заменившие кликабельные <span> (hw-view-link, invite-copy):
+   сброс браузерных стилей кнопки, чтобы внешний вид совпадал с прежним span.
+   Правило стоит раньше специфичных стилей (.invite-id, .invite-copy,
+   .hw-view-link) — те переопределяют его, где нужно. */
+.hw-view-link,
+.invite-copy {
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
 :root {
   --bg: #0f1117;
   --surface: #1a1d27;
@@ -13,6 +29,11 @@
   --text-dim: #8b8fa3;
   --accent: #6c8cff;
   --accent-dim: #4a65cc;
+  /* Акцентный цвет ТЕКСТА на поверхностях (автор задания). Отдельная переменная,
+     чтобы не зависеть от --accent-dim (границы/hover) и от кастомного акцента:
+     shade(accent, -0.18) в applyAccent может дать тёмный цвет с контрастом < 4.5:1.
+     #7d93f2 на #1a1d27 ≈ 5.9:1 (WCAG AA для обычного текста). */
+  --accent-dim-text: #7d93f2;
   --danger: #e5484d;
   --green: #4ade80;
   --red: #f87171;
@@ -33,6 +54,9 @@
   --text-dim: #6b7080;
   --accent: #4a65cc;
   --accent-dim: #3a4fab;
+  /* Тёмный акцентный текст на белых поверхностях: #3a4fab на #ffffff ≈ 7.3:1.
+     Фиксированное значение — кастомный акцент не должен ухудшать читаемость. */
+  --accent-dim-text: #3a4fab;
   --danger: #d92d35;
   --green: #16a34a;
   --red: #dc2626;
@@ -45,11 +69,13 @@
 
 html {
   scrollbar-width: none;
+  background-color: var(--bg);
 }
 html::-webkit-scrollbar { display: none; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.45;
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
@@ -60,6 +86,17 @@ body {
   transition: background 0.25s ease, color 0.25s ease;
 }
 body::-webkit-scrollbar { display: none; }
+
+/* Блокировка прокрутки фона при открытой модалке — на всех экранах.
+   Класс вешает openModal() и снимает closeModal() (app.js) через счётчик
+   открытых модалок: пока открыта хотя бы одна, body держит modal-open.
+   Скроллбар страницы уже скрыт (scrollbar-width:none + ::-webkit-scrollbar
+   display:none), поэтому смена overflow не даёт скачка layout — компенсация
+   ширины скроллбара не нужна. overflow на body пропагируется на viewport
+   (html без явного overflow) и блокирует прокрутку страницы целиком. */
+body.modal-open {
+  overflow: hidden;
+}
 
 .container {
   max-width: 600px;
@@ -113,7 +150,7 @@ header {
   border: none;
   color: var(--text-dim);
   cursor: pointer;
-  padding: 8px;
+  padding: 10px; /* тач-таргет 20px иконка + 2×10px = 40px */
   border-radius: 8px;
   transition: background 0.2s, color 0.2s;
   display: inline-flex;
@@ -164,7 +201,7 @@ header {
 }
 
 .sync-status {
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   padding: 4px 0;
   display: flex;
   align-items: center;
@@ -195,7 +232,8 @@ header {
   cursor: pointer;
   text-decoration: underline;
   font-size: inherit;
-  padding: 0;
+  padding: 10px 8px;
+  margin: -10px -8px;
 }
 
 #groupName {
@@ -226,10 +264,16 @@ header {
   color: var(--text);
   width: 36px;
   height: 36px;
+  min-width: 40px;
+  min-height: 40px;
+  flex-shrink: 0;
   border-radius: 8px;
   cursor: pointer;
   font-size: 0.9rem;
   transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .nav-btn:hover {
@@ -241,11 +285,20 @@ header {
   font-size: 0.9rem;
   color: var(--text-dim);
   text-align: center;
+  /* Длинное название недели на узких экранах переносится, а не обрезается:
+     label занимает всё свободное место между стрелками (.nav-btn не сжимается),
+     перенос по словам, экстренный разрыв длинных дат — overflow-wrap. */
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
 }
 
 .week-dates {
   display: inline-block;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .day-tabs {
@@ -338,10 +391,77 @@ header {
   to   { transform: translate3d(0, 0, 0); opacity: 1; }
 }
 
-.loading {
-  text-align: center;
-  padding: 40px;
-  color: var(--text-dim);
+/* ── Скелетон-заглушки при загрузке расписания ───────────────
+   Серые блоки в форме «заголовок дня + карточки пар» вместо
+   текста «Загрузка расписания...». Пульсация — только opacity,
+   без влияния на layout (вопрос prefers-reduced-motion покрыт
+   отдельной задачей). */
+.schedule-skeleton {
+  padding-top: 4px;
+}
+
+.skeleton {
+  display: block;
+  background: var(--border);
+  border-radius: 8px;
+  animation: skeletonPulse 1.4s ease-in-out infinite;
+}
+
+.skeleton-day {
+  width: 35%;
+  height: 20px;
+  margin-bottom: 14px;
+}
+
+.skeleton-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 10px;
+}
+
+.skeleton-card:last-child {
+  margin-bottom: 0;
+}
+
+.skeleton-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.skeleton-row:last-child {
+  margin-bottom: 0;
+}
+
+.skeleton-w20 { width: 20%; }
+.skeleton-w35 { width: 35%; }
+.skeleton-w40 { width: 40%; }
+.skeleton-w45 { width: 45%; }
+.skeleton-w55 { width: 55%; }
+.skeleton-w60 { width: 60%; }
+.skeleton-w65 { width: 65%; }
+
+.skeleton-h12 { height: 12px; }
+.skeleton-h16 { height: 16px; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@keyframes skeletonPulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
 }
 
 .day-schedule {
@@ -413,20 +533,20 @@ header {
 }
 
 .pair-type {
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   padding: 2px 8px;
   border-radius: 6px;
   font-weight: 500;
 }
 
-.pair-type.лекция { background: #1e3a5f; color: #60a5fa; }
-.pair-type.практика { background: #1a3a2a; color: #4ade80; }
-.pair-type.лабораторная { background: #3a2a1a; color: #fbbf24; }
-.pair-type.семинар { background: #2a1a3a; color: #c084fc; }
-.pair-type.практическое { background: #1a3a2a; color: #4ade80; }
+.pair-type[data-type="л"] { background: #1e3a5f; color: #60a5fa; }
+.pair-type[data-type="пр"] { background: #1a3a2a; color: #4ade80; }
+.pair-type[data-type="пз"] { background: #1a3a2a; color: #4ade80; }
+.pair-type[data-type="лаб"] { background: #3a2a1a; color: #fbbf24; }
+.pair-type[data-type="с"] { background: #2a1a3a; color: #c084fc; }
 
 .pair-subgroup {
-  font-size: 0.7rem;
+  font-size: 0.8rem;
   padding: 2px 6px;
   border-radius: 6px;
   font-weight: 500;
@@ -465,7 +585,7 @@ header {
 
 .room-status {
   margin-left: 8px;
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   font-weight: 600;
 }
 
@@ -477,6 +597,8 @@ header {
   color: var(--green, #4caf50);
   cursor: pointer;
   text-decoration: underline dotted;
+  padding: 6px 4px;
+  margin: -6px -4px;
 }
 
 .room-status.closed {
@@ -497,7 +619,7 @@ header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   color: var(--orange);
   gap: 8px;
 }
@@ -516,8 +638,12 @@ header {
   cursor: pointer;
   font-size: 0.95rem;
   line-height: 1;
-  padding: 2px 4px;
-  border-radius: 4px;
+  padding: 12px 10px;
+  margin: -12px -10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
   transition: all 0.2s;
 }
 
@@ -549,12 +675,12 @@ header {
 
 .hw-error {
   color: var(--red);
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   margin-top: 2px;
 }
 
 .hw-markup-hint {
-  font-size: 0.72rem;
+  font-size: 0.8rem;
   color: var(--text-dim);
   margin-top: 4px;
   line-height: 1.5;
@@ -584,7 +710,7 @@ header {
 .hw-open-hint {
   color: var(--accent);
   text-decoration: underline;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   white-space: nowrap;
   margin-left: 2px;
 }
@@ -595,12 +721,12 @@ header {
 .pair-hw-due {
   flex-shrink: 0;
   opacity: 0.7;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
 }
 
 .pair-add-hw {
-  width: 28px;
-  height: 28px;
+  min-width: 40px;
+  min-height: 40px;
   padding: 4px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -666,7 +792,7 @@ header {
 
 .error-msg button {
   margin-top: 12px;
-  padding: 8px 20px;
+  padding: 10px 24px;
   background: var(--red);
   color: var(--on-accent);
   border: none;
@@ -697,7 +823,7 @@ header {
 }
 
 .add-btn {
-  padding: 6px 14px;
+  padding: 10px 16px;
   background: var(--accent);
   color: var(--on-accent);
   border: none;
@@ -705,14 +831,26 @@ header {
   cursor: pointer;
   font-size: 0.85rem;
   font-weight: 500;
-  transition: opacity 0.2s;
+  transition: opacity 0.2s, transform 0.15s ease, box-shadow 0.2s ease;
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 
 .add-btn:hover {
-  opacity: 0.85;
+  opacity: 0.9;
+}
+
+@media (hover: hover) {
+  .add-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(108, 140, 255, 0.35);
+  }
+}
+
+.add-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: none;
 }
 
 .add-btn .icon {
@@ -763,7 +901,7 @@ header {
 }
 
 .hw-due {
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   color: var(--orange);
   margin-top: 4px;
 }
@@ -786,8 +924,8 @@ header {
   cursor: pointer;
   font-size: 1.1rem;
   padding: 0;
-  width: 28px;
-  height: 28px;
+  min-width: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -808,8 +946,8 @@ header {
   cursor: pointer;
   font-size: 1.1rem;
   padding: 0;
-  width: 28px;
-  height: 28px;
+  min-width: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -830,8 +968,8 @@ header {
   cursor: pointer;
   font-size: 1.1rem;
   padding: 0;
-  width: 28px;
-  height: 28px;
+  min-width: 40px;
+  min-height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -846,8 +984,8 @@ header {
 }
 
 .hw-author {
-  font-size: 0.8rem;
-  color: var(--accent-dim);
+  font-size: 0.85rem;
+  color: var(--accent-dim-text);
   margin-top: 4px;
   font-style: italic;
 }
@@ -950,15 +1088,15 @@ header {
 }
 .group-input-wrap input {
   width: 100%;
-  padding-right: 48px;
+  padding-right: 56px;
   border-radius: 8px;
 }
 .group-save-btn {
   position: absolute;
   right: 4px;
-  top: 4px;
-  bottom: 4px;
-  width: 36px;
+  top: 2px;
+  bottom: 2px;
+  min-width: 40px;
   flex-shrink: 0;
   border: none;
   border-radius: 6px;
@@ -1094,12 +1232,11 @@ header {
 }
 
 .settings-note {
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   color: var(--text-dim);
   background: var(--bg);
   padding: 10px;
   border-radius: 8px;
-  line-height: 1.4;
 }
 
 .settings-note code {
@@ -1115,11 +1252,23 @@ header {
   cursor: pointer;
   font-size: 0.9rem;
   font-weight: 600;
-  transition: opacity 0.2s;
+  transition: opacity 0.2s, transform 0.15s ease, box-shadow 0.2s ease;
 }
 
 .save-btn:hover {
-  opacity: 0.85;
+  opacity: 0.9;
+}
+
+@media (hover: hover) {
+  .save-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 8px rgba(108, 140, 255, 0.35);
+  }
+}
+
+.save-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+  box-shadow: none;
 }
 
 .delete-btn {
@@ -1155,9 +1304,34 @@ header {
 
 .delete-warning {
   margin: 0 0 12px;
-  font-size: 0.88rem;
+  font-size: 0.9rem;
   color: var(--text);
-  line-height: 1.4;
+}
+
+/* Встроенное подтверждение сброса отметок «выполнено» (Да/Отмена) */
+.reset-done-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.reset-done-actions .delete-btn,
+.reset-done-actions .btn-secondary {
+  flex: 1;
+}
+
+/* Модалка «Предыдущая пара в аудитории» */
+.room-prev-text {
+  margin: 0;
+  white-space: pre-line;
+  line-height: 1.5;
+  color: var(--text);
+  font-size: 0.95rem;
+  word-break: break-word;
+}
+
+.room-prev-ok {
+  align-self: flex-end;
+  min-width: 96px;
 }
 
 /* ── Homework modal additions ───────────────────────────────── */
@@ -1287,7 +1461,7 @@ header {
 }
 
 .hw-mode-sub {
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -1362,7 +1536,10 @@ header {
   color: var(--text);
   cursor: pointer;
   font-size: 1rem;
-  padding: 4px 8px;
+  padding: 10px 12px; /* тач-таргет ~40px */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .hw-cal-header button:hover {
@@ -1382,21 +1559,36 @@ header {
 }
 
 .hw-cal-grid .cal-day-header {
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   color: var(--text-dim);
   padding: 4px 0;
 }
 
+/* Дни — настоящие <button> (доступны с клавиатуры): сбрасываем UA-стили,
+   чтобы внешний вид остался прежним (font-family/color наследуем, font-size свой) */
 .hw-cal-grid .cal-day {
-  padding: 6px 0;
+  padding: 10px 0;
   font-size: 0.85rem;
+  font-family: inherit;
+  line-height: inherit;
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.15s;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: center;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 .hw-cal-grid .cal-day:hover {
   background: var(--border);
+}
+
+.hw-cal-grid .cal-day:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
 }
 
 .hw-cal-grid .cal-day.selected {
@@ -1417,7 +1609,7 @@ header {
 
 .hw-date-selected {
   margin-top: 6px;
-  font-size: 0.8rem;
+  font-size: 0.85rem;
   color: var(--text-dim);
 }
 
@@ -1433,7 +1625,7 @@ header {
 /* ── Responsive layout ──────────────────────────────────── */
 @media (max-width: 400px) {
   .container { padding: 10px; }
-  .day-tab { padding: 6px 10px; font-size: 0.8rem; }
+  .day-tab { padding: 10px 14px; font-size: 0.85rem; }
   .modal { padding: 0; }
   .modal-content {
     border: none;
@@ -1449,9 +1641,13 @@ header {
   }
 }
 
-/* Планшет: расширяем контейнер, одна широкая колонка */
+/* Планшет: расширяем контейнер, одна широкая колонка.
+   Ширина растёт плавно от 600px (мобильная) до 920px (начало десктопа)
+   по мере расширения вьюпорта 768px → 1024px — без резкого скачка на 768px. */
 @media (min-width: 768px) {
-  .container { max-width: 920px; }
+  .container {
+    max-width: min(920px, calc(600px + (100vw - 768px) * 1.25));
+  }
 }
 
 /* Десктоп: две колонки — расписание слева, домашка справа (sticky) */
@@ -1522,7 +1718,7 @@ header {
 .tg-status.tg-warn { color: var(--orange); }
 
 .tg-hint {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   color: var(--text-dim);
   margin: 0 0 10px 0;
   line-height: 1.5;
@@ -1608,7 +1804,7 @@ header {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
-.toast.toast-error { border-color: var(--orange); }
+.toast.toast-error { border-color: var(--danger); }
 .toast.toast-ok { border-color: var(--green); }
 
 /* ── Settings: role / theme / accent ────────────────────── */
@@ -1645,12 +1841,12 @@ header {
 .role-status.role-writer .role-icon { color: var(--green); }
 .role-status.role-reader .role-icon { color: var(--text-dim); }
 .role-status .role-label { font-weight: 600; }
-.role-status .role-desc { color: var(--text-dim); font-size: 0.82rem; }
+.role-status .role-desc { color: var(--text-dim); font-size: 0.85rem; }
 .role-status .role-action {
   display: block;
   margin-top: 8px;
-  padding: 6px 10px;
-  font-size: 0.8rem;
+  padding: 10px 14px;
+  font-size: 0.85rem;
 }
 
 .theme-radios {
@@ -1793,8 +1989,8 @@ header {
   position: relative;
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   border: 2px solid var(--border);
   cursor: pointer;
@@ -1877,12 +2073,12 @@ header {
   color: var(--text);
 }
 .invite-section h4 {
-  font-size: 0.88rem;
+  font-size: 0.9rem;
   margin: 14px 0 8px;
   color: var(--text-dim);
 }
 .invite-note {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   color: var(--text-dim);
   line-height: 1.5;
   margin-bottom: 12px;
@@ -1896,7 +2092,7 @@ header {
   margin-bottom: 8px;
 }
 .invite-msg {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   margin: 8px 0;
   padding: 8px 10px;
   border-radius: 6px;
@@ -1928,7 +2124,7 @@ header {
   align-items: baseline;
   gap: 8px;
   flex-wrap: wrap;
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   min-width: 0;
 }
 .invite-id {
@@ -1939,6 +2135,8 @@ header {
 .invite-copy {
   cursor: pointer;
   text-decoration: underline dotted;
+  padding: 6px 4px;
+  margin: -6px -4px;
 }
 .invite-copy:hover {
   opacity: 0.8;
@@ -1948,15 +2146,15 @@ header {
 }
 .invite-date {
   color: var(--text-dim);
-  font-size: 0.76rem;
+  font-size: 0.8rem;
 }
 .revoke-btn {
-  padding: 6px 12px;
+  padding: 11px 12px;
   border-radius: 8px;
   border: 1px solid var(--danger);
   background: none;
   color: var(--danger);
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   cursor: pointer;
   transition: all 0.2s;
   flex-shrink: 0;
@@ -1973,14 +2171,17 @@ header {
   flex-shrink: 0;
 }
 .rename-btn {
-  padding: 6px 9px;
+  padding: 11px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: none;
   color: var(--text-dim);
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   cursor: pointer;
   transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .rename-btn:hover {
   background: var(--surface-hover);
@@ -2002,8 +2203,8 @@ header {
   min-width: 0;
 }
 .rename-wrap .btn-secondary {
-  padding: 6px 10px;
-  font-size: 0.8rem;
+  padding: 10px 12px;
+  font-size: 0.85rem;
 }
 
 /* ── Start Page (Google-style) ─────────────────────────────── */
@@ -2134,7 +2335,7 @@ header {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 2px 10px;
-  font-size: 0.78rem;
+  font-size: 0.85rem;
   color: var(--text-dim);
   white-space: nowrap;
 }
@@ -2268,4 +2469,46 @@ header {
   background: var(--green);
   color: #062c1a;
   border-color: var(--green);
+}
+
+/* ── Reduced motion ──────────────────────────────────────
+   Для пользователей с включённым «меньше движения» все анимации и
+   переходы схлопываются в мгновенные (карусель недели, появление
+   модалок, fadeIn дней, toast, hover-эффекты). Бесконечные анимации
+   (спиннеры) останавливаются, каскадные задержки обнуляются. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Вспышка при смене темы — полностью убрать */
+  .theme-sweep {
+    opacity: 0 !important;
+  }
+}
+
+/* ── Единый видимый фокус с клавиатуры (:focus-visible) ────────────────────
+   Общий контур для всех фокусируемых элементов (кнопки, инпуты, select,
+   textarea, ссылки, [tabindex], [role="button"]). Размещён в конце файла,
+   чтобы выигрывать каскад у базовых правил; var(--accent) автоматически
+   подстраивается под тёмную/светлую тему и выбранный акцентный цвет. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Инпуты/textarea/select в модалках и на стартовой странице ранее гасили
+   outline через :focus { outline: none } — при клавиатурной навигации
+   возвращаем единый контур (мышиный фокус по-прежнему подсвечивает только
+   border-color, как было). */
+.modal-body input:focus-visible,
+.modal-body textarea:focus-visible,
+.modal-body select:focus-visible,
+.start-page-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }

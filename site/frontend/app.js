@@ -95,8 +95,9 @@ let state = {
   selectedDay: null,
   homework: [],
   syncing: false,
-  // Тема оформления: 'dark' | 'light' | 'auto'. По умолчанию тёмная.
-  theme: localStorage.getItem('theme') || 'dark',
+  // Тема оформления: 'dark' | 'light' | 'auto'. По умолчанию — системная (auto):
+  // при первом открытии берётся prefers-color-scheme, ручной выбор сохраняется.
+  theme: localStorage.getItem('theme') || 'auto',
   // Цвет акцента (кнопки). Хранится как hex. По умолчанию синий из :root.
   accent: localStorage.getItem('accent') || '',
   // Флаг «свежести» списка недель: ставится когда bootstrap или
@@ -361,6 +362,10 @@ function applyAccent() {
     document.documentElement.style.setProperty('--accent', state.accent);
     // accent-dim — чуть темнее для hover/gradients.
     document.documentElement.style.setProperty('--accent-dim', shade(state.accent, -0.18));
+    // ВАЖНО: переменную --accent-dim-text (акцентный цвет ТЕКСТА, напр. автор задания)
+    // намеренно НЕ переопределяем: shade(accent, -0.18) для тёмных/жёлтых акцентов
+    // даёт цвет с контрастом < 4.5:1 на карточках. Её фиксированные значения заданы
+    // в style.css для каждой темы и гарантируют читаемость при любом акценте.
   } else {
     document.documentElement.style.removeProperty('--accent');
     document.documentElement.style.removeProperty('--accent-dim');
@@ -383,6 +388,13 @@ function shade(hex, f) {
 // Заглушка для совместимости: иконки через <use href="#icon-x"> рендерятся
 // сами из инлайн-спрайта в index.html. Вызывается после обновлений DOM на всякий случай.
 function refreshIcons() {}
+
+// Системная настройка «меньше движения»: используется для отключения
+// JS-управляемых анимаций (карусель, пружинный overscroll) и ускорения
+// задержек, ждущих завершения CSS-transition.
+function prefersReducedMotion() {
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 
 // Делегированный обработчик анимаций клика для кнопок с data-anim.
 function setupAnimations() {
@@ -449,6 +461,40 @@ function saveDoneHw() {
   try {
     localStorage.setItem(doneHwKey(), JSON.stringify([...doneHwIds]));
   } catch (e) { /* квота/недоступность — игнорируем */ }
+}
+
+// Точечно обновляет UI отметки «выполнено» после смены doneHwIds — вместо
+// полного перерендера дня/списка (сохраняет фокус и скролл). Нижний список
+// заданий и элементы пар в расписании обновляются без пересоздания родителя.
+function updateHwDoneState(id) {
+  const done = doneHwIds.has(id);
+
+  // Расписание: переключаем класс .done у элемента пары с этим ДЗ (визуал
+  // отметки целиком описан в CSS через .pair-hw-item.done — style.css 529–541).
+  // Элемент не пересоздаётся, поэтому фокус и скролл сохраняются.
+  document.querySelectorAll('.pair-hw-item').forEach(item => {
+    const btn = item.querySelector('.pair-hw-done');
+    if (btn && btn.dataset.id === id) {
+      item.classList.toggle('done', done);
+      btn.title = done ? 'Снять отметку «выполнено»' : 'Отметить выполненным';
+    }
+  });
+
+  // Нижний список ДЗ: выполненные скрываются из списка, при снятии — возвращаются.
+  const list = document.getElementById('homeworkList');
+  if (!list) return;
+  const hwBtn = Array.from(list.querySelectorAll('.hw-done')).find(b => b.dataset.id === id);
+  if (hwBtn) {
+    const card = hwBtn.closest('.hw-card');
+    if (card) card.remove();
+    if (!list.querySelector('.hw-card')) {
+      list.innerHTML = '<div class="no-homework">Нет заданий</div>';
+    }
+  } else if (!done) {
+    // Карточки в списке нет, а отметка снята — вернём её. Перерисовывается
+    // только нижний список (день не затрагивается).
+    renderHomework();
+  }
 }
 
 // ── Init ──────────────────────────────────────────────────────
@@ -851,7 +897,7 @@ function hideStartPage() {
   setTimeout(() => {
     el.classList.add('hidden');
     el.classList.remove('fade-out');
-  }, 300);
+  }, prefersReducedMotion() ? 0 : 300);
 }
 
 function setupStartPage() {
@@ -1134,6 +1180,32 @@ function getInitialWeekIndices() {
   return result;
 }
 
+// Скелетон-заглушка для контейнера расписания: серые блоки в форме
+// «заголовок дня + карточки пар» вместо текста «Загрузка расписания...».
+// aria-hidden прячет визуальные блоки от скринридеров — для них оставлен
+// скрытый текст с role="status" (полит-анонс о начале загрузки).
+function skeletonScheduleHTML() {
+  const card = (subjW, lineW) => `
+    <div class="skeleton-card" aria-hidden="true">
+      <div class="skeleton-row">
+        <span class="skeleton skeleton-w20 skeleton-h16"></span>
+        <span class="skeleton skeleton-w35 skeleton-h16"></span>
+      </div>
+      <span class="skeleton ${subjW} skeleton-h16"></span>
+      <div class="skeleton-row">
+        <span class="skeleton ${lineW} skeleton-h12"></span>
+      </div>
+    </div>`;
+  return `
+    <div class="schedule-skeleton">
+      <span class="visually-hidden" role="status">Загрузка расписания...</span>
+      <div class="skeleton skeleton-day" aria-hidden="true"></div>
+      ${card('skeleton-w60', 'skeleton-w45')}
+      ${card('skeleton-w55', 'skeleton-w40')}
+      ${card('skeleton-w65', 'skeleton-w35')}
+    </div>`;
+}
+
 // Загрузка исходных расписаний (БД + фоне синхронизация) при открытии страницы.
 // БД — источник отрисовки «первым и немедленным»: экран показываем сразу из
 // кэша/БД. Кампус никогда не блокирует отрисовку: синхронизацию запускает
@@ -1144,7 +1216,7 @@ async function loadInitialSchedules() {
   if (indices.length === 0) return;
 
   const content = document.getElementById('scheduleContent');
-  content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
+  content.innerHTML = skeletonScheduleHTML();
 
   // Если все стартовые недели уже в кеше (от bootstrap или предыдущего
   // открытия) — сохраняем кеш и сразу рисуем. Никакого запроса к воркеру.
@@ -1323,7 +1395,7 @@ async function loadSchedule(targetIdx, direction) {
   }
 
   const content = document.getElementById('scheduleContent');
-  content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
+  content.innerHTML = skeletonScheduleHTML();
 
   // 2) Нет в кэше → из БД. Запрашиваем сразу 3 недели одной /api/schedules
   //    (текущую + ±1), чтобы следующее перелистывание уже было в кеше.
@@ -2486,9 +2558,94 @@ function renderWeekNav() {
 // Плавное открытие/закрытие модалки (double rAF, чтобы transition сработал
 // от начального кадра, а не мгновенно).
 // originEl — кнопка-источник: модалка «вырастает» из неё (transform-origin).
+
+// ── Focus management для модалок ───────────────────────────────
+// При открытии модалки сохраняем элемент, на котором был фокус (кнопку-триггер),
+// переносим фокус внутрь; при закрытии возвращаем фокус на сохранённый элемент.
+// Ловушка Tab удерживает фокус внутри открытой модалки (циклический обход).
+let lastFocusedEl = null;
+let modalFocusTrapBound = false;
+const MODAL_FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getModalFocusable(modal) {
+  if (!modal) return [];
+  return Array.prototype.filter.call(
+    modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR),
+    (el) => el.offsetParent !== null && !el.closest('.hidden')
+  );
+}
+
+function focusFirstModalElement(modal) {
+  if (!modal) return;
+  // Фокус уже внутри модалки (например, openHwModal сам фокусит hwTask) — не трогаем.
+  if (modal.contains(document.activeElement)) return;
+  const focusable = getModalFocusable(modal);
+  if (focusable.length) {
+    focusable[0].focus();
+  } else {
+    modal.setAttribute('tabindex', '-1');
+    modal.focus();
+  }
+}
+
+function restoreModalFocus() {
+  if (!lastFocusedEl) return;
+  if (lastFocusedEl.isConnected && lastFocusedEl.offsetParent !== null) {
+    lastFocusedEl.focus();
+  }
+  lastFocusedEl = null;
+}
+
+// Ловушка Tab: последний элемент → первый (и наоборот для Shift+Tab);
+// если фокус каким-то образом ушёл из модалки — возвращаем его внутрь.
+function setupModalFocusTrap() {
+  if (modalFocusTrapBound) return;
+  modalFocusTrapBound = true;
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    const modal = document.querySelector('.modal.is-open');
+    if (!modal) return;
+    const focusable = getModalFocusable(modal);
+    if (!focusable.length) {
+      e.preventDefault();
+      focusFirstModalElement(modal);
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!modal.contains(e.target)) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+      return;
+    }
+    if (e.shiftKey && e.target === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && e.target === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+}
+
+// Счётчик одновременно открытых модалок: прокрутка фона блокируется при
+// первой открытой модалке и снимается только когда закрыта последняя
+// (модалки могут открываться одна поверх другой, напр. просмотр ДЗ → форма).
+let openModalCount = 0;
+
 function openModal(modal, originEl) {
   if (!modal) return;
+  lastFocusedEl = originEl ||
+    (document.activeElement && document.activeElement !== document.body ? document.activeElement : null);
   modal.classList.remove('hidden');
+
+  // Блокируем прокрутку фона на ВСЕХ экранах (не только ≤400px), пока
+  // открыта хотя бы одна модалка. Синхронно — до rAF, чтобы при быстрой
+  // смене «закрыть одну → открыть другую» не было кадра со свободным скроллом.
+  openModalCount += 1;
+  if (openModalCount === 1) {
+    document.body.classList.add('modal-open');
+  }
 
   const content = modal.querySelector('.modal-content');
 
@@ -2518,17 +2675,22 @@ function openModal(modal, originEl) {
     }
     void (content ? content.offsetWidth : 0);
     modal.classList.add('is-open');
-    if (window.matchMedia('(max-width: 400px)').matches) {
-      document.body.style.overflow = 'hidden';
-    }
+    focusFirstModalElement(modal);
   });
 }
 
 function closeModal(modal) {
   if (!modal) return;
   modal.classList.remove('is-open');
-  document.body.style.overflow = '';
-  setTimeout(() => modal.classList.add('hidden'), 240);
+  // Снимаем блокировку прокрутки только когда закрыта последняя модалка.
+  openModalCount = Math.max(0, openModalCount - 1);
+  if (openModalCount === 0) {
+    document.body.classList.remove('modal-open');
+  }
+  restoreModalFocus();
+  // При «меньше движения» переход уже мгновенный — прячем оверлей сразу,
+  // иначе прозрачный некликабельный слой висел бы ещё 240ms.
+  setTimeout(() => modal.classList.add('hidden'), prefersReducedMotion() ? 0 : 240);
 }
 
 // с противоположной. Между ними — момент, когда видны оба частично.
@@ -2536,6 +2698,10 @@ function closeModal(modal) {
 function animateSchedule(direction) {
   const el = document.getElementById('scheduleContent');
   if (!el) return;
+
+  // «Меньше движения»: карусель отключается целиком — новый контент
+  // появляется мгновенно в renderDaySchedule, оверлей не создаётся.
+  if (prefersReducedMotion()) return;
 
   // Убираем предыдущий leaving-оверлей, если анимация ещё не завершилась.
   const prev = document.querySelector('.week-leaving-fixed');
@@ -2631,15 +2797,22 @@ function selectDay(day) {
 function setupKeyboardShortcuts() {
   document.addEventListener('keydown', (e) => {
     if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+    // Esc закрывает ЛЮБУЮ открытую модалку (настройки, форму ДЗ, просмотр ДЗ),
+    // даже если фокус внутри поля ввода модалки (потому и стоит до проверки
+    // INPUT/TEXTAREA/SELECT). Закрываем через кнопку «×» модалки — на неё
+    // повешена специфичная очистка (resetDeleteState у формы, анимация у
+    // настроек и т.п.); если кнопки нет — просто closeModal.
     if (e.key === 'Escape') {
-      const view = document.getElementById('hwViewModal');
-      if (view && !view.classList.contains('hidden')) {
-        closeModal(view);
+      const open = document.querySelector('.modal.is-open');
+      if (open) {
+        const closeBtn = open.querySelector('.modal-header .icon-btn');
+        if (closeBtn) closeBtn.click();
+        else closeModal(open);
         return;
       }
     }
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
     const modalOpen = document.querySelector('.modal.is-open');
     if (modalOpen) return;
     if (e.key === 'ArrowLeft') {
@@ -2697,7 +2870,6 @@ function renderDaySchedule(day) {
       pairsHtml = '<div class="no-pairs"><svg class="icon" style="width:32px;height:32px"><use href="#icon-party-popper"></use></svg><br>Нет пар</div>';
   } else {
     for (const p of activePairs) {
-      const typeClass = PAIR_TYPE_NAMES[p.type] || '';
       const typeFullName = PAIR_TYPE_NAMES[p.type] || p.type || '';
 
       const hwItems = getHwForPair(p.subject, p.type, dayData.date, p.subgroup);
@@ -2732,7 +2904,7 @@ function renderDaySchedule(day) {
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
               ${p.subgroup ? `<span class="pair-subgroup">${escHtml(p.subgroup)}</span>` : ''}
-              ${typeFullName ? `<span class="pair-type ${typeClass}">${escHtml(typeFullName)}</span>` : ''}
+              ${typeFullName ? `<span class="pair-type" data-type="${escHtml(p.type || '')}">${escHtml(typeFullName)}</span>` : ''}
               ${isWriter() ? `<button class="pair-add-hw" data-subj="${escHtml(baseSubj)}" data-type="${escHtml(pairTypeCode)}" data-subgroup="${subgroupNum}" title="Добавить ДЗ" data-anim="scale"><svg class="icon" style="width:16px;height:16px"><use href="#icon-plus"></use></svg></button>` : ''}
             </div>
           </div>
@@ -2772,8 +2944,9 @@ function renderDaySchedule(day) {
         doneHwIds.add(id);
       }
       saveDoneHw();
-      renderDaySchedule(day);
-      renderHomework();
+      // Точечное обновление — не перерисовываем весь день, чтобы не терялись
+      // фокус на кнопке и скролл.
+      updateHwDoneState(id);
     };
   });
 
@@ -2810,20 +2983,50 @@ function loadRoomStatuses(day, dayData) {
         badge.className = 'room-status open';
         badge.textContent = 'возможно открыта';
         badge.title = 'Показать предыдущую пару в аудитории';
+        // Доступность с клавиатуры: span получает роль кнопки только в состоянии
+        // open; Enter/Space вызывают тот же обработчик, что и клик.
+        badge.setAttribute('role', 'button');
+        badge.tabIndex = 0;
         badge.onclick = (e) => {
           e.stopPropagation();
-          showRoomPrevPair(room, res.prev);
+          showRoomPrevPair(room, res.prev, badge);
+        };
+        badge.onkeydown = (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            showRoomPrevPair(room, res.prev);
+          }
         };
       } else if (res.status === 'closed') {
         badge.className = 'room-status closed';
         badge.textContent = 'закрыта';
+        // Закрытая аудитория — просто информация: убираем интерактивность.
+        badge.removeAttribute('role');
+        badge.removeAttribute('tabindex');
+        badge.onclick = null;
+        badge.onkeydown = null;
       }
     }).catch(() => {});
   });
 }
 
-function showRoomPrevPair(room, prevText) {
-  alert('Аудитория ' + room + '\n\nПредыдущая пара:\n' + prevText);
+function showRoomPrevPair(room, prevText, originEl) {
+  const modal = document.getElementById('roomPrevModal');
+  if (!modal) return;
+  document.getElementById('roomPrevTitle').textContent = 'Аудитория ' + room;
+  document.getElementById('roomPrevText').textContent = 'Предыдущая пара:\n' + prevText;
+  openModal(modal, originEl);
+}
+
+// Закрытие модалки «Предыдущая пара» (крестик, кнопка ОК, клик по фону).
+{
+  const modal = document.getElementById('roomPrevModal');
+  if (modal) {
+    const close = () => closeModal(modal);
+    document.getElementById('closeRoomPrev').onclick = close;
+    document.getElementById('roomPrevOk').onclick = close;
+    modal.onclick = (e) => { if (e.target === modal) close(); };
+  }
 }
 
 // ── Sync UI ───────────────────────────────────────────────────
@@ -3141,9 +3344,9 @@ function hwTaskMarkup(task, fallback, hwId) {
   if (clean.length <= 120) {
     return `<span class="hw-text">${escHtml(clean)}</span>`;
   }
-  return `<span class="hw-text hw-view-link" data-hw-id="${escHtml(hwId || '')}" title="Открыть задание">`
+  return `<button type="button" class="hw-text hw-view-link" data-hw-id="${escHtml(hwId || '')}" title="Открыть задание">`
     + `${escHtml(clean.slice(0, 120))}… <span class="hw-open-hint">открыть</span>`
-    + `</span>`;
+    + `</button>`;
 }
 
 // Окно просмотра ДЗ с отрендеренной разметкой
@@ -3194,8 +3397,9 @@ function openHwViewer(hwId, originEl) {
     }
     saveDoneHw();
     renderDoneBtn();
-    renderHomework();
-    if (state.selectedDay) renderDaySchedule(state.selectedDay);
+    // Точечно синхронизируем расписание и нижний список за модалкой — без
+    // полного перерендера дня (фокус/скролл фона не теряются).
+    updateHwDoneState(hw.id);
   };
 
   editBtn.onclick = () => {
@@ -3222,6 +3426,7 @@ function attachHwViewLinks(container) {
 }
 
 setupKeyboardShortcuts();
+setupModalFocusTrap();
 
 // ── Calendar widget ──────────────────────────────────────────
 
@@ -3250,48 +3455,121 @@ function renderCalendar(year, month, selectedDateStr) {
     html += '<div class="cal-day-header">' + h + '</div>';
   }
 
-  // Дни предыдущего месяца
+  // Дни предыдущего месяца (недоступны — плейсхолдер)
   const startOffset = firstDay === 0 ? 6 : firstDay - 1;
   for (let i = startOffset - 1; i >= 0; i--) {
     const d = daysInPrev - i;
-    html += '<div class="cal-day other-month" data-date="">' + d + '</div>';
+    html += '<div class="cal-day other-month" data-date="" aria-hidden="true">' + d + '</div>';
   }
 
+  // Дни текущего месяца — настоящие кнопки (доступны с клавиатуры).
+  // Roving tabindex: выбранный день (или первый доступный) получает tabindex=0,
+  // остальные — -1, чтобы в Tab-порядке был только один элемент календаря.
+  let anchorSet = false;
   for (let d = 1; d <= daysInMonth; d++) {
     const date = new Date(year, month, d);
     const dateStr = formatDateISO(date);
+    if (dateStr < todayStr) {
+      // Прошлое недоступно — не кнопка.
+      html += '<div class="cal-day other-month" data-date="" aria-hidden="true" title="Прошедшая дата">' + d + '</div>';
+      continue;
+    }
     let cls = 'cal-day';
     if (dateStr === todayStr) cls += ' today';
     if (dateStr === selected) cls += ' selected';
-    if (dateStr < todayStr) cls += ' other-month'; // прошлое недоступно
-    html += '<div class="' + cls + '" data-date="' + dateStr + '">' + d + '</div>';
+    let tabIndex = '-1';
+    if (dateStr === selected) {
+      tabIndex = '0';
+      anchorSet = true;
+    } else if (!anchorSet) {
+      tabIndex = '0';
+      anchorSet = true;
+    }
+    const ariaSelected = dateStr === selected ? 'true' : 'false';
+    const ariaCurrent = dateStr === todayStr ? ' aria-current="date"' : '';
+    html += '<button type="button" class="' + cls + '" data-date="' + dateStr +
+      '" tabindex="' + tabIndex + '" aria-selected="' + ariaSelected + '"' + ariaCurrent + '>' + d + '</button>';
   }
 
-  // Дни следующего месяца
+  // Дни следующего месяца (недоступны — плейсхолдер)
   const totalCells = startOffset + daysInMonth;
   const remaining = (7 - (totalCells % 7)) % 7;
   for (let d = 1; d <= remaining; d++) {
-    html += '<div class="cal-day other-month" data-date="">' + d + '</div>';
+    html += '<div class="cal-day other-month" data-date="" aria-hidden="true">' + d + '</div>';
   }
 
   grid.innerHTML = html;
 
-  grid.querySelectorAll('.cal-day').forEach(el => {
-    const dateStr = el.dataset.date;
-    if (!dateStr) return;
-    if (dateStr < todayStr) {
-      el.style.cursor = 'default';
-      el.title = 'Прошедшая дата';
-      return;
-    }
-    el.onclick = () => {
-      document.querySelectorAll('.cal-day.selected').forEach(c => c.classList.remove('selected'));
-      el.classList.add('selected');
-      document.getElementById('hwDateSelected').textContent = formatDateDisplay(dateStr);
-      calState.selectedDate = dateStr;
-      updateSaveBtnState();
-    };
+  grid.querySelectorAll('.cal-day[data-date]').forEach(el => {
+    if (el.dataset.date) el.onclick = () => selectCalendarDay(el.dataset.date);
   });
+}
+
+// Выбор дня в календаре (клик по кнопке или навигация стрелками):
+// подсветка, roving tabindex, aria-selected, подпись и состояние сохранения.
+function selectCalendarDay(dateStr) {
+  document.querySelectorAll('.hw-cal-grid button.cal-day').forEach(btn => {
+    const isSel = btn.dataset.date === dateStr;
+    btn.classList.toggle('selected', isSel);
+    btn.setAttribute('aria-selected', isSel ? 'true' : 'false');
+    btn.tabIndex = isSel ? 0 : -1;
+  });
+  document.getElementById('hwDateSelected').textContent = formatDateDisplay(dateStr);
+  calState.selectedDate = dateStr;
+  updateSaveBtnState();
+}
+
+// Клавиатурная навигация по календарю: ←/→ — день, ↑/↓ — неделя,
+// Home/End — начало/конец месяца. Enter/Space работают нативно (кнопки).
+function onCalGridKeydown(e) {
+  const grid = document.getElementById('hwCalGrid');
+  const buttons = Array.prototype.slice.call(grid.querySelectorAll('button.cal-day'));
+  if (!buttons.length) return;
+  const idx = buttons.indexOf(document.activeElement);
+  if (idx === -1) return; // фокус не на дне календаря — не перехватываем
+
+  const dayOfMonth = (btn) => Number(btn.dataset.date.split('-')[2]);
+  const moveTo = (btn) => {
+    btn.focus();
+    selectCalendarDay(btn.dataset.date);
+  };
+
+  let target = null;
+  switch (e.key) {
+    case 'ArrowLeft':
+      if (idx > 0) target = buttons[idx - 1];
+      break;
+    case 'ArrowRight':
+      if (idx < buttons.length - 1) target = buttons[idx + 1];
+      break;
+    case 'ArrowUp':
+      // Та же колонка неделей выше (грид строго по 7 колонок).
+      if (dayOfMonth(buttons[idx]) - 7 >= 1) {
+        target = buttons.find(b => dayOfMonth(b) === dayOfMonth(buttons[idx]) - 7) || null;
+      }
+      break;
+    case 'ArrowDown':
+      if (dayOfMonth(buttons[idx]) + 7 <= new Date(calState.year, calState.month + 1, 0).getDate()) {
+        target = buttons.find(b => dayOfMonth(b) === dayOfMonth(buttons[idx]) + 7) || null;
+      }
+      break;
+    case 'Home':
+      target = buttons[0];
+      break;
+    case 'End':
+      target = buttons[buttons.length - 1];
+      break;
+    default:
+      return; // другие клавиши не трогаем
+  }
+  if (target) {
+    e.preventDefault();
+    moveTo(target);
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' ||
+             e.key === 'ArrowUp' || e.key === 'ArrowDown' ||
+             e.key === 'Home' || e.key === 'End') {
+    e.preventDefault();
+  }
 }
 
 function formatDateISO(date) {
@@ -3512,6 +3790,9 @@ function setupHomeworkModal() {
     calState.year = newYear;
     calState.month = newMonth;
   };
+
+  // Клавиатурная навигация по дням календаря (свойство onkeydown — без дублей).
+  document.getElementById('hwCalGrid').onkeydown = onCalGridKeydown;
 
   // Save
   const deleteBtn = document.getElementById('deleteHomework');
@@ -4133,7 +4414,9 @@ function renderHomework() {
      btn.onclick = () => {
        doneHwIds.add(btn.dataset.id);
        saveDoneHw();
-       renderHomework();
+       // Убираем карточку из списка точечно (и обновляем день, если виден) —
+       // без полного перерендера, чтобы не терялись фокус и скролл.
+       updateHwDoneState(btn.dataset.id);
      };
    });
 
@@ -4254,7 +4537,7 @@ function setupInviteSection() {
         return `
           <div class="invite-item" data-id="${escHtml(it.id)}">
             <div class="invite-meta">
-              <span class="invite-id invite-copy" title="Нажмите, чтобы скопировать ссылку">#${escHtml(it.id)}</span>
+              <button type="button" class="invite-id invite-copy" title="Нажмите, чтобы скопировать ссылку">#${escHtml(it.id)}</button>
               <span class="invite-label-text">${label || '<i>без названия</i>'}</span>
               <span class="invite-date">${created}</span>
             </div>
@@ -4453,13 +4736,15 @@ function setupSettingsModal() {
     document.getElementById('settingsBtn').onclick = () => {
       groupInput.value = state.group;
       updateSaveGroupBtnState();
+      // Если блок подтверждения сброса отметок остался открытым с прошлого раза — прячем.
+      if (typeof resetDoneHideConfirm === 'function') resetDoneHideConfirm();
       document.getElementById('campusToggle').checked = state.campusEnabled;
       document.getElementById('subgroupFilter').value = state.subgroupFilter || 'any';
       document.getElementById('lastSyncInfo').textContent = formatDateTime(state.lastSyncAt);
       document.getElementById('campusUpdatedInfo').textContent = formatDateTime(state.campusUpdatedAt);
       // Тема
       const themeRadios = document.querySelectorAll('input[name="theme-mode"]');
-      themeRadios.forEach((r) => { r.checked = (r.value === (state.theme || 'dark')); });
+      themeRadios.forEach((r) => { r.checked = (r.value === (state.theme || 'auto')); });
       // Акцент
       buildAccentPicker();
       // Роль (вынесена из шапки)
@@ -4538,14 +4823,32 @@ function setupSettingsModal() {
     });
   });
 
-  document.getElementById('resetDoneHw').onclick = () => {
-    if (!confirm('Сбросить все отметки «выполнено» для группы ' + state.group + '?')) return;
+  // Встроенное подтверждение сброса отметок «выполнено» (без нативного confirm):
+  // клик по кнопке показывает блок «Точно сбросить?» с кнопками Сбросить/Отмена.
+  const resetDoneBtn = document.getElementById('resetDoneHw');
+  const resetDoneConfirm = document.getElementById('resetDoneConfirm');
+
+  function resetDoneShowConfirm() {
+    document.getElementById('resetDoneGroup').textContent = state.group;
+    resetDoneBtn.classList.add('hidden');
+    resetDoneConfirm.classList.remove('hidden');
+  }
+
+  function resetDoneHideConfirm() {
+    resetDoneConfirm.classList.add('hidden');
+    resetDoneBtn.classList.remove('hidden');
+  }
+
+  resetDoneBtn.onclick = resetDoneShowConfirm;
+  document.getElementById('resetDoneYes').onclick = () => {
     doneHwIds.clear();
     saveDoneHw();
     renderHomework();
     if (state.schedule) renderDayTabs();
     showToast('Отметки выполненных ДЗ сброшены', 'ok');
+    resetDoneHideConfirm();
   };
+  document.getElementById('resetDoneNo').onclick = resetDoneHideConfirm;
 
   // Мгновенное переключение подгруппы — без кнопки «Сохранить».
   document.getElementById('subgroupFilter').addEventListener('change', function() {
@@ -4610,8 +4913,8 @@ function setupSettingsModal() {
       doneHwIds = loadDoneHw();
     }
 
-    // Показываем загрузку в UI.
-    document.getElementById('scheduleContent').innerHTML = '<div class="loading">Загрузка...</div>';
+    // Показываем загрузку в UI (скелетон вместо текста).
+    document.getElementById('scheduleContent').innerHTML = skeletonScheduleHTML();
     document.getElementById('homeworkList').innerHTML = '';
     document.getElementById('weekLabel').textContent = 'Загрузка...';
     document.getElementById('dayTabs').innerHTML = '';
@@ -4652,8 +4955,14 @@ let toastTimer = null;
 function showToast(msg, kind) {
   const el = document.getElementById('toast');
   if (!el) return;
-  el.textContent = msg;
+  // Сначала убираем display:none, потом задаём роль и меняем контент —
+  // чтобы мутация происходила в уже видимом live-регионе и озвучивалась скринридером.
   el.className = 'toast' + (kind ? ' toast-' + kind : '');
+  // Ошибки — прерывающая озвучка (role=alert/assertive), остальное — вежливая (status/polite).
+  const isError = kind === 'error';
+  el.setAttribute('role', isError ? 'alert' : 'status');
+  el.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+  el.textContent = msg;
   // force reflow so transition runs on repeated calls
   void el.offsetWidth;
   el.classList.add('toast-show');
@@ -4746,6 +5055,10 @@ function fallbackCopy(text, done) {
 
 // Rubber‑band overscroll (iOS‑like bounce)
 (function(){
+  // «Меньше движения»: физическая «пружинная» анимация отключается —
+  // скролл остаётся обычным.
+  if (prefersReducedMotion()) return;
+
   var el = document.querySelector('.container') || document.body;
   var offset = 0, raf = null;
   var DAMP = 0.35, DECAY = 0.82, THR = 0.5;
