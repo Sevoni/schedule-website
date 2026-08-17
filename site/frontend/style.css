@@ -150,7 +150,7 @@ header {
   border: none;
   color: var(--text-dim);
   cursor: pointer;
-  padding: 10px; /* тач-таргет 20px иконка + 2×10px = 40px */
+  padding: 8px;
   border-radius: 8px;
   transition: background 0.2s, color 0.2s;
   display: inline-flex;
@@ -232,8 +232,7 @@ header {
   cursor: pointer;
   text-decoration: underline;
   font-size: inherit;
-  padding: 10px 8px;
-  margin: -10px -8px;
+  padding: 0;
 }
 
 #groupName {
@@ -264,16 +263,11 @@ header {
   color: var(--text);
   width: 36px;
   height: 36px;
-  min-width: 40px;
-  min-height: 40px;
   flex-shrink: 0;
   border-radius: 8px;
   cursor: pointer;
   font-size: 0.9rem;
   transition: all 0.2s;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
 }
 
 .nav-btn:hover {
@@ -597,8 +591,6 @@ header {
   color: var(--green, #4caf50);
   cursor: pointer;
   text-decoration: underline dotted;
-  padding: 6px 4px;
-  margin: -6px -4px;
 }
 
 .room-status.closed {
@@ -725,8 +717,8 @@ header {
 }
 
 .pair-add-hw {
-  min-width: 40px;
-  min-height: 40px;
+  width: 28px;
+  height: 28px;
   padding: 4px;
   border: 1px solid var(--border);
   border-radius: 9px;
@@ -792,7 +784,7 @@ header {
 
 .error-msg button {
   margin-top: 12px;
-  padding: 10px 24px;
+  padding: 8px 20px;
   background: var(--red);
   color: var(--on-accent);
   border: none;
@@ -823,7 +815,7 @@ header {
 }
 
 .add-btn {
-  padding: 10px 16px;
+  padding: 6px 14px;
   background: var(--accent);
   color: var(--on-accent);
   border: none;
@@ -924,8 +916,8 @@ header {
   cursor: pointer;
   font-size: 1.1rem;
   padding: 0;
-  min-width: 40px;
-  min-height: 40px;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1088,15 +1080,15 @@ header {
 }
 .group-input-wrap input {
   width: 100%;
-  padding-right: 56px;
+  padding-right: 48px;
   border-radius: 8px;
 }
 .group-save-btn {
   position: absolute;
   right: 4px;
-  top: 2px;
-  bottom: 2px;
-  min-width: 40px;
+  top: 4px;
+  bottom: 4px;
+  width: 36px;
   flex-shrink: 0;
   border: none;
   border-radius: 6px;
@@ -1536,10 +1528,7 @@ header {
   color: var(--text);
   cursor: pointer;
   font-size: 1rem;
-  padding: 10px 12px; /* тач-таргет ~40px */
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  padding: 4px 8px;
 }
 
 .hw-cal-header button:hover {
@@ -1567,7 +1556,7 @@ header {
 /* Дни — настоящие <button> (доступны с клавиатуры): сбрасываем UA-стили,
    чтобы внешний вид остался прежним (font-family/color наследуем, font-size свой) */
 .hw-cal-grid .cal-day {
-  padding: 10px 0;
+  padding: 6px 0;
   font-size: 0.85rem;
   font-family: inherit;
   line-height: inherit;
@@ -1845,7 +1834,7 @@ header {
 .role-status .role-action {
   display: block;
   margin-top: 8px;
-  padding: 10px 14px;
+  padding: 6px 10px;
   font-size: 0.85rem;
 }
 
@@ -1989,8 +1978,8 @@ header {
   position: relative;
   display: grid;
   place-items: center;
-  width: 40px;
-  height: 40px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   border: 2px solid var(--border);
   cursor: pointer;
@@ -2135,8 +2124,6 @@ header {
 .invite-copy {
   cursor: pointer;
   text-decoration: underline dotted;
-  padding: 6px 4px;
-  margin: -6px -4px;
 }
 .invite-copy:hover {
   opacity: 0.8;
@@ -2149,7 +2136,7 @@ header {
   font-size: 0.8rem;
 }
 .revoke-btn {
-  padding: 11px 12px;
+  padding: 6px 12px;
   border-radius: 8px;
   border: 1px solid var(--danger);
   background: none;
@@ -2171,7 +2158,7 @@ header {
   flex-shrink: 0;
 }
 .rename-btn {
-  padding: 11px 10px;
+  padding: 6px 9px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: none;
@@ -2179,9 +2166,6 @@ header {
   font-size: 0.85rem;
   cursor: pointer;
   transition: all 0.2s;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
 }
 .rename-btn:hover {
   background: var(--surface-hover);
@@ -2203,7 +2187,7 @@ header {
   min-width: 0;
 }
 .rename-wrap .btn-secondary {
-  padding: 10px 12px;
+  padding: 6px 10px;
   font-size: 0.85rem;
 }
 
