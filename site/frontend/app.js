@@ -897,7 +897,7 @@ function hideStartPage() {
   setTimeout(() => {
     el.classList.add('hidden');
     el.classList.remove('fade-out');
-  }, prefersReducedMotion() ? 0 : 300);
+  }, 300);
 }
 
 function setupStartPage() {
