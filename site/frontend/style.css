@@ -2488,3 +2488,11 @@ header {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* Стартовая страница: инпуту outline не нужен — индикатор фокуса даёт
+   скруглённая «таблетка» .start-page-search:focus-within. Без этого
+   глобальное :focus-visible выше рисует прямоугольный контур поверх
+   скруглённой рамки (одинаковая специфичность, но правило стоит позже). */
+.start-page-input:focus-visible {
+  outline: none;
+}
