@@ -572,6 +572,20 @@ export default {
         return await handleRecalcHw(request, env, corsHeaders);
       }
 
+      // ── Announcements (глобальные объявления от owner) ──
+      if (path === '/api/announcements' && method === 'GET') {
+        return await cachedGet(request, env, corsHeaders, () => handleGetAnnouncements(request, env, corsHeaders), context);
+      }
+      if (path === '/api/announcements' && method === 'POST') {
+        return await handleAddAnnouncement(request, env, corsHeaders);
+      }
+      if (path === '/api/announcements' && method === 'PUT') {
+        return await handleUpdateAnnouncement(request, env, corsHeaders);
+      }
+      if (path === '/api/announcements' && method === 'DELETE') {
+        return await handleDeleteAnnouncement(request, env, corsHeaders);
+      }
+
       // ── Campus sync (frontend-parse flow) ───────────────
       if (path === '/api/check-campus-update' && method === 'POST') {
         const guard = await requireWriter(request, env, corsHeaders);
@@ -2429,6 +2443,168 @@ async function handleRecalcHw(request, env, corsHeaders) {
   return jsonResponse({ ok: true, ...result }, corsHeaders);
 }
 
+// ── Объявления (глобальные, для всех посетителей сайта) ─────────
+//
+// KV/D1-ключ: announcements -> JSON [ { id, text, createdAt, updatedAt? }, ... ]
+// Новые сверху. Пишет ТОЛЬКО owner (writer'ы и reader'ы — 403).
+// Лимит MAX_ANNOUNCEMENTS записей: при переполнении старые вытесняются,
+// чтобы объём записи в D1 был ограничен независимо от поведения owner'а.
+//
+// GET  /api/announcements   — публичный, кешируется CDN (cachedGet)
+// POST /api/announcements   — owner, body { text }
+// PUT  /api/announcements   — owner, body { id, text } (ставит updatedAt)
+// DELETE /api/announcements?id= — owner
+
+const ANNOUNCEMENTS_KEY = 'announcements';
+const MAX_ANNOUNCEMENTS = 20;
+const ANNOUNCEMENT_TTL = 21600000; // ≈250 дней, как у остальных контентных ключей
+const ANNOUNCEMENT_ID_RE = /^[0-9a-f]{32}$/i;
+
+// Единая проверка «только owner» + CSRF-guard для cookie-авторизации.
+// Паттерн тот же, что в handleInviteCreate: writer явно отклоняется.
+async function requireOwner(request, env, corsHeaders) {
+  const auth = await resolveAuth(request, env);
+  if (!auth || auth.role !== 'owner') {
+    return { error: jsonResponse({ error: 'Forbidden: only owner can manage announcements' }, corsHeaders, 403) };
+  }
+  const csrf = csrfGuardForCookieAuth(auth, request, corsHeaders);
+  if (csrf) return { error: csrf };
+  return { auth };
+}
+
+function loadAnnouncements(store) {
+  return store.get(ANNOUNCEMENTS_KEY, { type: 'json' }).then((v) => (Array.isArray(v) ? v : []));
+}
+
+// GET /api/announcements — публичный список. Данные не зависят от группы и
+// роли, поэтому cacheControlForGet достаточно: reader'ам public+CDN,
+// owner/writer (Bearer или кука) — private no-store (свежий список).
+async function handleGetAnnouncements(request, env, corsHeaders) {
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+  const items = await loadAnnouncements(store);
+  return jsonResponse({ items }, corsHeaders, 200, { cacheControl: await cacheControlForGet(request, env), isPrivate: await isAuthRequest(request, env) });
+}
+
+// POST /api/announcements — создать объявление.
+async function handleAddAnnouncement(request, env, corsHeaders) {
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  const own = await requireOwner(request, env, corsHeaders);
+  if (own.error) return own.error;
+
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+
+  // sanitizeString срезает длину И управляющие символы (\t\n\r сохраняются —
+  // фронту они нужны для переносов строк через white-space:pre-wrap).
+  const text = sanitizeString(bb.json.text, 2000).trim();
+  if (!text) {
+    return jsonResponse({ error: 'Missing announcement text' }, corsHeaders, 400);
+  }
+
+  const item = { id: crypto.randomUUID().replace(/-/g, ''), text, createdAt: new Date().toISOString() };
+
+  // RMW-цикл под withKeyLock — иначе два параллельных POST owner'а
+  // перезаписали бы список (потеря объявления), см. handleAddHw/handleInviteCreate.
+  let overflow = false;
+  await withKeyLock(ANNOUNCEMENTS_KEY, async () => {
+    const list = await loadAnnouncements(store);
+    list.unshift(item);
+    if (list.length > MAX_ANNOUNCEMENTS) {
+      list.length = MAX_ANNOUNCEMENTS;
+      overflow = true;
+    }
+    await store.put(ANNOUNCEMENTS_KEY, JSON.stringify(list), { expirationTtl: ANNOUNCEMENT_TTL });
+  });
+
+  await purgeAnnouncementsCdnCache(env);
+  return jsonResponse({ ok: true, item, overflow }, corsHeaders);
+}
+
+// PUT /api/announcements — отредактировать текст объявления.
+// createdAt не меняем (порядок списка стабилен), ставим updatedAt — по нему
+// фронт считает объявление «непрочитанным» повторно.
+async function handleUpdateAnnouncement(request, env, corsHeaders) {
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  const own = await requireOwner(request, env, corsHeaders);
+  if (own.error) return own.error;
+
+  const bb = await readJsonBody(request);
+  if (bb.tooLarge) return jsonResponse({ error: 'Payload Too Large' }, corsHeaders, 413);
+  if (bb.parseError) return jsonResponse({ error: 'Bad JSON' }, corsHeaders, 400);
+
+  const id = typeof bb.json.id === 'string' ? bb.json.id : '';
+  if (!ANNOUNCEMENT_ID_RE.test(id)) {
+    return jsonResponse({ error: 'Invalid id' }, corsHeaders, 400);
+  }
+  const text = sanitizeString(bb.json.text, 2000).trim();
+  if (!text) {
+    return jsonResponse({ error: 'Missing announcement text' }, corsHeaders, 400);
+  }
+
+  let updated = null;
+  await withKeyLock(ANNOUNCEMENTS_KEY, async () => {
+    const list = await loadAnnouncements(store);
+    const it = list.find((a) => a && a.id === id);
+    if (it) {
+      it.text = text;
+      it.updatedAt = new Date().toISOString();
+      updated = it;
+      await store.put(ANNOUNCEMENTS_KEY, JSON.stringify(list), { expirationTtl: ANNOUNCEMENT_TTL });
+    }
+  });
+
+  if (!updated) {
+    // Идемпотентная семантика без oracle существования: чужой/устаревший id
+    // просто ни к чему не приводит.
+    return jsonResponse({ ok: true, updated: false }, corsHeaders);
+  }
+
+  await purgeAnnouncementsCdnCache(env);
+  return jsonResponse({ ok: true, updated: true, item: updated }, corsHeaders);
+}
+
+// DELETE /api/announcements?id= — удалить объявление.
+async function handleDeleteAnnouncement(request, env, corsHeaders) {
+  const store = createStore(env);
+  if (!env.DB) {
+    return jsonResponse({ error: 'DB not configured' }, corsHeaders, 500);
+  }
+
+  const own = await requireOwner(request, env, corsHeaders);
+  if (own.error) return own.error;
+
+  const url = new URL(request.url);
+  const id = url.searchParams.get('id') || '';
+  if (!ANNOUNCEMENT_ID_RE.test(id)) {
+    return jsonResponse({ error: 'Invalid id' }, corsHeaders, 400);
+  }
+
+  let removed = false;
+  await withKeyLock(ANNOUNCEMENTS_KEY, async () => {
+    const list = await loadAnnouncements(store);
+    const next = list.filter((a) => !(a && a.id === id));
+    if (next.length !== list.length) {
+      removed = true;
+      await store.put(ANNOUNCEMENTS_KEY, JSON.stringify(next), { expirationTtl: ANNOUNCEMENT_TTL });
+    }
+  });
+
+  if (removed) await purgeAnnouncementsCdnCache(env);
+  return jsonResponse({ ok: true, removed }, corsHeaders);
+}
+
 // ── Семестр (ключ для storage) ─────────────────────────────────────
 // Границы: 31 января → весна (31.01 - 30.06), 1 августа → осень (01.08 - 30.01).
 // Возвращает строку вида "2025-2026-весна" / "2026-2027-осень".
@@ -2859,6 +3035,20 @@ async function purgeGroupCdnCache(env, group, changedWeeks = []) {
     );
   } catch (e) {
     console.log('[cache] purge failed (ignored):', e.message);
+  }
+}
+
+// Инвалидация CDN-кеша объявлений после записи. URL один и без query-параметров,
+// поэтому purge детерминирован (в отличие от комбинаций /api/schedules?weeks=).
+async function purgeAnnouncementsCdnCache(env) {
+  try {
+    if (typeof caches === 'undefined' || !caches.default) return;
+    const base = new URL(env.INVITE_ORIGIN || 'https://kampussgu.dpdns.org');
+    await caches.default
+      .delete(new URL('/api/announcements', base).toString(), { ignoreMethod: true })
+      .catch(() => {});
+  } catch (e) {
+    console.log('[cache] announcements purge failed (ignored):', e.message);
   }
 }
 

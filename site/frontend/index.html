@@ -44,6 +44,7 @@
       <div class="header-top">
         <h1><svg class="icon icon-h1"><use href="#icon-calendar"></use></svg> Расписание</h1>
         <div class="header-actions">
+          <button id="bellBtn" class="icon-btn bell-btn" title="Объявления" aria-label="Объявления" data-anim="ring"><svg class="icon"><use href="#icon-bell"></use></svg><span id="bellDot" class="bell-dot hidden" aria-hidden="true"></span></button>
           <button id="syncBtn" class="icon-btn" title="Синхронизировать" aria-label="Синхронизировать" data-anim="spin"><svg class="icon"><use href="#icon-refresh-cw"></use></svg></button>
           <button id="settingsBtn" class="icon-btn" title="Настройки" aria-label="Настройки" data-anim="spin"><svg class="icon"><use href="#icon-settings"></use></svg></button>
         </div>
@@ -335,6 +336,29 @@
     </div>
   </div>
 
+  <div id="announcementsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="announcementsTitle">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="announcementsTitle"><svg class="icon icon-h2"><use href="#icon-bell"></use></svg> Объявления</h2>
+        <button id="closeAnnouncements" class="icon-btn" aria-label="Закрыть" data-anim="scale"><svg class="icon"><use href="#icon-x"></use></svg></button>
+      </div>
+      <div class="modal-body">
+        <div id="announcementOwnerBlock" class="announcement-owner-block" style="display:none;">
+          <label>
+            Новое объявление
+            <textarea id="announcementText" rows="3" maxlength="2000" placeholder="Текст объявления для всех студентов..."></textarea>
+          </label>
+          <div class="announcement-form-actions">
+            <button id="saveAnnouncement" class="save-btn">Опубликовать</button>
+            <button id="cancelAnnouncementEdit" class="btn-secondary hidden">Отмена</button>
+          </div>
+          <div id="announcementMsg" class="invite-msg hidden"></div>
+        </div>
+        <div id="announcementList" class="announcement-list"></div>
+      </div>
+    </div>
+  </div>
+
   <div id="roomPrevModal" class="modal hidden">
     <div class="modal-content">
       <div class="modal-header">
@@ -359,6 +383,15 @@
       <circle cx="12" cy="12" r="10" />
       <line x1="12" x2="12" y1="8" y2="12" />
       <line x1="12" x2="12.01" y1="16" y2="16" />
+    </symbol>
+    <symbol id="icon-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <!-- Короткая прямая «ножка» сверху: нижний конец заходит в купол (купол
+           опущен translate(0 1.75)), чтобы деталь выглядела цельной. -->
+      <path d="M12 2v2.5" />
+      <g transform="translate(0 1.75)">
+        <path d="M10.268 21a2 2 0 0 0 3.464 0" />
+        <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326" />
+      </g>
     </symbol>
     <symbol id="icon-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M8 2v4" />

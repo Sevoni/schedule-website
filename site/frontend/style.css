@@ -193,6 +193,58 @@ header {
   to { transform: rotate(-360deg); }
 }
 
+/* ── Кнопка-колокольчик (объявления) ───────────────────────── */
+.bell-btn {
+  position: relative;
+}
+/* Красная точка непрочитанных объявлений поверх иконки. pointer-events:none —
+   клик по точке не «теряется», а открывает модалку как клик по кнопке. */
+.bell-dot {
+  position: absolute;
+  top: 6px;
+  right: 7px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--danger);
+  border: 2px solid var(--bg);
+  pointer-events: none;
+  animation: bellDotPulse 2s ease-in-out infinite;
+}
+@keyframes bellDotPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.8); opacity: 0.75; }
+}
+/* Анимация «звонка» при клике (data-anim="ring"): качание вокруг верхнего
+   крепления, как настоящий колокол. */
+.icon-btn.anim-ring .icon {
+  animation: ringOnce 0.6s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  transform-origin: 50% 10%;
+}
+@keyframes ringOnce {
+  0%   { transform: rotate(0deg); }
+  15%  { transform: rotate(16deg); }
+  30%  { transform: rotate(-13deg); }
+  45%  { transform: rotate(9deg); }
+  60%  { transform: rotate(-6deg); }
+  75%  { transform: rotate(3deg); }
+  100% { transform: rotate(0deg); }
+}
+/* Обратный звонок при закрытии модалки объявлений (как anim-spin-reverse у настроек). */
+.icon-btn.anim-ring-reverse .icon {
+  animation: ringOnceReverse 0.6s cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  transform-origin: 50% 10%;
+}
+@keyframes ringOnceReverse {
+  0%   { transform: rotate(0deg); }
+  15%  { transform: rotate(-16deg); }
+  30%  { transform: rotate(13deg); }
+  45%  { transform: rotate(-9deg); }
+  60%  { transform: rotate(6deg); }
+  75%  { transform: rotate(-3deg); }
+  100% { transform: rotate(0deg); }
+}
+
 .group-info {
   display: flex;
   align-items: center;
@@ -2495,4 +2547,63 @@ header {
    скруглённой рамки (одинаковая специфичность, но правило стоит позже). */
 .start-page-input:focus-visible {
   outline: none;
+}
+
+/* ── Объявления (модалка колокольчика) ─────────────────────── */
+.announcement-owner-block {
+  margin-bottom: 14px;
+}
+.announcement-form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.announcement-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.announcement-item {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+.announcement-item.is-new {
+  border-color: var(--accent);
+}
+.announcement-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+.announcement-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+.announcement-edited {
+  font-style: italic;
+}
+.announcement-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+.announcement-actions .icon-btn {
+  padding: 4px;
+  border-radius: 6px;
+}
+.announcement-actions .icon-btn .icon {
+  width: 15px;
+  height: 15px;
+}
+.announcement-empty {
+  text-align: center;
+  color: var(--text-dim);
+  padding: 18px 0;
 }

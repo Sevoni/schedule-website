@@ -94,6 +94,8 @@ let state = {
   currentWeekIdx: -1,
   selectedDay: null,
   homework: [],
+  // Глобальные объявления owner'а (колокольчик). Общие для всех групп.
+  announcements: [],
   syncing: false,
   // Тема оформления: 'dark' | 'light' | 'auto'. По умолчанию — системная (auto):
   // при первом открытии берётся prefers-color-scheme, ручной выбор сохраняется.
@@ -402,7 +404,7 @@ function setupAnimations() {
     const btn = e.target.closest('[data-anim]');
     if (!btn) return;
     const type = btn.getAttribute('data-anim');
-    const map = { spin: 'anim-spin', scale: 'anim-scale', 'slide-right': 'anim-slide-right', 'slide-left': 'anim-slide-left' };
+    const map = { spin: 'anim-spin', scale: 'anim-scale', ring: 'anim-ring', 'slide-right': 'anim-slide-right', 'slide-left': 'anim-slide-left' };
     const cls = map[type];
     if (!cls) return;
     btn.classList.remove(cls);
@@ -525,7 +527,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupHomeworkModal();
   setupTgSection();
   setupInviteSection();
+  setupAnnouncements();
   setupStartPage();
+
+  // Объявления глобальные (не зависят от группы) — фоновая проверка
+  // непрочитанных для красной точки на колокольчике. Fire-and-forget:
+  // не блокирует загрузку, работает и на стартовой странице без группы.
+  refreshAnnouncementsBadge();
 
   // Если группы нет в localStorage — сразу показываем стартовую страницу,
   // чтобы не мелькало расписание группы по умолчанию из HTML, пока идут
@@ -4639,6 +4647,211 @@ function setupInviteSection() {
     const divider = document.getElementById('inviteDivider');
     if (divider) divider.style.display = show ? '' : 'none';
     if (show) loadInvites();
+  };
+}
+
+// ── Объявления (колокольчик в шапке) ────────────────────────────
+//
+// Глобальные объявления owner'а: GET /api/announcements публичный
+// (CDN-кеш), POST/PUT/DELETE — только owner. Непрочитанность считается
+// ЛОКАЛЬНО: в localStorage храним метку announcementsLastSeen —
+// createdAt/updatedAt самого свежего просмотренного объявления. Красная
+// точка горит, пока есть объявление новее метки; открытие модалки
+// помечает всё просмотренным.
+
+const ANN_SEEN_KEY = 'announcementsLastSeen';
+let editingAnnouncementId = null;
+
+// Метка «новизны» объявления: правка (updatedAt) делает его непрочитанным снова.
+function announcementItemTs(it) {
+  return it.updatedAt || it.createdAt || '';
+}
+
+function loadAnnouncementsSeen() {
+  try { return localStorage.getItem(ANN_SEEN_KEY) || ''; } catch (e) { return ''; }
+}
+
+function saveAnnouncementsSeen(ts) {
+  try { localStorage.setItem(ANN_SEEN_KEY, ts); } catch (e) { /* квота — игнорируем */ }
+}
+
+function updateAnnouncementsBadge() {
+  const dot = document.getElementById('bellDot');
+  if (!dot) return;
+  const seen = loadAnnouncementsSeen();
+  const hasNew = state.announcements.some((it) => announcementItemTs(it) > seen);
+  dot.classList.toggle('hidden', !hasNew);
+}
+
+// Фоновая проверка при загрузке страницы (fire-and-forget): зажигаем точку,
+// не открывая модалку. Ошибка сети/воркера — точка просто не зажжётся.
+async function refreshAnnouncementsBadge() {
+  try {
+    const res = await apiFetch('/api/announcements');
+    state.announcements = Array.isArray(res.items) ? res.items : [];
+    updateAnnouncementsBadge();
+  } catch (e) {
+    console.warn('[announcements] badge refresh failed:', e.message);
+  }
+}
+
+function resetAnnouncementForm() {
+  editingAnnouncementId = null;
+  const ta = document.getElementById('announcementText');
+  const saveBtn = document.getElementById('saveAnnouncement');
+  const cancelBtn = document.getElementById('cancelAnnouncementEdit');
+  if (ta) ta.value = '';
+  if (saveBtn) saveBtn.textContent = 'Опубликовать';
+  if (cancelBtn) cancelBtn.classList.add('hidden');
+}
+
+function renderAnnouncements() {
+  const listEl = document.getElementById('announcementList');
+  if (!listEl) return;
+
+  if (!state.announcements.length) {
+    listEl.innerHTML = '<div class="announcement-empty">Объявлений нет</div>';
+    return;
+  }
+
+  const seen = loadAnnouncementsSeen();
+  listEl.innerHTML = state.announcements.map((it) => {
+    const isNew = announcementItemTs(it) > seen;
+    const date = it.createdAt ? formatDateTime(it.createdAt) : '';
+    const edited = it.updatedAt
+      ? '<span class="announcement-edited">изменено ' + escHtml(formatDateTime(it.updatedAt)) + '</span>'
+      : '';
+    // Кнопки управления — только для owner (сервер всё равно отклонит
+    // чужие POST/PUT/DELETE, здесь лишь косметика интерфейса).
+    const actions = isOwner()
+      ? '<span class="announcement-actions">' +
+        '<button type="button" class="icon-btn ann-edit" data-id="' + escHtml(it.id) + '" title="Редактировать" data-anim="scale"><svg class="icon"><use href="#icon-pencil"></use></svg></button>' +
+        '<button type="button" class="icon-btn ann-delete" data-id="' + escHtml(it.id) + '" title="Удалить" data-anim="scale"><svg class="icon"><use href="#icon-trash-2"></use></svg></button>' +
+        '</span>'
+      : '';
+    return (
+      '<div class="announcement-item' + (isNew ? ' is-new' : '') + '">' +
+        '<div class="announcement-text">' + escHtml(it.text) + '</div>' +
+        '<div class="announcement-meta">' +
+          '<span>' + escHtml(date) + '</span>' + edited + actions +
+        '</div>' +
+      '</div>'
+    );
+  }).join('');
+
+  listEl.querySelectorAll('.ann-edit').forEach((btn) => {
+    btn.onclick = () => {
+      const item = state.announcements.find((a) => a.id === btn.dataset.id);
+      if (!item) return;
+      editingAnnouncementId = item.id;
+      document.getElementById('announcementText').value = item.text;
+      document.getElementById('saveAnnouncement').textContent = 'Сохранить';
+      document.getElementById('cancelAnnouncementEdit').classList.remove('hidden');
+      document.getElementById('announcementText').focus();
+    };
+  });
+
+  listEl.querySelectorAll('.ann-delete').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await apiDelete('/api/announcements', { id: btn.dataset.id });
+        showToast('Объявление удалено', 'ok');
+        await loadAnnouncementsList();
+      } catch (e) {
+        showToast('Ошибка удаления: ' + (e.message || 'не удалось удалить'), 'warn');
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+// Загружает список с сервера, перерисовывает и помечает всё просмотренным.
+async function loadAnnouncementsList() {
+  const listEl = document.getElementById('announcementList');
+  try {
+    const res = await apiFetch('/api/announcements');
+    state.announcements = Array.isArray(res.items) ? res.items : [];
+  } catch (e) {
+    if (listEl) listEl.innerHTML = '<div class="announcement-empty">Не удалось загрузить объявления</div>';
+    return;
+  }
+  renderAnnouncements();
+  // Открытие модалки = просмотр: гасим точку. Метку ставим по самому
+  // свежему объявлению (createdAt/updatedAt сервера, не локальные часы).
+  let maxTs = loadAnnouncementsSeen();
+  for (const it of state.announcements) {
+    const ts = announcementItemTs(it);
+    if (ts > maxTs) maxTs = ts;
+  }
+  if (maxTs) saveAnnouncementsSeen(maxTs);
+  updateAnnouncementsBadge();
+}
+
+function setupAnnouncements() {
+  const modal = document.getElementById('announcementsModal');
+  const bellBtn = document.getElementById('bellBtn');
+  if (!modal || !bellBtn) return;
+
+  const textarea = document.getElementById('announcementText');
+  const saveBtn = document.getElementById('saveAnnouncement');
+  const cancelBtn = document.getElementById('cancelAnnouncementEdit');
+  const msgEl = document.getElementById('announcementMsg');
+
+  bellBtn.onclick = () => {
+    // Блок формы owner'а — виден только при активной роли (косметика:
+    // права проверяет сервер на каждом запросе).
+    document.getElementById('announcementOwnerBlock').style.display = isOwner() ? '' : 'none';
+    resetAnnouncementForm();
+    renderAnnouncements(); // мгновенно из кеша state, затем обновим с сервера
+    openModal(modal, bellBtn);
+    loadAnnouncementsList();
+  };
+
+  // Закрытие с «обратным звонком» колокольчика (по аналогии с
+  // closeSettingsWithAnim: анимация на кнопке-источнике, затем closeModal).
+  function closeAnnouncementsWithAnim() {
+    bellBtn.classList.remove('anim-ring-reverse');
+    void bellBtn.offsetWidth; // reflow — перезапуск анимации
+    bellBtn.classList.add('anim-ring-reverse');
+    setTimeout(() => bellBtn.classList.remove('anim-ring-reverse'), 600);
+    closeModal(modal);
+  }
+
+  document.getElementById('closeAnnouncements').onclick = () => closeAnnouncementsWithAnim();
+  modal.onclick = (e) => { if (e.target === modal) closeAnnouncementsWithAnim(); };
+
+  cancelBtn.onclick = resetAnnouncementForm;
+
+  saveBtn.onclick = async () => {
+    if (!isOwner()) {
+      showToast('Публиковать объявления может только владелец', 'warn');
+      return;
+    }
+    const text = textarea.value.trim();
+    if (!text) {
+      showToast('Введите текст объявления', 'warn');
+      return;
+    }
+    saveBtn.disabled = true;
+    msgEl.classList.add('hidden');
+    try {
+      if (editingAnnouncementId) {
+        await apiPut('/api/announcements', { id: editingAnnouncementId, text });
+        showToast('Объявление обновлено', 'ok');
+      } else {
+        await apiPost('/api/announcements', { text });
+        showToast('Объявление опубликовано', 'ok');
+      }
+      resetAnnouncementForm();
+      await loadAnnouncementsList();
+    } catch (e) {
+      msgEl.textContent = 'Ошибка: ' + (e.message || 'не удалось сохранить объявление');
+      msgEl.className = 'invite-msg tg-warn';
+      msgEl.classList.remove('hidden');
+    } finally {
+      saveBtn.disabled = false;
+    }
   };
 }
 
