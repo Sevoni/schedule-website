@@ -84,6 +84,11 @@ body {
   overscroll-behavior: none;
   scrollbar-width: none;
   transition: background 0.25s ease, color 0.25s ease;
+  /* PWA standalone (iOS, black-translucent): не заезжать под статус-бар и
+     home-indicator. В обычном браузере env() = 0 — эффекта нет. Требует
+     viewport-fit=cover в meta viewport (index.html). */
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
 }
 body::-webkit-scrollbar { display: none; }
 

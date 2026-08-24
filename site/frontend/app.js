@@ -530,6 +530,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupAnnouncements();
   setupStartPage();
 
+  // PWA: регистрация service worker (офлайн-шелл, см. frontend/sw.js).
+  // Fire-and-forget: не блокирует загрузку. ВАЖНО: '?v=' держим синхронно
+  // со SW_VERSION внутри sw.js и бампаем вместе с ним при изменении статики.
+  // Query нужен потому, что зонный дефолт CF на кастомном домене перебивает
+  // Cache-Control для .js (max-age=14400) — свежий URL после бампа обходит
+  // и HTTP-кэш браузера, и edge-кэш Cloudflare.
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('/sw.js?v=v2').catch((e) => {
+      console.warn('[sw] registration failed:', e.message);
+    });
+  }
+
   // Объявления глобальные (не зависят от группы) — фоновая проверка
   // непрочитанных для красной точки на колокольчике. Fire-and-forget:
   // не блокирует загрузку, работает и на стартовой странице без группы.

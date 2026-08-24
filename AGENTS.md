@@ -16,12 +16,15 @@ site/
 │   ├── app.js                — main logic (~4600 lines)
 │   ├── schedule-utils.js     — DEAD CODE (unused ES module, not imported)
 │   ├── style.css             — dark theme
+│   ├── sw.js                 — service worker: PWA офлайн-шелл (см. «PWA / offline»)
+│   ├── manifest.webmanifest  — PWA манифест (standalone, иконки, тема #0f1117)
 │   ├── _headers              — Pages security headers incl. CSP hash for inline script
-│   └── icons/                — SVG icons (door-open.svg)
+│   └── icons/                — SVG icons + сгенерированные PNG PWA-иконки (icon-192/512, maskable)
 ├── migrations/
 │   └── 0001_init.sql         — D1 schema (kv table + expires index)
 ├── scripts/
-│   └── set-webhook.js        — Telegram webhook setup script
+│   ├── set-webhook.js        — Telegram webhook setup script
+│   └── make_icons.py         — генератор PNG-иконок из дизайна favicon.svg (запуск вручную, результат в frontend/icons/)
 ├── generate_owner_code.py    — OWNER_CODE generator (Python)
 ├── package.json              — only devDep: wrangler
 ├── wrangler.toml             — Worker + D1 + KV (legacy) + cron + routes
@@ -92,6 +95,15 @@ Local secrets go in `site/.dev.vars` (gitignored).
 - **Route**: `kampussgu.dpdns.org/api/*` → Worker (custom domain). Static Pages on same domain.
 - **CORS**: strict allowlist, NOT `*`. Worker returns `Access-Control-Allow-Origin: <origin>` only for allowed origins: preview domains `*.schedule-worker.pages.dev` **only when var `ALLOW_PREVIEW_CORS === "true"`** (default `"false"` on prod; local override in `.dev.vars`) + list from env var `ALLOWED_ORIGINS` (comma-separated, in `wrangler.toml` `[vars]`). Preview builds (`{hash}.schedule-worker.pages.dev`) deliberately do NOT work against the prod API — frontend testing happens via deploy to the main domain. Same-origin requests and curl (no `Origin` header) get no CORS headers at all. Preflight `OPTIONS` returns 204 for allowed origins, no CORS headers otherwise. CORS headers are stripped from cached responses and re-applied per request in `cachedGet` (cache poisoning protection). `Access-Control-Allow-Credentials` is intentionally NOT set (auth is Bearer-header based). On top of CORS, ALL `/api/*` responses (incl. 429 `rateLimitResponse`, TG webhook `tgWebhookResponse`, preflight `OPTIONS`) get a uniform defensive base via the single `securityHeaders` object in `worker/index.js`: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Strict-Transport-Security: max-age=31536000; includeSubDomains` (no `preload` — requires hstspreload.org registration), `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, `Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()` (identical to static `frontend/_headers`). COOP/CORP are NOT CORS headers — `cachedGet` strips/re-applies only `CORS_HEADER_NAMES`, so they stay on cached responses harmlessly.
 - **CDN caching**: public GETs are manually cached via Cache API (`cachedGet` in `worker/index.js`): readers get `public, max-age=60, s-maxage=300` (CDN 5 min), writers `private, no-store`. After every write the worker purges that group's cached URLs (`purgeGroupCdnCache`). If you test with curl and see stale data, pass an `Authorization: Bearer` header (bypasses cache) or wait for purge.
+
+### PWA / offline (frontend/sw.js)
+
+- Service worker кэширует ТОЛЬКО статический шелл (`/`, index.html, style.css, app.js, favicon.svg, manifest.webmanifest, PNG-иконки). `/api/*`, кросс-доменные запросы (campus.syktsu.ru) и всё не-GET через SW НЕ идут — офлайн-данные отдаются localStorage-кэшами app.js (cache-only путь в `loadData`).
+- Стратегии: навигация (HTML) — network-first с фолбэком на кэш; статика — stale-while-revalidate (мгновенно из кэша, обновление фоном).
+- ⚠️ **При любом изменении app.js/style.css/иконок бампать ДВЕ константы синхронно: `SW_VERSION` в sw.js и `'?v='` в register('/sw.js?v=…') в app.js** — файлы без хэшей в имени, это единственная инвалидация прекэша. Query-версия обязательна: зонный дефолт Cloudflare на кастомном домене перебивает Cache-Control для `.js` (`max-age=14400`, `_headers` там не работает для .js), свежий URL после бампа обходит и HTTP-кэш браузера, и edge-кэш. Клиенты подхватывают новую версию при следующем заходе (skipWaiting, без UI-уведомлений — осознанно).
+- Регистрация SW — fire-and-forget в `DOMContentLoaded` (app.js), guard `'serviceWorker' in navigator && location.protocol === 'https:'`. CSP менять не нужно (`script-src 'self'` покрывает /sw.js). Инлайн-скрипты для PWA в index.html НЕ добавлять — сломается CSP-хэш (см. Conventions).
+- `_headers`: у `/sw.js` обязателен `Cache-Control: no-cache` (иначе HTTP-кэш браузера держит старый sw.js до суток и апдейты не доезжают).
+- PNG-иконки (192/512/maskable-512) генерируются из дизайна favicon.svg: `python scripts/make_icons.py` (нужен Pillow). iOS не понимает SVG как apple-touch-icon, поэтому PNG обязательны.
 
 ### Auth (role-based access)
 

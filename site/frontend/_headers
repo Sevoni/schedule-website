@@ -26,3 +26,13 @@
   Cross-Origin-Resource-Policy: same-origin
   Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
   Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'sha256-ZwQm2DvFzITZP8DlcrJzJ0u86bEGhGecCPIXZ8wdsuQ='; connect-src 'self' https://campus.syktsu.ru; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
+
+# Service Worker: no-cache ОБЯЗАТЕЛЕН — иначе HTTP-кэш браузера может держать
+# старый sw.js до суток, и инвалидация прекэша (бамп SW_VERSION) не доедет.
+# CSP для регистрации SW менять не нужно: script-src 'self' покрывает /sw.js.
+/sw.js
+  Cache-Control: no-cache
+
+/manifest.webmanifest
+  Cache-Control: public, max-age=3600
+  Content-Type: application/manifest+json
