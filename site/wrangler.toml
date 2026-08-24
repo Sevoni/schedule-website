@@ -30,7 +30,7 @@ INVITE_ORIGIN = "https://kampussgu.dpdns.org"
 # *.schedule-worker.pages.dev разрешены ТОЛЬКО при ALLOW_PREVIEW_CORS === 'true'
 # (см. ниже). Same-origin и curl (без Origin) в списке не нуждаются. ВАЖНО:
 # этот список кэшируется CDN'ом — меняйте его только вместе с деплоем воркера.
-ALLOWED_ORIGINS = "https://translated.turbopages.org"
+ALLOWED_ORIGINS = ""
 
 # CORS для preview-доменов *.schedule-worker.pages.dev.
 # "false" (или отсутствие) — вилдкард выключен, превью-сборки НЕ работают
