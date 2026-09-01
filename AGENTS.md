@@ -255,3 +255,5 @@ npm run deploy
 2. Деплоит Pages фронтенд (`site/frontend/`) на `{hash}.schedule-worker.pages.dev`
 
 Деплой занимает ~20-30 секунд. После деплоя URL-ы меняются — проверяй вывод команды.
+
+> ⚠️ **Перед деплоем фронта всегда бампай SW_VERSION**: `sw.js` → `const SW_VERSION = 'v…'` и `app.js` → `register('/sw.js?v=v…')`. Без этого браузер держит старый кэш и изменения не подхватываются (см. PWA / offline).

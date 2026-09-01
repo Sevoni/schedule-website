@@ -12,26 +12,19 @@
 // в app.js (зонный дефолт CF на кастомном домене кэширует .js на 4 ч —
 // свежий query обходит и HTTP-кэш, и edge). Новая версия подхватывается
 // при следующем заходе (skipWaiting без уведомлений — осознанно).
-const SW_VERSION = 'v2';
+const SW_VERSION = 'v6';
 const CACHE_NAME = `shell-${SW_VERSION}`;
 
-const PRECACHE = [
-  '/',
-  '/index.html',
-  '/style.css',
-  '/app.js',
-  '/favicon.svg',
-  '/manifest.webmanifest',
-  '/icons/icon-192.png',
-  '/icons/icon-512.png',
-  '/icons/icon-maskable-512.png',
-];
+const CRITICAL = ['/', '/index.html', '/app.js', '/style.css'];
+const OPTIONAL = ['/favicon.svg', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-maskable-512.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then((cache) => cache.addAll(PRECACHE))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_NAME).then(async (cache) => {
+      await Promise.allSettled(CRITICAL.map((url) => cache.add(url)));
+      await Promise.allSettled(OPTIONAL.map((url) => cache.add(url)));
+      self.skipWaiting();
+    })
   );
 });
 

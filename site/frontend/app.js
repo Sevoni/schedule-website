@@ -60,6 +60,19 @@ function clearUrlParams(keysToRemove) {
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
+// Недели от API (/api/weeks, /api/bootstrap) приходят без поля dates
+// (worker's sanitizeWeeks выбрасывает его). Парсим dates из text,
+// чтобы getCurrentWeekSchedule() / findRealCurrentIdx() могли
+// определить текущую неделю по календарной дате.
+function normalizeWeeks(weeks) {
+  if (!Array.isArray(weeks)) return weeks;
+  return weeks.map(w => {
+    if (w && w.dates && w.dates.length >= 2) return w;
+    const dates = (w.text || '').match(/\d{2}\.\d{2}\.\d{4}/g) || [];
+    return { ...w, dates };
+  });
+}
+
 // ── State ─────────────────────────────────────────────────────
 
 let state = {
@@ -113,10 +126,10 @@ let state = {
 // ── Клиентский кеш недель в localStorage (TTL 1ч) ──────────────
 // Избавляет от /api/weeks при повторных открытиях в течение часа.
 // Кеш хранится per-group: `weeksCache:{group}` = { ts, weeks }.
-const WEEKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 час
-const SCHEDULE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для расписаний
-const HW_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для домашки
-const SUBJECTS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут для предметов
+const WEEKS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+const SCHEDULE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+const HW_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+const SUBJECTS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
 
 function weeksCacheKey() {
   return 'weeksCache:' + state.group;
@@ -537,7 +550,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Cache-Control для .js (max-age=14400) — свежий URL после бампа обходит
   // и HTTP-кэш браузера, и edge-кэш Cloudflare.
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('/sw.js?v=v2').catch((e) => {
+    navigator.serviceWorker.register('/sw.js?v=v6').catch((e) => {
       console.warn('[sw] registration failed:', e.message);
     });
   }
@@ -978,10 +991,8 @@ async function loadData() {
     // Восстанавливаем её отдельным лёгким запросом: при тёплых клиентских
     // кешах /api/bootstrap не вызывается, и без этого права owner после
     // перезагрузки страницы пропадали бы.
-    await restoreOwnerRole();
-    // Роль редактора — тоже в HttpOnly-cookie (__Host-writer_tokens).
-    // Восстанавливаем аналогично: /api/writer/status читает куку на сервере.
-    await refreshWriterStatus();
+    restoreOwnerRole().catch(() => {});
+    refreshWriterStatus().catch(() => {});
     state.scheduleCache = {};
     applyGroupDisplay(state.group);
 
@@ -1000,7 +1011,7 @@ async function loadData() {
     if (cachedWeeks && cachedWeeks.length && cachedWeeks.every((w) => w.dates && w.dates.length >= 2)) {
       // Есть недели в кеше — рендерим сразу. Помечаем их свежими, чтобы
       // syncAll не дёргал syncWeeksFromCampus повторно в этом же сеансе.
-      state.weeks = cachedWeeks;
+      state.weeks = normalizeWeeks(cachedWeeks);
       markWeeksFresh();
       if (cachedSched) {
         for (const w of state.weeks) {
@@ -1104,7 +1115,7 @@ async function bootstrapFromApi(opts = {}) {
     if (state.ownerRole !== wasOwner) refreshEditVisibility();
 
     if (wantWeeks && Array.isArray(data.weeks) && data.weeks.length) {
-      state.weeks = data.weeks;
+      state.weeks = normalizeWeeks(data.weeks);
       saveWeeksToCache(data.weeks);
       markWeeksFresh();
     }
@@ -1143,7 +1154,7 @@ async function bootstrapLegacyFallback(opts = {}) {
 
   if (wantWeeks && state.weeks.length === 0) {
     try {
-      state.weeks = await apiFetch('/api/weeks', { group: state.group });
+      state.weeks = normalizeWeeks(await apiFetch('/api/weeks', { group: state.group }));
       if (state.weeks && state.weeks.length) saveWeeksToCache(state.weeks);
     } catch (e) {
       state.weeks = [];
@@ -1827,13 +1838,33 @@ async function syncWeeksFromCampus(preserveWeek = false) {
     weeks,
   });
 
+  // Следующая неделя за границей списка («нажатие кнопки след. недели» внутри
+  // fetchWeeksFromCampus, поле weeks._nextWeek) — кладём её в кеш, чтобы она
+  // сразу отрисовалась/скачалась, и (при правах редактора) загружаем в БД.
+  const nxt = weeks._nextWeek;
+  if (nxt && nxt.value && nxt.schedule) {
+    state.scheduleCache[nxt.value] = nxt.schedule;
+    saveSchedToCache(state.scheduleCache);
+    if (isWriter()) {
+      uploadSchedulesToBackend([{ weekCode: nxt.value, data: nxt.schedule }])
+        .catch((e) => console.warn('[weeks] next-week upload failed:', e.message));
+    }
+  }
+
   const savedWeekValue = preserveWeek ? state.weeks[state.currentWeekIdx]?.value : null;
-  state.weeks = weeks;
+  state.weeks = normalizeWeeks(weeks);
   saveWeeksToCache(weeks);
 
   if (preserveWeek && savedWeekValue) {
     const idx = state.weeks.findIndex(w => w.value === savedWeekValue);
-    state.currentWeekIdx = idx >= 0 ? idx : state.currentWeekIdx;
+    if (idx >= 0) {
+      state.currentWeekIdx = idx;
+    } else {
+      // Список недель сменился (переход семестра/года): сохранённой недели в
+      // нём больше нет — остаёмся на реальной текущей, а не на индексе из
+      // старого списка (он указывал бы на чужую неделю).
+      findCurrentWeek();
+    }
   } else {
     findCurrentWeek();
   }
@@ -1858,7 +1889,118 @@ async function fetchWeeksFromCampus(group) {
   const weeks = parseWeekOptions(html);
   // Заодно извлекаем дату обновления (на случай, если она пригодится позже)
   weeks._campusUpdatedAt = extractCampusUpdatedAt(html);
+
+  // Если текущая реальная неделя — последняя в списке недель (или список уже
+  // позади), на кампусе за границей списка может появиться новое расписание
+  // с новым списком недель (новый семестр). В `<select name="weeks">` его ещё
+  // нет, поэтому weeks=<N> код не работает — имитируем нажатие кнопки
+  // «след. >>» (name="next"): сервер вернёт следующую неделю сразу с
+  // обновлённым списком и её расписанием.
+  const today = new Date();
+  if (today.getDay() === 0) today.setDate(today.getDate() + 1);
+  let anchor = extractNextWeekAnchor(html);
+  const seenAnchors = new Set();
+  let prevLen = -1;
+  for (let iter = 0; iter < 3 && anchor && !seenAnchors.has(anchor) && weekListNeedsNext(weeks, today) && weeks.length !== prevLen; iter++) {
+    seenAnchors.add(anchor);
+    prevLen = weeks.length;
+    try {
+      const nextForm = new URLSearchParams();
+      nextForm.set('num_group', group);
+      nextForm.set('next', anchor);
+
+      const nextResp = await fetchTimeout(CAMPUS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: nextForm.toString(),
+      });
+      if (!nextResp.ok) throw new Error('Campus: ' + nextResp.status);
+      const nextHtml = await nextResp.text();
+      const newWeeks = parseWeekOptions(nextHtml);
+      if (newWeeks.length === 0) break;
+
+      // Коды недель вида "{число}_{группа}" на кампусе каждый год/семестр
+      // начинаются заново (1, 2, …52), поэтому сам код не уникален между
+      // годами — сверяемся по датам.
+      const oldValues = new Set(weeks.map((w) => w.value));
+      const sharesValues = newWeeks.some((w) => oldValues.has(w.value));
+
+      // Старая последняя неделя: «следующая» ищется как первая в новом списке,
+      // начинающаяся сразу после её конца.
+      let nextWeek = null;
+      const prevLast = weeks.length ? weeks[weeks.length - 1] : null;
+      let afterPrev = null;
+      if (prevLast && prevLast.dates && prevLast.dates.length >= 2) {
+        afterPrev = new Date(parseDate(prevLast.dates[1]).getTime() + 864e5);
+      }
+
+      if (sharesValues) {
+        // Список кампуса «переехал» вперёд (новый семестр/год): номера недель
+        // повторились. Заменяем старый список целиком новым — он самодостаточен
+        // и свеж, а слияние по value дало бы дубли кодов.
+        weeks.length = 0;
+        weeks.push(...newWeeks);
+      } else {
+        // Простое продление списка: новых кодов раньше не было — докидываем.
+        let grew = false;
+        for (const w of newWeeks) {
+          if (!oldValues.has(w.value)) {
+            oldValues.add(w.value);
+            weeks.push(w);
+            grew = true;
+          }
+        }
+        if (!grew) break;
+      }
+
+      // Расписание следующей недели лежит прямо на этой же странице.
+      weeks._campusUpdatedAt = extractCampusUpdatedAt(nextHtml) || weeks._campusUpdatedAt;
+      if (afterPrev) {
+        nextWeek = newWeeks.find(
+          (w) => w.dates && parseDate(w.dates[0]).getTime() >= afterPrev.getTime()
+        ) || null;
+      }
+      if (nextWeek) {
+        const nextSchedule = parseScheduleHTML(nextHtml);
+        if (nextSchedule) {
+          weeks._nextWeek = { value: nextWeek.value, schedule: nextSchedule };
+        }
+      }
+      anchor = extractNextWeekAnchor(nextHtml);
+    } catch (e) {
+      console.warn('[weeks] next-week fetch failed:', e.message);
+      break;
+    }
+  }
+
   return weeks;
+}
+
+// Якорь кнопки «след. >>» (name="next") со страницы кампуса. Формат:
+// "{YYYY-MM-DD}_{группа}" (напр. "2026-08-24_131-ИБо") — дата старта текущей
+// показанной недели; сервер сам вычисляет следующую неделю от неё. Возвращает
+// строку-якорь или ''.
+function extractNextWeekAnchor(html) {
+  const m = html.match(
+    /<button[^>]*name="next"[^>]*value="([^"]+)"|<button[^>]*value="([^"]+)"[^>]*name="next"/i
+  );
+  return m ? (m[1] || m[2]) : '';
+}
+
+// Нужно ли «нажимать следующую неделю»: сегодняшняя дата попадает в последнюю
+// неделю списка (или список уже позади). В этом случае за границей списка есть
+// следующая неделя, но кода weeks=<> для неё ещё нет.
+function weekListNeedsNext(weeks, today) {
+  if (!weeks || weeks.length === 0) return false;
+  const last = weeks[weeks.length - 1];
+  if (!last || !last.dates || last.dates.length < 2) return false;
+  let lastStart;
+  try {
+    lastStart = parseDate(last.dates[0]);
+  } catch (e) {
+    return false;
+  }
+  return today >= lastStart;
 }
 
 // Извлекает дату обновления расписания с кампуса.
