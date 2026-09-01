@@ -3937,13 +3937,30 @@ function pairSubgroupNum(p) {
   return p && p.subgroup ? String(p.subgroup).replace(/\D/g, '') : '';
 }
 
+// Короткое ФИО: «Некрасов Александр Николаевич» → «Некрасов А.Н.»
+function shortTeacher(name) {
+  if (!name) return '';
+  const parts = name.trim().split(/\s+/);
+  if (parts.length < 2) return escTg(name);
+  const surname = parts[0];
+  const initials = parts.slice(1).map(w => (w[0] || '') + '.').join(' ');
+  return escTg(surname + ' ' + initials);
+}
+
+const DAY_SHORT = {
+  Понедельник: 'Пн', Вторник: 'Вт', Среда: 'Ср',
+  Четверг: 'Чт', Пятница: 'Пт', Суббота: 'Сб', Воскресенье: 'Вс',
+};
+
 // Краткая human строка одной пары для diff.
+// Возвращает null, если у пары нет названия — такие пары пропускаются.
 function pairBrief(p) {
-  const subject = escTg(p.subject || '(без названия)');
+  if (!p || !p.subject) return null;
+  const subject = escTg(p.subject);
   const tp = p.type ? ` <i>[${escTg(pairTypeLabel(p.type))}]</i>` : '';
-  const sub = p.subgroup ? ` · ${escTg(p.subgroup)}` : '';
+  const sub = p.subgroup ? ` · подгруппа ${escTg(p.subgroup)}` : '';
   const room = p.room ? ` · ${escTg(p.room)}` : '';
-  const teacher = p.teacher ? ` · ${escTg(p.teacher)}` : '';
+  const teacher = p.teacher ? ` · ${shortTeacher(p.teacher)}` : '';
   const time = p.time ? `${escTg(p.time)} ` : '';
   return `${time}${subject}${tp}${sub}${room}${teacher}`;
 }
@@ -3953,18 +3970,64 @@ function pairKey(p) {
   return [p.time || '', p.subject || '', p.type || '', p.subgroup || '', p.room || '', p.teacher || ''].join('␟');
 }
 
+// Частичный ключ: время + предмет + тип + подгруппа (без аудитории и преподавателя).
+// Используется для поиска пар, у которых изменились только кабинет/преподаватель.
+function partialMatchKey(p) {
+  return [p.time || '', p.subject || '', p.type || '', p.subgroup || ''].join('␟');
+}
+
+// Вычисляет, какие поля изменились между двумя парами с одинаковым partialMatchKey.
+function computeFieldChanges(oldP, newP) {
+  const changes = [];
+  if (oldP.room !== newP.room) {
+    changes.push({ field: 'кабинет', old: oldP.room || '—', new: newP.room || '—' });
+  }
+  if (oldP.teacher !== newP.teacher) {
+    changes.push({ field: 'преподаватель', old: shortTeacher(oldP.teacher), new: shortTeacher(newP.teacher) });
+  }
+  return changes;
+}
+
+// Эмодзи для полей диффа.
+function fieldEmoji(field) {
+  if (field === 'кабинет') return '📍';
+  if (field === 'преподаватель') return '👤';
+  return '•';
+}
+
+// Группирует элементы массива по результату fn.
+function groupBy(arr, fn) {
+  const m = new Map();
+  for (const item of arr) {
+    const k = fn(item);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(item);
+  }
+  return m;
+}
+
 // Сравнивает старую и новую неделю, возвращает изменения по дням.
 // Возвращает null, если изменений нет, либо структуру
 // { weekLabel, lines: [{ text, subgroup }, ...] }, где subgroup — структурный
 // номер подгруппы пары ('1' | '2' | '') для фильтрации при рассылке.
+//
+// Трёхуровневая логика для каждого дня:
+//   Уровень 1: Точное совпадение (pairKey) → пропускаем (без изменений)
+//   Уровень 2: Частичное совпадение (partialMatchKey) → полевая дифф (кабинет/препод.)
+//   Уровень 3: Нет совпадения → замена (⬇️) или одиночное ➖/➕
 function diffScheduleWeek(oldWeek, newWeek) {
   const oldDays = (oldWeek && oldWeek.days) || {};
   const newDays = (newWeek && newWeek.days) || {};
 
-  // Заголовок недели (для контекста сообщения).
+  // Заголовок недели (для контекста сообщения) — короткие даты без года.
   const ws = (newWeek && newWeek.weekStart) || (oldWeek && oldWeek.weekStart) || '';
   const we = (newWeek && newWeek.weekEnd) || (oldWeek && oldWeek.weekEnd) || '';
-  const weekLabel = (ws && we) ? `с ${escTg(ws)} по ${escTg(we)}` : 'неделя';
+  const shortDate = (d) => {
+    if (!d) return '';
+    const parts = d.split('.');
+    return parts.length >= 2 ? `${parts[0]}.${parts[1]}` : d;
+  };
+  const weekLabel = (ws && we) ? `с ${shortDate(ws)} по ${shortDate(we)}` : 'неделя';
 
   const lines = [];
 
@@ -3982,8 +4045,12 @@ function diffScheduleWeek(oldWeek, newWeek) {
     const oldPairs = (oldDays[dn] && oldDays[dn].pairs) || [];
     const newPairs = (newDays[dn] && newDays[dn].pairs) || [];
     const dateStr = (newDays[dn] && newDays[dn].date) || (oldDays[dn] && oldDays[dn].date) || '';
-    const dayHeader = dateStr ? `${escTg(dn)} (${escTg(dateStr)})` : escTg(dn);
 
+    // Короткий заголовок дня: «Пн 07.09:»
+    const shortDay = DAY_SHORT[dn] || dn;
+    const dayHeader = dateStr ? `${shortDay} ${shortDate(dateStr)}` : shortDay;
+
+    // Уровень 1: точное совпадение по pairKey → без изменений.
     const oldMap = new Map(oldPairs.map(p => [pairKey(p), p]));
     const newMap = new Map(newPairs.map(p => [pairKey(p), p]));
 
@@ -3992,13 +4059,87 @@ function diffScheduleWeek(oldWeek, newWeek) {
 
     if (removed.length === 0 && added.length === 0) continue;
 
-    // Каждая строка diff несёт СТРУКТУРНУЮ подгруппу пары (item.subgroup:
-    // '1' | '2' | '') — фильтрация в buildScheduleDiffText идёт по полю,
-    // а не по regex на тексте (предмет может сам содержать «· подгруппа 1»
-    // в названии). Заголовок дня — не пара, у него subgroup ''.
-    lines.push({ text: `<b>${dayHeader}</b>:`, subgroup: '' });
-    for (const p of removed) lines.push({ text: `  ➖ ${pairBrief(p)}`, subgroup: pairSubgroupNum(p) });
-    for (const p of added) lines.push({ text: `  ➕ ${pairBrief(p)}`, subgroup: pairSubgroupNum(p) });
+    // Уровень 2: частичное совпадение по partialMatchKey → полевая дифф.
+    const removedByPartial = groupBy(removed, partialMatchKey);
+    const addedByPartial = groupBy(added, partialMatchKey);
+
+    const partialMatches = [];
+    const unmatchedRemoved = [];
+    const unmatchedAdded = [];
+
+    const allPartialKeys = new Set([...removedByPartial.keys(), ...addedByPartial.keys()]);
+    for (const pk of allPartialKeys) {
+      const olds = removedByPartial.get(pk) || [];
+      const news = addedByPartial.get(pk) || [];
+      const matchCount = Math.min(olds.length, news.length);
+      for (let i = 0; i < matchCount; i++) {
+        partialMatches.push({ old: olds[i], new: news[i], changes: computeFieldChanges(olds[i], news[i]) });
+      }
+      unmatchedRemoved.push(...olds.slice(matchCount));
+      unmatchedAdded.push(...news.slice(matchCount));
+    }
+
+    // Уровень 3: среди несопоставленных — замены по времени и одиночные.
+    const unmatchedRemovedByTime = groupBy(unmatchedRemoved, p => p.time || '');
+    const unmatchedAddedByTime = groupBy(unmatchedAdded, p => p.time || '');
+
+    const fullReplacements = [];
+    const standaloneRemoved = [];
+    const standaloneAdded = [];
+
+    const allTimes = new Set([...unmatchedRemovedByTime.keys(), ...unmatchedAddedByTime.keys()]);
+    for (const t of allTimes) {
+      const olds = unmatchedRemovedByTime.get(t) || [];
+      const news = unmatchedAddedByTime.get(t) || [];
+      const replaceCount = Math.min(olds.length, news.length);
+      for (let i = 0; i < replaceCount; i++) {
+        fullReplacements.push({ old: olds[i], new: news[i] });
+      }
+      standaloneRemoved.push(...olds.slice(replaceCount));
+      standaloneAdded.push(...news.slice(replaceCount));
+    }
+
+    // Если ничего не осталось — пропускаем день.
+    if (partialMatches.length === 0 && fullReplacements.length === 0
+        && standaloneRemoved.length === 0 && standaloneAdded.length === 0) continue;
+
+    // Заголовок дня.
+    lines.push({ text: `<b>${dayHeader}:</b>`, subgroup: '' });
+
+    // Полевая дифф (кабинет/преподаватель).
+    for (const m of partialMatches) {
+      const brief = pairBrief(m.old);
+      if (!brief) continue;
+      const diffLines = m.changes.map(c => `  ${fieldEmoji(c.field)} ${c.old} → ${c.new}`);
+      lines.push({ text: `  ${brief}\n${diffLines.join('\n')}`, subgroup: pairSubgroupNum(m.old) });
+      lines.push({ text: '---', subgroup: '' });
+    }
+
+    // Замены (другой предмет/тип/подгруппа) — три строки со стрелкой вниз.
+    for (const r of fullReplacements) {
+      const oldBrief = pairBrief(r.old);
+      const newBrief = pairBrief(r.new);
+      if (oldBrief && newBrief) {
+        lines.push({ text: `  ${oldBrief}\n  <b>⬇️</b>\n  ${newBrief}`, subgroup: pairSubgroupNum(r.new) });
+      } else if (newBrief) {
+        lines.push({ text: `  ➕ ${newBrief}`, subgroup: pairSubgroupNum(r.new) });
+      } else if (oldBrief) {
+        lines.push({ text: `  ➖ ${oldBrief}`, subgroup: pairSubgroupNum(r.old) });
+      }
+      lines.push({ text: '---', subgroup: '' });
+    }
+
+    // Одиночные удаления/добавления.
+    for (const p of standaloneRemoved) {
+      const brief = pairBrief(p);
+      if (brief) lines.push({ text: `  ➖ ${brief}`, subgroup: pairSubgroupNum(p) });
+      lines.push({ text: '---', subgroup: '' });
+    }
+    for (const p of standaloneAdded) {
+      const brief = pairBrief(p);
+      if (brief) lines.push({ text: `  ➕ ${brief}`, subgroup: pairSubgroupNum(p) });
+      lines.push({ text: '---', subgroup: '' });
+    }
   }
 
   if (lines.length === 0) return null;
@@ -4009,20 +4150,22 @@ function diffScheduleWeek(oldWeek, newWeek) {
 function formatScheduleDiffBroadcast(group, changedWeeks) {
   // changedWeeks: [{ weekLabel, lines: [{ text, subgroup }, ...] }, ...]
   const parts = [];
-  parts.push(`🔔 <b>Расписание группы ${escTg(group)} изменилось</b>`);
+  parts.push(`🔔 <b>Расписание ${escTg(group)}</b>`);
   parts.push('');
   for (const w of changedWeeks) {
     if (parts.length + w.lines.length + 2 > 3500) {
       parts.push('… (часть изменений опущена, см. на сайте)');
       break;
     }
-    parts.push(`📅 <b>Неделя ${w.weekLabel}</b>`);
+    parts.push(`📅 <b>${w.weekLabel}</b>`);
     for (const l of w.lines) {
       parts.push(l.text);
     }
     parts.push('');
   }
-  return parts.join('\n');
+  // Rich Markdown (sendRichMessage) интерпретирует одинарный \n как пробел
+  // внутри абзаца — только \n\n создаёт новый абзац. Нормализуем все \n.
+  return parts.join('\n').replace(/\n+/g, '\n\n');
 }
 
 // Формирует сообщение по ДЗ (полный текст — по решению пользователя).
