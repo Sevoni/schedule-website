@@ -12,7 +12,7 @@
 // в app.js (зонный дефолт CF на кастомном домене кэширует .js на 4 ч —
 // свежий query обходит и HTTP-кэш, и edge). Новая версия подхватывается
 // при следующем заходе (skipWaiting без уведомлений — осознанно).
-const SW_VERSION = 'v6';
+const SW_VERSION = 'v7';
 const CACHE_NAME = `shell-${SW_VERSION}`;
 
 const CRITICAL = ['/', '/index.html', '/app.js', '/style.css'];

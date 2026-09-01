@@ -550,7 +550,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Cache-Control для .js (max-age=14400) — свежий URL после бампа обходит
   // и HTTP-кэш браузера, и edge-кэш Cloudflare.
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('/sw.js?v=v6').catch((e) => {
+    navigator.serviceWorker.register('/sw.js?v=v7').catch((e) => {
       console.warn('[sw] registration failed:', e.message);
     });
   }
