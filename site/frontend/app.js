@@ -126,10 +126,10 @@ let state = {
 // ── Клиентский кеш недель в localStorage (TTL 1ч) ──────────────
 // Избавляет от /api/weeks при повторных открытиях в течение часа.
 // Кеш хранится per-group: `weeksCache:{group}` = { ts, weeks }.
-const WEEKS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
-const SCHEDULE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
-const HW_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
-const SUBJECTS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+const WEEKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 час
+const SCHEDULE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для расписаний
+const HW_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для домашки
+const SUBJECTS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут для предметов
 
 function weeksCacheKey() {
   return 'weeksCache:' + state.group;
