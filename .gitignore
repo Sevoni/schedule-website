@@ -4,4 +4,6 @@ node_modules/
 site/.wrangler
 .opencode/council/
 .freebuff
+local/
+AGENTS.md
 
