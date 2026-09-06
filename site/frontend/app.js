@@ -550,7 +550,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Cache-Control для .js (max-age=14400) — свежий URL после бампа обходит
   // и HTTP-кэш браузера, и edge-кэш Cloudflare.
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('/sw.js?v=v7').catch((e) => {
+    navigator.serviceWorker.register('/sw.js?v=v10').catch((e) => {
       console.warn('[sw] registration failed:', e.message);
     });
   }
@@ -2063,8 +2063,13 @@ async function fetchScheduleFromCampus(group, weekCode) {
 //  - предыдущая пара есть  → «возможно открыта» + показ текста пары
 //  - предыдущая пара пуста → «закрыта»
 //  - нет данных вовсе       → ничего не показываем
+// Запрос без параметра недели возвращает неделю «по умолчанию» сервера.
+// Если нужная дата (например, понедельник при просмотре в воскресенье)
+// в другую неделю — дозагружаем её через weeks=<код> из списка недель
+// самой страницы аудитории.
 
-// Кеш результатов на время жизни страницы: room -> Promise<parsed>|parsed
+// Кеш результатов на время жизни страницы:
+// 'room|weekCode' -> Promise<parsed>|parsed ('default' — ответ без weeks).
 const classroomCache = {};
 
 // Парсит HTML расписания аудитории, сохраняя сырой текст пары так,
@@ -2104,13 +2109,15 @@ function parseClassroomHTML(html) {
   return result;
 }
 
-async function fetchClassroomFromCampus(room) {
-  if (classroomCache[room] !== undefined) return classroomCache[room];
+async function fetchClassroomWeek(room, weekCode) {
+  const key = room + '|' + (weekCode || 'default');
+  if (classroomCache[key] !== undefined) return classroomCache[key];
 
   const promise = (async () => {
     const formData = new URLSearchParams();
     formData.set('num_aud', room);
-    formData.set('searchdata', 'ИСКАТЬ');
+    if (weekCode) formData.set('weeks', weekCode);
+    else formData.set('searchdata', 'ИСКАТЬ');
     const resp = await fetchTimeout(CAMPUS_CLASSROOM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
@@ -2118,18 +2125,57 @@ async function fetchClassroomFromCampus(room) {
     });
     if (!resp.ok) throw new Error('Campus classroom: ' + resp.status);
     const html = await resp.text();
-    return parseClassroomHTML(html);
+    const data = parseClassroomHTML(html);
+    data.weeks = parseWeekOptions(html);
+    return data;
   })();
 
-  classroomCache[room] = promise;
+  classroomCache[key] = promise;
   try {
     const data = await promise;
-    classroomCache[room] = data;
+    classroomCache[key] = data;
     return data;
   } catch (e) {
-    delete classroomCache[room];
+    delete classroomCache[key];
     throw e;
   }
+}
+
+// Ищет в списке недель аудитории неделю, содержащую дату dayDate
+// ('дд.мм.гггг'). Возвращает weekCode или ''.
+function findClassroomWeekForDate(weeks, dayDate) {
+  if (!Array.isArray(weeks) || !dayDate) return '';
+  let target;
+  try {
+    target = parseDate(dayDate);
+  } catch (e) {
+    return '';
+  }
+  target.setHours(0, 0, 0, 0);
+  for (const w of weeks) {
+    if (!w.dates || w.dates.length < 2) continue;
+    let start, end;
+    try {
+      start = parseDate(w.dates[0]);
+      end = parseDate(w.dates[1]);
+    } catch (e) {
+      continue;
+    }
+    start.setHours(0, 0, 0, 0);
+    end.setHours(0, 0, 0, 0);
+    if (target >= start && target <= end) return w.value;
+  }
+  return '';
+}
+
+async function fetchClassroomFromCampus(room, dayDate) {
+  const data = await fetchClassroomWeek(room, null);
+  if (!dayDate || (data.days && data.days[dayDate])) return data;
+  // Даты нет в неделе по умолчанию (типичный случай — воскресенье смотрит
+  // понедельник следующей недели): дозагружаем нужную неделю аудитории.
+  const weekCode = findClassroomWeekForDate(data.weeks, dayDate);
+  if (!weekCode) return data;
+  return fetchClassroomWeek(room, weekCode);
 }
 
 // Возвращает статус аудитории для конкретной пары указанного дня:
@@ -2139,7 +2185,7 @@ async function fetchClassroomFromCampus(room) {
 async function getRoomStatus(room, dayDate, pairTime) {
   let data;
   try {
-    data = await fetchClassroomFromCampus(room);
+    data = await fetchClassroomFromCampus(room, dayDate);
   } catch (e) {
     return null;
   }
@@ -3523,7 +3569,7 @@ function openHwViewer(hwId, originEl) {
   const typeName = hw.pairType && hw.pairType !== 'any' ? (PAIR_TYPE_NAMES[hw.pairType] || hw.pairType) : '';
   const subLabel = hw.subgroup && hw.subgroup !== 'any' ? 'подгруппа ' + hw.subgroup : '';
   let dueLabel = '';
-  if (hw.dueDate) dueLabel = 'Срок: ' + hw.dueDate;
+  if (hw.dueDate) dueLabel = 'Срок: ' + formatDateShort(hw.dueDate);
   else if (hw.dueMode === 'nextPair') dueLabel = 'Следующая пара';
 
   const chips = [];
@@ -3676,7 +3722,7 @@ function selectCalendarDay(dateStr) {
     btn.setAttribute('aria-selected', isSel ? 'true' : 'false');
     btn.tabIndex = isSel ? 0 : -1;
   });
-  document.getElementById('hwDateSelected').textContent = formatDateDisplay(dateStr);
+  document.getElementById('hwDateSelected').textContent = formatDateShort(dateStr);
   calState.selectedDate = dateStr;
   updateSaveBtnState();
 }
@@ -3745,6 +3791,22 @@ function formatDateDisplay(str) {
   if (!str) return '—';
   const [y, m, d] = str.split('-');
   return `${d}.${m}.${y}`;
+}
+
+// Короткий формат для карточек ДЗ: дд.мм + день недели (год не показываем).
+// Хранение/сортировка остаются на ISO — это только отображение.
+// Дату собираем через new Date(y, m-1, d), чтобы день недели не съезжал из-за UTC-парсинга.
+function formatDateShort(str) {
+  const iso = normalizeDateToISO(str);
+  if (!iso) return '—';
+  const parts = iso.split('-');
+  if (parts.length !== 3) return str;
+  const y = Number(parts[0]);
+  const m = Number(parts[1]);
+  const d = Number(parts[2]);
+  if (!y || !m || !d) return str;
+  const wd = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'][new Date(y, m - 1, d).getDay()];
+  return `${parts[2]}.${parts[1]}, ${wd}`;
 }
 
 // Единый переключатель режима сдачи: ставит radio, показывает/прячет календарь
@@ -4291,7 +4353,7 @@ function openHwModal(preSubject, prePairType, preSubgroup, existingHw, originEl)
       calState.month = now.getMonth();
       calState.selectedDate = existingHw.dueDate;
       renderCalendar(calState.year, calState.month, existingHw.dueDate);
-      document.getElementById('hwDateSelected').textContent = existingHw.dueDate;
+      document.getElementById('hwDateSelected').textContent = formatDateShort(existingHw.dueDate);
     }
     setHwDueMode(existingHw.dueMode === 'date' ? 'date' : 'nextPair');
 
@@ -4533,15 +4595,15 @@ function renderHomework() {
       if (diff < 0) {
         cardClass = 'overdue';
         dueClass = 'overdue';
-        dueText = 'Просрочено (' + escHtml(hw.dueDate) + ')';
+        dueText = 'Просрочено (' + escHtml(formatDateShort(hw.dueDate)) + ')';
       } else if (diff === 0) {
         cardClass = 'due-soon';
         dueText = 'Сегодня!';
       } else if (diff <= 2) {
         cardClass = 'due-soon';
-        dueText = 'Через ' + diff + ' дн. (' + escHtml(hw.dueDate) + ')';
+        dueText = 'Через ' + diff + ' дн. (' + escHtml(formatDateShort(hw.dueDate)) + ')';
       } else {
-        dueText = escHtml(hw.dueDate);
+        dueText = escHtml(formatDateShort(hw.dueDate));
       }
     } else if (hw.dueMode === 'nextPair') {
       dueText = 'Следующая пара';
