@@ -28,9 +28,9 @@
   <!-- Версия в query обязательна: зонный дефолт Cloudflare кэширует .css/.js
        на 4 часа (max-age=14400), и после деплоя браузер мог брать старый
        файл мимо service worker. '?v=' меняется вместе с SW_VERSION. -->
-  <link rel="preload" href="style.css?v=v19" as="style">
-  <link rel="preload" href="app.js?v=v19" as="script">
-  <link rel="stylesheet" href="style.css?v=v19">
+  <link rel="preload" href="style.css?v=v20" as="style">
+  <link rel="preload" href="app.js?v=v20" as="script">
+  <link rel="stylesheet" href="style.css?v=v20">
   <script>try{if(!localStorage.getItem('group'))document.documentElement.classList.add('no-group')}catch(e){}</script>
 </head>
 <body>
@@ -549,6 +549,6 @@
   </svg>
 
   <!-- SRI для app.js не добавляем — см. комментарий в <head> про style.css/app.js. -->
-  <script src="app.js?v=v19"></script>
+  <script src="app.js?v=v20"></script>
 </body>
 </html>

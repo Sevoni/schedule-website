@@ -24,7 +24,7 @@
 // в app.js (зонный дефолт CF на кастомном домене кэширует .js на 4 ч —
 // свежий query обходит и HTTP-кэш, и edge). Новая версия подхватывается
 // при следующем заходе (skipWaiting без уведомлений — осознанно).
-const SW_VERSION = 'v19';
+const SW_VERSION = 'v20';
 const CACHE_NAME = `shell-${SW_VERSION}`;
 
 // Навигация: сколько ждать сеть, прежде чем отдать кэш (5 с — TTFB Cloudflare
@@ -36,7 +36,7 @@ const NAV_BG_TIMEOUT_MS = 30000;
 // дальше — честный 503, а не вечный спиннер (жёсткий abort — NAV_BG_TIMEOUT_MS).
 const NAV_NOCACHE_TIMEOUT_MS = 15000;
 
-const CRITICAL = ['/', '/index.html', '/app.js?v=v19', '/style.css?v=v19'];
+const CRITICAL = ['/', '/index.html', '/app.js?v=v20', '/style.css?v=v20'];
 const OPTIONAL = ['/favicon.svg', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-maskable-512.png'];
 
 self.addEventListener('install', (event) => {

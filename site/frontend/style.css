@@ -317,7 +317,8 @@ header {
 .week-nav {
   display: flex;
   align-items: center;
-  justify-content: center;
+  /* Стрелки — по краям серого блока, подпись недели по центру. */
+  justify-content: space-between;
   gap: 16px;
   padding: 12px;
   background: var(--surface);
@@ -351,6 +352,8 @@ header {
 }
 
 #weekLabel {
+  flex: 1;
+  min-width: 0;
   font-size: 0.9rem;
   color: var(--text-dim);
   text-align: center;
