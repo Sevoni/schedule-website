@@ -25,9 +25,12 @@
        правке app.js/style.css (деплой вручную, без CI) — риск сломать прод выше
        выгоды. Если появится сборка с автопересчётом хэшей — добавить integrity
        (без crossorigin: ресурсы same-origin), SRI с script-src 'self' совместим. -->
-  <link rel="preload" href="style.css" as="style">
-  <link rel="preload" href="app.js" as="script">
-  <link rel="stylesheet" href="style.css">
+  <!-- Версия в query обязательна: зонный дефолт Cloudflare кэширует .css/.js
+       на 4 часа (max-age=14400), и после деплоя браузер мог брать старый
+       файл мимо service worker. '?v=' меняется вместе с SW_VERSION. -->
+  <link rel="preload" href="style.css?v=v19" as="style">
+  <link rel="preload" href="app.js?v=v19" as="script">
+  <link rel="stylesheet" href="style.css?v=v19">
   <script>try{if(!localStorage.getItem('group'))document.documentElement.classList.add('no-group')}catch(e){}</script>
 </head>
 <body>
@@ -546,6 +549,6 @@
   </svg>
 
   <!-- SRI для app.js не добавляем — см. комментарий в <head> про style.css/app.js. -->
-  <script src="app.js"></script>
+  <script src="app.js?v=v19"></script>
 </body>
 </html>

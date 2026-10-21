@@ -321,17 +321,13 @@ header {
   gap: 16px;
   padding: 12px;
   background: var(--surface);
-  /* Прозрачная рамка в обычном состоянии — чтобы при включении обводки
-     текущей недели навбар не дёргался на 2px. */
-  border: 1px solid transparent;
   border-radius: var(--radius);
   margin-bottom: 16px;
-  transition: border-color 0.2s ease;
 }
 
-/* Текущая неделя: весь блок с номером недели и стрелками обведён акцентом. */
-.week-nav.is-current {
-  border-color: var(--accent);
+/* Текущая неделя: подпись недели становится ярче (белой в тёмной теме). */
+.week-nav.is-current #weekLabel {
+  color: var(--text);
 }
 
 .nav-btn {
