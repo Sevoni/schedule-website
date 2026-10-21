@@ -269,6 +269,17 @@ header {
 .sync-status.ok { color: var(--green); }
 .sync-status.error { color: var(--red); }
 
+/* Офлайн-плашка: данные не обновляются, показаны сохранённые (stale-кэш). */
+.offline-banner {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--orange);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
 .sync-icon {
   display: inline-block;
 }
@@ -310,8 +321,17 @@ header {
   gap: 16px;
   padding: 12px;
   background: var(--surface);
+  /* Прозрачная рамка в обычном состоянии — чтобы при включении обводки
+     текущей недели навбар не дёргался на 2px. */
+  border: 1px solid transparent;
   border-radius: var(--radius);
   margin-bottom: 16px;
+  transition: border-color 0.2s ease;
+}
+
+/* Текущая неделя: весь блок с номером недели и стрелками обведён акцентом. */
+.week-nav.is-current {
+  border-color: var(--accent);
 }
 
 .nav-btn {

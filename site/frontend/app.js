@@ -107,6 +107,10 @@ let state = {
   currentWeekIdx: -1,
   selectedDay: null,
   homework: [],
+  // true, если расписание отрисовано из stale-кэша (сеть недоступна/offline).
+  // В этом состоянии loadInitialSchedules пропускает сетевые запросы — они
+  // всё равно мертвы, а каждый ждал бы свой fetchTimeout (15 с).
+  offlineMode: false,
   // Глобальные объявления owner'а (колокольчик). Общие для всех групп.
   announcements: [],
   syncing: false,
@@ -130,18 +134,25 @@ const WEEKS_CACHE_TTL_MS = 60 * 60 * 1000; // 1 час
 const SCHEDULE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для расписаний
 const HW_CACHE_TTL_MS = 5 * 60 * 1000; // 5 минут для домашки
 const SUBJECTS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 минут для предметов
+// Потолок возраста для stale-фолбэка (ignoreTTL=true): офлайн-рендер берёт
+// данные из кэша даже после истечения обычного TTL, но не старше 30 дней —
+// дальше расписание семестра уже бессмысленно.
+const STALE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 function weeksCacheKey() {
   return 'weeksCache:' + state.group;
 }
-function loadWeeksFromCache() {
+function loadWeeksFromCache(ignoreTTL = false) {
   try {
     const raw = localStorage.getItem(weeksCacheKey());
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.weeks)) return null;
     if (typeof parsed.ts !== 'number') return null;
-    if (Date.now() - parsed.ts > WEEKS_CACHE_TTL_MS) return null;
+    const age = Date.now() - parsed.ts;
+    if (ignoreTTL) {
+      if (age > STALE_MAX_AGE_MS) return null;
+    } else if (age > WEEKS_CACHE_TTL_MS) return null;
     return parsed.weeks;
   } catch (e) {
     return null;
@@ -157,13 +168,16 @@ function saveWeeksToCache(weeks) {
 function schedCacheKey() {
   return 'schedCache:' + state.group;
 }
-function loadSchedFromCache() {
+function loadSchedFromCache(ignoreTTL = false) {
   try {
     const raw = localStorage.getItem(schedCacheKey());
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !parsed.data || typeof parsed.ts !== 'number') return null;
-    if (Date.now() - parsed.ts > SCHEDULE_CACHE_TTL_MS) return null;
+    const age = Date.now() - parsed.ts;
+    if (ignoreTTL) {
+      if (age > STALE_MAX_AGE_MS) return null;
+    } else if (age > SCHEDULE_CACHE_TTL_MS) return null;
     return parsed.data;
   } catch (e) {
     return null;
@@ -191,13 +205,16 @@ function invalidateWeeksCache() {
 function hwCacheKey() {
   return 'hwCache:' + state.group;
 }
-function loadHwFromCache() {
+function loadHwFromCache(ignoreTTL = false) {
   try {
     const raw = localStorage.getItem(hwCacheKey());
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.data) || typeof parsed.ts !== 'number') return null;
-    if (Date.now() - parsed.ts > HW_CACHE_TTL_MS) return null;
+    const age = Date.now() - parsed.ts;
+    if (ignoreTTL) {
+      if (age > STALE_MAX_AGE_MS) return null;
+    } else if (age > HW_CACHE_TTL_MS) return null;
     return parsed.data;
   } catch (e) {
     return null;
@@ -220,13 +237,16 @@ function invalidateHwCache() {
 function subjCacheKey() {
   return 'subjCache:' + state.group;
 }
-function loadSubjectsFromCache() {
+function loadSubjectsFromCache(ignoreTTL = false) {
   try {
     const raw = localStorage.getItem(subjCacheKey());
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.data) || typeof parsed.ts !== 'number') return null;
-    if (Date.now() - parsed.ts > SUBJECTS_CACHE_TTL_MS) return null;
+    const age = Date.now() - parsed.ts;
+    if (ignoreTTL) {
+      if (age > STALE_MAX_AGE_MS) return null;
+    } else if (age > SUBJECTS_CACHE_TTL_MS) return null;
     return parsed.data;
   } catch (e) {
     return null;
@@ -550,10 +570,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Cache-Control для .js (max-age=14400) — свежий URL после бампа обходит
   // и HTTP-кэш браузера, и edge-кэш Cloudflare.
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('/sw.js?v=v10').catch((e) => {
+    navigator.serviceWorker.register('/sw.js?v=v17').catch((e) => {
       console.warn('[sw] registration failed:', e.message);
     });
   }
+
+  // Офлайн-плашка: браузер сообщает о смене connectivity в реальном времени.
+  // offline → показать сразу; online → скрыть и перезагрузить данные
+  // (stale-кэш заменится свежими с сервера). Если на момент старта сети нет —
+  // плашку покажет сам loadData (ветка navigator.onLine === false).
+  window.addEventListener('offline', showOfflineBanner);
+  window.addEventListener('online', () => {
+    hideOfflineBanner();
+    loadData().catch((e) => console.warn('[online] loadData failed:', e.message));
+  });
 
   // Объявления глобальные (не зависят от группы) — фоновая проверка
   // непрочитанных для красной точки на колокольчике. Fire-and-forget:
@@ -985,6 +1015,130 @@ function setupStartPage() {
 //     реальной текущей (max(currentWeekIdx, realCurrentIdx)). Качает якорь +
 //     5 недель вперёд из кампуса (при изменении по check-campus-update). Неделю не меняем.
 
+// Сетевая ошибка fetch (offline, обрыв, DNS): TypeError — «Failed to fetch»,
+// AbortError — обрыв fetchTimeout через AbortController (15 с). HTTP-ошибки
+// (API 404/500) и свои Error — НЕ сетевые, для них legacy-fallback остаётся.
+function isNetworkError(e) {
+  if (!e) return false;
+  return e instanceof TypeError || e.name === 'AbortError';
+}
+
+// Stale-фолбэк: добиваем пробелы в state из клиентского кэша, игнорируя TTL
+// (но не старше STALE_MAX_AGE_MS). Перетираем только то, чего в state нет —
+// уже загруженные данные не трогаем. Возвращает true, если есть что рисовать
+// (state.weeks непуст после добора).
+function applyStaleCache() {
+  let filled = false;
+
+  if (!state.weeks.length) {
+    const staleWeeks = loadWeeksFromCache(true);
+    if (staleWeeks && staleWeeks.length) {
+      state.weeks = normalizeWeeks(staleWeeks);
+      filled = true;
+    }
+  }
+  if (!state.weeks.length) return false;
+
+  const staleSched = loadSchedFromCache(true);
+  if (staleSched) {
+    for (const w of state.weeks) {
+      if (!state.scheduleCache[w.value] && staleSched[w.value]) {
+        state.scheduleCache[w.value] = staleSched[w.value];
+        filled = true;
+      }
+    }
+  }
+
+  if (!state.homework.length) {
+    const staleHw = loadHwFromCache(true);
+    if (staleHw && staleHw.length) {
+      state.homework = staleHw;
+      filled = true;
+    }
+  }
+
+  if (!loadedSubjects.length) {
+    const staleSubj = loadSubjectsFromCache(true);
+    if (staleSubj && staleSubj.length) {
+      setLoadedSubjects(staleSubj);
+      filled = true;
+    }
+  }
+
+  return filled || state.weeks.length > 0;
+}
+
+// Офлайн-плашка: данные не удаётся обновить, показаны сохранённые.
+// В текст подставляется дата сохранения (самая свежая метка из кэшей) —
+// так видно, насколько данные старые, и есть ли кэш вообще.
+function staleCacheSavedAt() {
+  let ts = 0;
+  for (const key of [weeksCacheKey(), schedCacheKey(), hwCacheKey(), subjCacheKey()]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const p = JSON.parse(raw);
+      if (p && typeof p.ts === 'number' && p.ts > ts) ts = p.ts;
+    } catch (e) { /* битый кэш — пропускаем */ }
+  }
+  return ts;
+}
+function showOfflineBanner() {
+  const el = document.getElementById('offlineBanner');
+  if (!el) return;
+  const ts = staleCacheSavedAt();
+  if (ts > 0) {
+    const d = new Date(ts);
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    el.textContent = `Не удалось обновить: показаны сохранённые данные от ${dd}.${mm}`;
+  } else {
+    el.textContent = 'Не удалось обновить: показаны сохранённые данные';
+  }
+  el.classList.remove('hidden');
+}
+function hideOfflineBanner() {
+  const el = document.getElementById('offlineBanner');
+  if (el) el.classList.add('hidden');
+}
+
+// Единая отрисовка после загрузки (и обычной, и из stale-кэша):
+// недели → скелетон/кэш → ДЗ. Порядок как в исторических путях loadData.
+async function renderAll() {
+  findCurrentWeek();
+  renderWeekNav();
+  await loadInitialSchedules();
+  recalcNextPairDates();
+  renderHomework();
+}
+
+// Фоновая догрузка после мгновенного stale-рендера (stale-while-revalidate).
+// Не блокирует экран: вызывается БЕЗ await. При успехе тихо обновляет экран
+// свежими данными с сервера, при провале — показывает плашку, экран остаётся
+// на сохранённых данных.
+function refreshFromNetwork() {
+  const group = state.group;
+  (async () => {
+    try {
+      const schedWeeks = getInitialWeekIndices().map((i) => state.weeks[i].value).filter(Boolean);
+      await bootstrapFromApi({ weeks: true, schedWeeks });
+      // Пока ждали сеть, пользователь мог сменить группу — чужой экран не трогаем.
+      if (group !== state.group) return;
+      state.offlineMode = false;
+      hideOfflineBanner();
+      await renderAll();
+      if (state.campusEnabled && isWriter() && navigator.onLine !== false) {
+        const cur = findRealCurrentIdx();
+        syncAll(cur).catch((e) => console.warn('[openSync] error:', e.message));
+      }
+    } catch (e) {
+      if (group !== state.group) return;
+      console.warn('[refreshFromNetwork] failed:', e.message);
+      showOfflineBanner();
+    }
+  })();
+}
+
 async function loadData() {
   try {
     // Роль владельца живёт только в HttpOnly-cookie, которую JS не видит.
@@ -994,7 +1148,26 @@ async function loadData() {
     restoreOwnerRole().catch(() => {});
     refreshWriterStatus().catch(() => {});
     state.scheduleCache = {};
+    state.offlineMode = false;
+    // Сбрасываем плашку при каждом новом loadData: если сеть вернулась и
+    // загрузка пройдёт успешно — плашка не должна остаться от прошлого раза.
+    // Stale-ветки ниже показывают её заново.
+    hideOfflineBanner();
     applyGroupDisplay(state.group);
+
+    // ── Ветка «нет сети совсем» (airplane mode): браузер об этом знает
+    //    точно, запросы обрываются мгновенно и в сеть не идём вообще —
+    //    сразу рисуем из клиентского кэша (stale, TTL игнорируется).
+    if (navigator.onLine === false) {
+      if (applyStaleCache()) {
+        state.offlineMode = true;
+        showOfflineBanner();
+        await renderAll();
+      } else {
+        showError('Нет подключения к интернету. Расписание появится, когда сеть вернётся.');
+      }
+      return;
+    }
 
     // 0) Пробуем загрузить всё одним запросом /api/bootstrap (weeks +
     //    schedules + hw + subjects + campusUpdatedAt) — экономия 3-4
@@ -1032,6 +1205,20 @@ async function loadData() {
         renderHomework();
         usedCacheOnly = true;
       } else {
+        // Stale-while-revalidate: остальное протухло — но если в сохранённом
+        // кэше есть расписание текущей недели, рисуем его МГНОВЕННО (вместе
+        // с оболочкой страницы), а сеть проверяем фоново: refreshFromNetwork
+        // сам обновит экран или покажет плашку. Если сохранённого расписания
+        // нет — ждём сеть как раньше (скелетон, не «Нет данных»).
+        applyStaleCache();
+        findCurrentWeek();
+        const staleWeek = state.weeks[state.currentWeekIdx];
+        if (staleWeek && state.scheduleCache[staleWeek.value]) {
+          state.offlineMode = true;
+          await renderAll();
+          refreshFromNetwork();
+          return;
+        }
         // Кеш недель есть, но остальное протухло — подгрузим одним
         // /api/bootstrap без weeks (их уже взяли из кеша).
         await bootstrapFromApi({
@@ -1044,7 +1231,24 @@ async function loadData() {
         recalcNextPairDates();
       }
     } else {
-      // Холодный старт: weeks в кеше пусты. Сначала bootstrap с weeks=true,
+      // Нет свежих недель: сначала пробуем сохранённые (stale-while-revalidate),
+      // иначе — холодный сетевой старт ниже. Стейт чистим от прошлой загрузки:
+      // дальше его перезапишет либо stale, либо сеть.
+      state.weeks = [];
+      state.homework = [];
+      setLoadedSubjects([]);
+      applyStaleCache();
+      findCurrentWeek();
+      const staleWeek = state.weeks[state.currentWeekIdx];
+      if (staleWeek && state.scheduleCache[staleWeek.value]) {
+        state.offlineMode = true;
+        renderWeekNav();
+        await renderAll();
+        refreshFromNetwork();
+        return;
+      }
+      // Холодный старт: weeks пусты и stale не покрыл текущую неделю.
+      // Сначала bootstrap с weeks=true,
       // затем (когда state.weeks заполнен) дозагрузим schedules тем же
       // /api/bootstrap (weeks:false) одним запросом. Это два вызова вместо
       // четырёх (weeks + schedules + hw + subjects по отдельности).
@@ -1059,12 +1263,17 @@ async function loadData() {
         }
       }
       if (state.weeks.length === 0) {
-        showError(
-          isWriter() ? 'Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.'
-                     : 'Нет данных о неделях. Попросите редактора группы синхронизировать данные.',
-          isWriter() ? () => syncAll(null, { forceSync: true }) : null
-        );
-        return;
+        // Нет недель и в БД, и в кампусе — пробуем stale-кэш (данные группы
+        // могли быть сохранены при прошлых визитах), и только потом ошибка.
+        if (!applyStaleCache()) {
+          showError(
+            isWriter() ? 'Нет данных о неделях. Включите загрузку из кампуса в настройках и нажмите кнопку синхронизации.'
+                       : 'Нет данных о неделях. Попросите редактора группы синхронизировать данные.',
+            isWriter() ? () => syncAll(null, { forceSync: true }) : null
+          );
+          return;
+        }
+        showOfflineBanner();
       }
       // Теперь недели известны — дозагружаем стартовые расписания.
       findCurrentWeek();
@@ -1077,7 +1286,7 @@ async function loadData() {
       recalcNextPairDates();
     }
 
-    if (state.campusEnabled && isWriter()) {
+    if (state.campusEnabled && isWriter() && !state.offlineMode) {
       // Фон: полноценная синхронизация как по кнопке синхронизации. При свежих данных
       // (campusUpdatedAt < 5 мин) ранний выход в syncAll. Недели не трогаем,
       // если только что их обновили через bootstrap (markWeeksFresh).
@@ -1085,6 +1294,19 @@ async function loadData() {
       syncAll(cur).catch((e) => console.warn('[openSync] error:', e.message));
     }
   } catch (e) {
+    // Сетевая ошибка (offline/обрыв/подвешивание РКН): не крашим ошибкой,
+    // а рисуем из stale-кэша с плашкой. HTTP-ошибки воркера сюда не попадают —
+    // bootstrapFromApi сам разбирается с legacy-fallback.
+    if (isNetworkError(e) && applyStaleCache()) {
+      state.offlineMode = true;
+      showOfflineBanner();
+      try {
+        await renderAll();
+        return;
+      } catch (e2) {
+        console.warn('[loadData] stale render failed:', e2.message);
+      }
+    }
     showError(
       'Не удалось загрузить данные: ' + e.message,
       isWriter() ? () => syncAll(null, { forceSync: true }) : null
@@ -1116,7 +1338,11 @@ async function bootstrapFromApi(opts = {}) {
 
     if (wantWeeks && Array.isArray(data.weeks) && data.weeks.length) {
       state.weeks = normalizeWeeks(data.weeks);
-      saveWeeksToCache(data.weeks);
+      // Сохраняем НОРМАЛИЗОВАННЫЕ недели (с полем dates, распарсенным из
+      // text): воркер отдаёт weeks без dates, и без этого фикса проверка
+      // `w.dates.length >= 2` в loadData не проходила — cache-only быстрый
+      // путь не срабатывал и каждый визит шёл в сеть.
+      saveWeeksToCache(state.weeks);
       markWeeksFresh();
     }
     if (data.schedules && typeof data.schedules === 'object') {
@@ -1140,6 +1366,11 @@ async function bootstrapFromApi(opts = {}) {
     }
     return true;
   } catch (e) {
+    // Сетевая ошибка (offline/обрыв/подвешивание РКН): legacy-fallback —
+    // это ещё 4 запроса в ту же мёртвую сеть (4 × fetchTimeout 15 с).
+    // Пробрасываем сразу наверх — там стейл-кэш. HTTP-ошибки (404/500
+    // старого воркера) по-прежнему идут в fallback.
+    if (isNetworkError(e)) throw e;
     console.warn('[bootstrap] failed, falling back to legacy load:', e.message);
     await bootstrapLegacyFallback(opts);
     return false;
@@ -1249,10 +1480,14 @@ async function loadInitialSchedules() {
   const content = document.getElementById('scheduleContent');
   content.innerHTML = skeletonScheduleHTML();
 
+  // Офлайн: сеть не трогаем вообще — каждый запрос ждал бы fetchTimeout
+  // (15 с) и всё равно упал бы. Рисуем только из того, что уже в кэше.
+  const offline = state.offlineMode || navigator.onLine === false;
+
   // Если все стартовые недели уже в кеше (от bootstrap или предыдущего
   // открытия) — сохраняем кеш и сразу рисуем. Никакого запроса к воркеру.
   const missing = indices.filter((i) => !state.scheduleCache[state.weeks[i].value]);
-  if (missing.length > 0) {
+  if (missing.length > 0 && !offline) {
     // Только для недостающих — один /api/schedules. Если все на месте —
     // этот запрос пропускается полностью.
     try {
@@ -1265,7 +1500,7 @@ async function loadInitialSchedules() {
     } catch (e) {
       console.warn('[loadInitial] /api/schedules failed:', e.message);
     }
-  } else {
+  } else if (missing.length === 0 && !offline) {
     console.log('[loadInitial] all weeks in cache — skipping /api/schedules');
     saveSchedToCache(state.scheduleCache);
   }
@@ -1278,7 +1513,7 @@ async function loadInitialSchedules() {
   // чтобы остаться на текущей неделе. Если кампус недоступен или неделя пустая —
   // остаёмся на текущей неделе с надписью «нет данных» (без перекидывания на другую).
   const curWeek = state.weeks[cur];
-  if (curWeek && !state.scheduleCache[curWeek.value] && state.campusEnabled) {
+  if (curWeek && !state.scheduleCache[curWeek.value] && state.campusEnabled && !offline) {
     try {
       const campusData = await fetchScheduleFromCampus(state.group, curWeek.value);
       const hasPairs = campusData.days && Object.values(campusData.days).some(d => d.pairs && d.pairs.length > 0);
@@ -1430,8 +1665,11 @@ async function loadSchedule(targetIdx, direction) {
 
   // 2) Нет в кэше → из БД. Запрашиваем сразу 3 недели одной /api/schedules
   //    (текущую + ±1), чтобы следующее перелистывание уже было в кеше.
-  //    Один RTT вместо потенциально трёх.
+  //    Один RTT вместо потенциально трёх. В офлайне сеть не трогаем —
+  //    каждый запрос ждал бы fetchTimeout и всё равно упал бы.
+  const offline = state.offlineMode || navigator.onLine === false;
   let dbData = null;
+  if (!offline) {
   try {
     const wantIdx = [targetIdx - 1, targetIdx, targetIdx + 1]
       .filter((i) => i >= 0 && i < state.weeks.length && !state.scheduleCache[state.weeks[i].value]);
@@ -1453,6 +1691,7 @@ async function loadSchedule(targetIdx, direction) {
   } catch (e) {
     dbData = null;
   }
+  }
 
   // Пока ждали /api/schedules, пользователь мог переключить неделю дальше —
   // тогда устаревший запрос не должен рисовать свой результат.
@@ -1473,8 +1712,9 @@ async function loadSchedule(targetIdx, direction) {
     return;
   }
 
-  // 3) Нет в БД → из кампуса, пишем в БД.
-  if (state.campusEnabled) {
+  // 3) Нет в БД → из кампуса, пишем в БД. В офлайне пропускаем —
+  // ниже сразу отрисуется «Нет данных для этой недели».
+  if (state.campusEnabled && !offline) {
     try {
       const campusData = await fetchScheduleFromCampus(state.group, w.value);
       const hasPairs = campusData.days && Object.values(campusData.days).some(d => d.pairs && d.pairs.length > 0);
@@ -1509,6 +1749,8 @@ async function loadSchedule(targetIdx, direction) {
 // следующее перелистывание было мгновенным (0 запросов). Качаем по 2
 // недели в обе стороны от текущей, для которых НЕТ кеша. fire-and-forget.
 async function prefetchNearbyWeeks(centerIdx) {
+  // Офлайн: сеть мертва, запрос завис бы на fetchTimeout — пропускаем молча.
+  if (state.offlineMode || navigator.onLine === false) return;
   try {
     const wantIdx = [];
     for (let off = -2; off <= 2; off++) {
@@ -1534,6 +1776,8 @@ async function prefetchNearbyWeeks(centerIdx) {
 // Фоновое обновление одной недели из кампуса (для случая «идём вперёд дальше +2»).
 async function backgroundSyncSingle(idx, dbData) {
   if (!state.campusEnabled) return;
+  // Офлайн: кампус недоступен, запрос завис бы на fetchTimeout — пропускаем.
+  if (state.offlineMode || navigator.onLine === false) return;
   try {
     const w = state.weeks[idx];
     const data = await fetchScheduleFromCampus(state.group, w.value);
@@ -1627,6 +1871,12 @@ async function syncAll(anchorIdxOverride = null, opts = {}) {
   // 2 вызовов воркера: check-campus-update + sync-from-campus).
   const forceSync = !!opts.forceSync;
   if (state.syncing) return;
+  // Офлайн: синхронизация невозможна — сразу говорим, не ждём таймаутов.
+  if (state.offlineMode || navigator.onLine === false) {
+    updateSyncUI('error', 'Нет соединения');
+    showOfflineBanner();
+    return;
+  }
   if (!state.campusEnabled) {
     updateSyncUI('error', 'Загрузка из кампуса отключена в настройках');
     return;
@@ -2760,6 +3010,15 @@ function renderWeekNav() {
       renderWeekNav();
     }
   };
+
+  // Обводка акцентом, когда открыта текущая неделя (та же, на которую
+  // приложение открывается по календарю).
+  const nav = document.getElementById('weekNav');
+  if (nav) {
+    const isCurrent = !!w && state.weeks.length > 0 &&
+      state.currentWeekIdx === findRealCurrentIdx();
+    nav.classList.toggle('is-current', isCurrent);
+  }
 }
 
 // Карусель смены недели/дня: старый слой уезжает в сторону, новый въезжает
@@ -2841,8 +3100,75 @@ function setupModalFocusTrap() {
 // (модалки могут открываться одна поверх другой, напр. просмотр ДЗ → форма).
 let openModalCount = 0;
 
+// ── Кнопка «Назад» закрывает модалку, а не сайт ──────────────
+// При открытии модалки кладём в историю отдельную запись. Системный «Назад»
+// снимает её и закрывает модалку; при закрытии крестиком запись убирается
+// отложенным history.back(). Задержка на тик нужна, чтобы цепочка
+// «закрыть просмотр ДЗ → открыть редактирование» переиспользовала ту же
+// запись, а не плодила лишние «мёртвые» нажатия.
+let modalHistoryActive = false;
+let modalHistoryBackTimer = null;
+
+function pushModalHistoryEntry() {
+  try {
+    history.pushState({ __modalOpen: true }, '');
+    modalHistoryActive = true;
+  } catch (e) {
+    // History API недоступна (sandbox/старый webview) — модалка работает
+    // как раньше, просто «Назад» не будет её закрывать.
+  }
+}
+
+function setupModalHistoryBack() {
+  // Перезагрузка при открытой модалке: в текущей записи остался флаг.
+  // Убираем его, иначе первый «Назад» после закрытия был бы холостым.
+  try {
+    if (history.state && history.state.__modalOpen) {
+      history.replaceState(null, '', location.href);
+    }
+  } catch (e) { /* ignore */ }
+
+  window.addEventListener('popstate', () => {
+    // Отложенный history.back() после закрытия крестиком: таймер уже снял
+    // флаг, запись истории просто стала базовой — ничего не делаем.
+    if (!modalHistoryActive) {
+      // Могли вернуться вперёд на старую запись с флагом (после жеста
+      // «вперёд») — чистим её, чтобы «Назад» не тратился впустую.
+      try {
+        if (history.state && history.state.__modalOpen) {
+          history.replaceState(null, '', location.href);
+        }
+      } catch (e) { /* ignore */ }
+      return;
+    }
+
+    // Пользователь нажал «Назад» при открытой модалке. Запись уже снята
+    // браузером; отменяем возможный отложенный back и закрываем все
+    // открытые модалки их штатными крестиками (чтобы отработали очистки).
+    if (modalHistoryBackTimer) {
+      clearTimeout(modalHistoryBackTimer);
+      modalHistoryBackTimer = null;
+    }
+    modalHistoryActive = false;
+    document.querySelectorAll('.modal.is-open').forEach((m) => {
+      const closeBtn = m.querySelector('.modal-header .icon-btn');
+      if (closeBtn) closeBtn.click();
+      else closeModal(m);
+    });
+  });
+}
+
 function openModal(modal, originEl) {
   if (!modal) return;
+  // История: одна запись на «сессию» модалок. Если модалку закрыли и сразу
+  // открыли другую (просмотр ДЗ → редактирование), отложенный back ещё не
+  // выполнился — отменяем его и переиспользуем запись.
+  if (modalHistoryBackTimer) {
+    clearTimeout(modalHistoryBackTimer);
+    modalHistoryBackTimer = null;
+  }
+  if (!modalHistoryActive) pushModalHistoryEntry();
+
   lastFocusedEl = originEl ||
     (document.activeElement && document.activeElement !== document.body ? document.activeElement : null);
   modal.classList.remove('hidden');
@@ -2899,6 +3225,18 @@ function closeModal(modal) {
   // При «меньше движения» переход уже мгновенный — прячем оверлей сразу,
   // иначе прозрачный некликабельный слой висел бы ещё 240ms.
   setTimeout(() => modal.classList.add('hidden'), prefersReducedMotion() ? 0 : 240);
+
+  // Убираем запись истории, добавленную при открытии. setTimeout(0) — чтобы
+  // синхронная цепочка closeModal → openModal успела переиспользовать запись.
+  if (modalHistoryActive && !modalHistoryBackTimer) {
+    modalHistoryBackTimer = setTimeout(() => {
+      modalHistoryBackTimer = null;
+      // Если за это время открылась другая модалка — запись ещё нужна.
+      if (document.querySelector('.modal.is-open')) return;
+      modalHistoryActive = false;
+      try { history.back(); } catch (e) { /* ignore */ }
+    }, 0);
+  }
 }
 
 // с противоположной. Между ними — момент, когда видны оба частично.
@@ -3635,6 +3973,7 @@ function attachHwViewLinks(container) {
 
 setupKeyboardShortcuts();
 setupModalFocusTrap();
+setupModalHistoryBack();
 
 // ── Calendar widget ──────────────────────────────────────────
 
